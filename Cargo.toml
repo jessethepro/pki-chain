@@ -1,0 +1,9 @@
+[package]
+name = "pki-chain"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+libblockchainstor = { path = "../libblockchainstor" }
+libcertcrypto = { path = "../libcertcrypto" }
+anyhow = "1.0"
