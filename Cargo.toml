@@ -7,3 +7,7 @@ edition = "2021"
 libblockchainstor = { path = "../libblockchainstor" }
 libcertcrypto = { path = "../libcertcrypto" }
 anyhow = "1.0"
+secrecy = { version = "0.8", features = ["serde"] }
+zeroize = "1.7"
+sha2 = "0.10"
+rsa = "0.9"
