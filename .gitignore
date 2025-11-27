@@ -1,1 +1,9 @@
 /target
+
+# Certificate and key files
+*.pfx
+*.cer
+*.crt
+*.key
+*.csr
+*.pem
