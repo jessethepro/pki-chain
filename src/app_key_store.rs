@@ -3,7 +3,8 @@ use libcertcrypto::{PfxContainer, CertificateUsageType};
 use anyhow::Result;
 use sha2::{Sha256, Digest};
 use std::path::Path;
-use rsa::pkcs8::EncodePrivateKey;
+use rsa::pkcs8::{EncodePrivateKey, DecodePrivateKey};
+use rsa::{RsaPublicKey, RsaPrivateKey};
 
 /// Secure in-memory storage for application private key
 /// 
@@ -13,6 +14,8 @@ use rsa::pkcs8::EncodePrivateKey;
 pub struct AppKeyStore {
     /// Private key bytes stored securely (zeroized on drop)
     private_key_pem: Secret<String>,
+    /// Public key for hybrid encryption operations
+    public_key: RsaPublicKey,
     /// SHA-256 hash of the private key (used for password derivation)
     key_hash: String,
 }
@@ -47,6 +50,9 @@ impl AppKeyStore {
         // Load the private key
         let private_key = pfx.load_private_key()?;
         
+        // Extract public key from private key
+        let public_key = RsaPublicKey::from(&private_key);
+        
         // Convert to PEM format
         let private_key_pem = private_key.to_pkcs8_pem(rsa::pkcs8::LineEnding::LF)
             .map_err(|e| anyhow::anyhow!("Failed to encode private key to PEM: {}", e))?;
@@ -62,6 +68,7 @@ impl AppKeyStore {
         // Wrap in Secret to prevent accidental exposure
         Ok(Self {
             private_key_pem: Secret::new(pem_string),
+            public_key,
             key_hash,
         })
     }
@@ -75,6 +82,44 @@ impl AppKeyStore {
     /// * `&str` - The SHA-256 hash as a hexadecimal string
     pub fn get_derived_password(&self) -> &str {
         &self.key_hash
+    }
+    
+    /// Get a reference to the public key for hybrid encryption
+    /// 
+    /// Use this to encrypt AES keys in hybrid encryption operations.
+    /// 
+    /// # Returns
+    /// * `&RsaPublicKey` - Reference to the RSA public key
+    /// 
+    /// # Example
+    /// ```no_run
+    /// use libcertcrypto::hybrid_encrypt;
+    /// 
+    /// let encrypted = hybrid_encrypt(
+    ///     app_key_store.get_public_key(),
+    ///     plaintext_data
+    /// )?;
+    /// ```
+    pub fn get_public_key(&self) -> &RsaPublicKey {
+        &self.public_key
+    }
+    
+    /// Get the RSA private key for decryption operations
+    /// 
+    /// This reconstructs the RsaPrivateKey from the stored PEM.
+    /// Use for hybrid decryption or other cryptographic operations.
+    /// 
+    /// # Returns
+    /// * `Result<RsaPrivateKey>` - The RSA private key
+    /// 
+    /// # Example
+    /// ```no_run
+    /// let private_key = app_key_store.get_private_key_rsa()?;
+    /// let decrypted = hybrid_decrypt(&private_key, encrypted_data)?;
+    /// ```
+    pub fn get_private_key_rsa(&self) -> Result<RsaPrivateKey> {
+        RsaPrivateKey::from_pkcs8_pem(self.private_key_pem.expose_secret())
+            .map_err(|e| anyhow::anyhow!("Failed to decode private key from PEM: {}", e))
     }
     
     /// Execute a closure with temporary access to the private key
