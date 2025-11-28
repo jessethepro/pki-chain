@@ -4,6 +4,7 @@ use anyhow::Result;
 
 mod pfx_key;
 mod app_key_store;
+mod store_key;
 
 use app_key_store::AppKeyStore;
 
