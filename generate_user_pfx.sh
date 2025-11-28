@@ -110,7 +110,7 @@ echo "Generating user certificate..."
 SERIAL=$(openssl rand -hex 16)
 
 # Create output filename based on CN
-SAFE_CN=$(echo "$CN" | tr ' ' '_' | tr -cd '[:alnum:]_-@.')
+SAFE_CN=$(echo "$CN" | tr ' ' '_' | tr -cd '[:alnum:]_@.-')
 OUTPUT_PFX="${SAFE_CN}.pfx"
 OUTPUT_CER="${SAFE_CN}.cer"
 OUTPUT_KEY="${SAFE_CN}.key"
