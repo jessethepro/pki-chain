@@ -5,53 +5,49 @@ use libblockchainstor::BlockchainDb;
 use libblockchainstor::libblockchain::traits::BlockHeaderHasher;
 use crate::app_key_store::AppKeyStore;
 
-/// Store a Root CA PFX file as the genesis block in the PFX blockchain
+/// Store a User certificate PFX file in the PFX blockchain
 ///
 /// This function validates that:
-/// 1. The PFX file is a valid Root Certificate Authority
-/// 2. No genesis block (height 0) already exists in the blockchain
-/// 3. Encrypts the PFX file using hybrid encryption with the app public key
-/// 4. Stores the encrypted PFX as the genesis block if validation passes
+/// 1. The PFX file is a valid User certificate
+/// 2. Encrypts the PFX file using hybrid encryption with the app public key
+/// 3. Stores the encrypted PFX as a new block in the blockchain
 ///
 /// # Arguments
 ///
-/// * `pfx_path` - Path to the Root CA PFX file
+/// * `pfx_path` - Path to the User certificate PFX file
 /// * `pfx_chain` - Reference to the PFX blockchain database
-/// * `hasher` - Block header hasher for creating the genesis block
+/// * `hasher` - Block header hasher for creating the block
 /// * `app_key_store` - Application key store (provides derived password for PFX decryption and public key for encryption)
 ///
 /// # Returns
 ///
-/// * `Result<([u8; 16], u32)>` - The block UID and height (0) on success
+/// * `Result<([u8; 16], u32)>` - The block UID and height on success
 ///
 /// # Errors
 ///
 /// Returns an error if:
 /// - The PFX file cannot be loaded
-/// - The certificate is not a Root CA
-/// - A genesis block already exists in the blockchain
+/// - The certificate is not a User certificate
 /// - Hybrid encryption fails
 /// - Database operations fail
 ///
 /// # Example
 /// ```no_run
-/// use pki_chain::store_root_ca_pfx;
+/// use pki_chain::store_user_pfx;
 /// use libblockchainstor::BlockchainDb;
 /// use sha2::{Sha256, Digest};
 ///
 /// let pfx_chain = BlockchainDb::open("../data/pfx")?;
 /// let hasher = Sha256::new();
 ///
-/// let (block_uid, height) = store_root_ca_pfx(
-///     "RootCA.pfx",
+/// let (block_uid, height) = store_user_pfx(
+///     "user@example.com.pfx",
 ///     &pfx_chain,
 ///     &hasher,
 ///     &app_key_store
 /// )?;
-///
-/// assert_eq!(height, 0); // Genesis block
 /// ```
-pub fn store_root_ca_pfx<P: AsRef<Path>, H: BlockHeaderHasher>(
+pub fn store_user_pfx<P: AsRef<Path>, H: BlockHeaderHasher>(
     pfx_path: P,
     pfx_chain: &BlockchainDb,
     hasher: &H,
@@ -61,28 +57,20 @@ pub fn store_root_ca_pfx<P: AsRef<Path>, H: BlockHeaderHasher>(
     let pfx_container = PfxContainer::load_from_file(
         pfx_path.as_ref(),
         app_key_store.get_derived_password(),
-        CertificateUsageType::RootCA,
+        CertificateUsageType::User,
     ).map_err(|e| anyhow!("Failed to load PFX file: {}", e))?;
     
-    // Validate it's a Root CA
-    if pfx_container.usage_type != CertificateUsageType::RootCA {
-        bail!("PFX file is not a Root CA certificate (type: {:?})", pfx_container.usage_type);
+    // Validate it's a User certificate
+    if pfx_container.usage_type != CertificateUsageType::User {
+        bail!("PFX file is not a User certificate (type: {:?})", pfx_container.usage_type);
     }
     
-    if !pfx_container.is_ca() {
-        bail!("PFX file is not a Certificate Authority");
+    // User certificates should not be CAs
+    if pfx_container.is_ca() {
+        bail!("User certificate should not be a Certificate Authority");
     }
     
-    // Check if genesis block (height 0) already exists
-    let mut iter = pfx_chain.iter()
-        .map_err(|e| anyhow!("Failed to create blockchain iterator: {}", e))?;
-    
-    // Check if there are any blocks in the chain
-    if iter.next().is_some() {
-        bail!("Genesis block already exists in the PFX blockchain. Cannot store Root CA.");
-    }
-    
-    // Serialize the PFX container to bytes for storage
+    // Read the PFX file bytes for storage
     let pfx_bytes = std::fs::read(pfx_path.as_ref())
         .map_err(|e| anyhow!("Failed to read PFX file: {}", e))?;
     
@@ -93,62 +81,59 @@ pub fn store_root_ca_pfx<P: AsRef<Path>, H: BlockHeaderHasher>(
     // Serialize encrypted data to bytes for blockchain storage
     let encrypted_bytes = encrypted_data.to_bytes();
     
-    // Store encrypted PFX as genesis block (will be height 0)
+    // Store encrypted PFX as a new block
     let (block, height, _signature) = pfx_chain.store_block(hasher, encrypted_bytes)
-        .map_err(|e| anyhow!("Failed to store genesis block: {}", e))?;
-    
-    // Verify it's actually the genesis block
-    if height != 0 {
-        bail!("Expected genesis block (height 0), but got height {}", height);
-    }
+        .map_err(|e| anyhow!("Failed to store block: {}", e))?;
     
     Ok((block.block_header.block_uid, height))
 }
 
-/// Retrieve the Root CA PFX from the genesis block of the PFX blockchain
+/// Retrieve a User certificate PFX from the PFX blockchain by height
 ///
 /// This function:
-/// 1. Retrieves the genesis block (height 0) from the blockchain
+/// 1. Retrieves the block at the specified height from the blockchain
 /// 2. Decrypts the encrypted PFX data using the app private key
 /// 3. Loads the decrypted PFX bytes into a PfxContainer
-/// 4. Validates it's a Root CA certificate
+/// 4. Validates it's a User certificate
 ///
 /// # Arguments
 ///
 /// * `pfx_chain` - Reference to the PFX blockchain database
+/// * `height` - The height of the block containing the User certificate
 /// * `app_key_store` - Application key store (provides private key for decryption and derived password)
 ///
 /// # Returns
 ///
-/// * `Result<PfxContainer>` - The Root CA PfxContainer on success
+/// * `Result<PfxContainer>` - The User certificate PfxContainer on success
 ///
 /// # Errors
 ///
 /// Returns an error if:
-/// - No genesis block exists in the blockchain
+/// - No block exists at the specified height
 /// - Decryption fails
 /// - The decrypted data is not a valid PFX file
-/// - The PFX is not a Root CA certificate
+/// - The PFX is not a User certificate
 ///
 /// # Example
 /// ```no_run
-/// use pki_chain::get_root_ca_pfx;
+/// use pki_chain::get_user_pfx;
 /// use libblockchainstor::BlockchainDb;
 ///
 /// let pfx_chain = BlockchainDb::open("../data/pfx")?;
 ///
-/// let root_ca = get_root_ca_pfx(&pfx_chain, &app_key_store)?;
-/// assert_eq!(root_ca.usage_type, CertificateUsageType::RootCA);
+/// let user_cert = get_user_pfx(&pfx_chain, 2, &app_key_store)?;
+/// assert_eq!(user_cert.usage_type, CertificateUsageType::User);
 /// ```
-pub fn get_root_ca_pfx(
+pub fn get_user_pfx(
     pfx_chain: &BlockchainDb,
+    height: u32,
     app_key_store: &AppKeyStore,
 ) -> Result<PfxContainer> {
-    // Retrieve the genesis block (height 0) directly from the height tree
-    let (genesis_block, _uid) = pfx_chain.get_block_by_height(0)
-        .map_err(|e| anyhow!("Failed to retrieve genesis block: {}", e))?;
+    // Retrieve the block at the specified height
+    let (block, _uid) = pfx_chain.get_block_by_height(height)
+        .map_err(|e| anyhow!("Failed to retrieve block at height {}: {}", height, e))?;
     
-    let encrypted_bytes = genesis_block.block_data;
+    let encrypted_bytes = block.block_data;
     
     // Deserialize encrypted data
     let encrypted_data = HybridEncryptedData::from_bytes(&encrypted_bytes)
@@ -161,22 +146,22 @@ pub fn get_root_ca_pfx(
     let pfx_bytes = hybrid_decrypt(&private_key, &encrypted_data)
         .map_err(|e| anyhow!("Failed to decrypt PFX data: {}", e))?;
     
-    // Load PFX container from decrypted bytes using from_pfx
+    // Load PFX container from decrypted bytes
     let pfx_container = PfxContainer::from_pfx(
         &pfx_bytes,
         app_key_store.get_derived_password(),
-        CertificateUsageType::RootCA,
+        CertificateUsageType::User,
     ).map_err(|e| anyhow!("Failed to load PFX from decrypted data: {}", e))?;
     
-    // Validate it's a Root CA
-    if pfx_container.usage_type != CertificateUsageType::RootCA {
-        bail!("Retrieved PFX is not a Root CA certificate (type: {:?})", pfx_container.usage_type);
+    // Validate it's a User certificate
+    if pfx_container.usage_type != CertificateUsageType::User {
+        bail!("Retrieved PFX is not a User certificate (type: {:?})", pfx_container.usage_type);
     }
     
-    if !pfx_container.is_ca() {
-        bail!("Retrieved PFX is not a Certificate Authority");
+    // User certificates should not be CAs
+    if pfx_container.is_ca() {
+        bail!("User certificate should not be a Certificate Authority");
     }
     
     Ok(pfx_container)
 }
-
