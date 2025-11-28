@@ -6,28 +6,66 @@ set -e
 # Set OpenSSL config file location
 export OPENSSL_CONF=/etc/ssl/openssl.cnf
 
+# Configuration variables - set these before running the script
+CN="${CN:-}"
+ORG="${ORG:-MenaceLabs}"
+OU="${OU:-}"
+COUNTRY="${COUNTRY:-BR}"
+STATE="${STATE:-SP}"
+CITY="${CITY:-Sao Jose dos Campos}"
+EMAIL="${EMAIL:-None}"
+VALIDITY_YEARS="${VALIDITY_YEARS:-1}"
+APP_PFX_PATH="${APP_PFX_PATH:-key/pki-chain-app.pfx}"
+APP_PFX_PASSWORD="${APP_PFX_PASSWORD:-thepro666}"
+INTER_CA_PFX_PATH="${INTER_CA_PFX_PATH:-PKI-Intermediate-CA.pfx}"
+
 echo "=== User Certificate Generator ==="
 echo
 echo "This user certificate will be used for encryption, signing, and identity."
 echo
 
-# Prompt for DN information
-read -p "Common Name (CN) [e.g., 'John Doe' or 'user@example.com']: " CN
-read -p "Organization (O): " ORG
-read -p "Organizational Unit (OU): " OU
-read -p "Country (C) [2-letter code]: " COUNTRY
-read -p "State/Province (ST): " STATE
-read -p "Locality/City (L): " CITY
-read -p "Email Address: " EMAIL
+# Use provided values or prompt if not set
+if [ -z "$CN" ]; then
+    read -p "Common Name (CN) [e.g., 'John Doe' or 'user@example.com']: " CN
+fi
 
-# Prompt for validity
-read -p "Validity period (years) [default: 1]: " VALIDITY_YEARS
-VALIDITY_YEARS=${VALIDITY_YEARS:-1}
+if [ -z "$ORG" ]; then
+    read -p "Organization (O): " ORG
+fi
+
+if [ -z "$OU" ]; then
+    read -p "Organizational Unit (OU): " OU
+fi
+
+if [ -z "$COUNTRY" ]; then
+    read -p "Country (C) [2-letter code]: " COUNTRY
+fi
+
+if [ -z "$STATE" ]; then
+    read -p "State/Province (ST): " STATE
+fi
+
+if [ -z "$CITY" ]; then
+    read -p "Locality/City (L): " CITY
+fi
+
+if [ -z "$EMAIL" ]; then
+    read -p "Email Address: " EMAIL
+fi
+
+if [ "$VALIDITY_YEARS" = "1" ]; then
+    read -p "Validity period (years) [default: 1]: " VALIDITY_INPUT
+    VALIDITY_YEARS="${VALIDITY_INPUT:-1}"
+fi
+
 VALIDITY_DAYS=$((VALIDITY_YEARS * 365))
 
-echo
-echo "=== Application PFX File (for password generation) ==="
-read -p "Path to application PFX file: " APP_PFX_PATH
+if [ "$APP_PFX_PATH" = "key/pki-chain-app.pfx" ]; then
+    echo
+    echo "=== Application PFX File (for password generation) ==="
+    read -p "Path to application PFX file [default: key/pki-chain-app.pfx]: " APP_PFX_INPUT
+    APP_PFX_PATH="${APP_PFX_INPUT:-key/pki-chain-app.pfx}"
+fi
 
 # Verify PFX file exists
 if [ ! -f "$APP_PFX_PATH" ]; then
@@ -35,13 +73,17 @@ if [ ! -f "$APP_PFX_PATH" ]; then
     exit 1
 fi
 
-# Secure password input for application PFX
-echo "Enter password for application PFX file (will be hidden):"
-read -s APP_PFX_PASSWORD
+# Secure password input for application PFX if not set
+if [ -z "$APP_PFX_PASSWORD" ]; then
+    echo "Enter password for application PFX file (will be hidden):"
+    read -s APP_PFX_PASSWORD
+fi
 
-echo
-echo "=== Intermediate CA PFX File (for signing) ==="
-read -p "Path to Intermediate CA PFX file: " INTER_CA_PFX_PATH
+if [ -z "$INTER_CA_PFX_PATH" ]; then
+    echo
+    echo "=== Intermediate CA PFX File (for signing) ==="
+    read -p "Path to Intermediate CA PFX file: " INTER_CA_PFX_PATH
+fi
 
 # Verify Intermediate CA PFX file exists
 if [ ! -f "$INTER_CA_PFX_PATH" ]; then

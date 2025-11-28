@@ -75,7 +75,8 @@ openssl req -new -key "$OUTPUT_KEY" -out "$OUTPUT_CSR" -subj "$SUBJECT"
 echo "Generating self-signed certificate..."
 
 # Build extensions config
-EXT_CONFIG="keyUsage = critical, digitalSignature, keyEncipherment, dataEncipherment
+EXT_CONFIG="basicConstraints = CA:FALSE
+keyUsage = critical, digitalSignature, keyEncipherment, dataEncipherment
 extendedKeyUsage = clientAuth, emailProtection, codeSigning"
 [ -n "$EMAIL" ] && EXT_CONFIG="${EXT_CONFIG}
 subjectAltName = email:${EMAIL}"
@@ -94,7 +95,10 @@ openssl pkcs12 -export \
     -inkey "$OUTPUT_KEY" \
     -in "$OUTPUT_CRT" \
     -name "$CN" \
-    -password "pass:${PASSWORD}"
+    -password "pass:${PASSWORD}" \
+    -keypbe PBE-SHA1-3DES \
+    -certpbe PBE-SHA1-3DES \
+    -macalg SHA1
 
 # Export certificate as PEM-formatted .cer file
 echo "Exporting certificate to PEM format..."

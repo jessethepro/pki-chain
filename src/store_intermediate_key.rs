@@ -2,7 +2,7 @@ use libcertcrypto::{PfxContainer, CertificateUsageType, hybrid_encrypt, hybrid_d
 use std::path::Path;
 use anyhow::{Result, anyhow, bail};
 use libblockchainstor::BlockchainDb;
-use libblockchainstor::libblockchain::traits::BlockHeaderHasher;
+use libblockchainstor::libblockchain::BlockHeaderHasher;
 use crate::app_key_store::AppKeyStore;
 
 /// Store an Intermediate CA PFX file in the PFX blockchain
@@ -35,10 +35,19 @@ use crate::app_key_store::AppKeyStore;
 /// ```no_run
 /// use pki_chain::store_intermediate_ca_pfx;
 /// use libblockchainstor::BlockchainDb;
-/// use sha2::{Sha256, Digest};
+/// use libblockchainstor::libblockchain::BlockHeaderHasher;
+/// use libcertcrypto::CertificateTools;
 ///
-/// let pfx_chain = BlockchainDb::open("../data/pfx")?;
-/// let hasher = Sha256::new();
+/// struct Sha256Hasher;
+/// impl BlockHeaderHasher for Sha256Hasher {
+///     fn hash(&self, data: &[u8]) -> Vec<u8> {
+///         CertificateTools::hash_sha256(data).unwrap_or_default()
+///     }
+///     fn hash_size(&self) -> usize { 32 }
+/// }
+///
+/// let blockchain = BlockchainDb::open("../data/pfx")?;
+/// let hasher = Sha256Hasher;
 ///
 /// let (block_uid, height) = store_intermediate_ca_pfx(
 ///     "IntermediateCA.pfx",

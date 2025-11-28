@@ -3,17 +3,15 @@ use libblockchainstor::BlockchainDb;
 use crate::app_key_store::AppKeyStore;
 use crate::store_user_key::store_user_pfx;
 use crate::store_user_cert::store_user_certificate;
-use sha2::{Sha256, Digest};
-use libblockchainstor::libblockchain::traits::BlockHeaderHasher;
+use libcertcrypto::CertificateTools;
+use libblockchainstor::libblockchain::BlockHeaderHasher;
 
 /// SHA-256 hasher implementation for blockchain operations
 struct Sha256Hasher;
 
 impl BlockHeaderHasher for Sha256Hasher {
     fn hash(&self, data: &[u8]) -> Vec<u8> {
-        let mut hasher = Sha256::new();
-        hasher.update(data);
-        hasher.finalize().to_vec()
+        CertificateTools::hash_sha256(data).unwrap_or_default()
     }
     
     fn hash_size(&self) -> usize {

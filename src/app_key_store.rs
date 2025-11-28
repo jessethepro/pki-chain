@@ -1,10 +1,7 @@
 use secrecy::{Secret, ExposeSecret};
-use libcertcrypto::{PfxContainer, CertificateUsageType};
+use libcertcrypto::{PfxContainer, CertificateUsageType, CertificateTools, PKey, Private, Public};
 use anyhow::Result;
-use sha2::{Sha256, Digest};
 use std::path::Path;
-use rsa::pkcs8::{EncodePrivateKey, DecodePrivateKey};
-use rsa::{RsaPublicKey, RsaPrivateKey};
 
 /// Secure in-memory storage for application private key
 /// 
@@ -12,10 +9,10 @@ use rsa::{RsaPublicKey, RsaPrivateKey};
 /// with automatic memory zeroization on drop. The private key is never
 /// exposed in logs or debug output.
 pub struct AppKeyStore {
-    /// Private key bytes stored securely (zeroized on drop)
-    private_key_pem: Secret<String>,
-    /// Public key for hybrid encryption operations
-    public_key: RsaPublicKey,
+    /// Private key stored securely (zeroized on drop)
+    private_key: Secret<Vec<u8>>,
+    /// Public key for hybrid encryption operations  
+    public_key: PKey<Public>,
     /// SHA-256 hash of the private key (used for password derivation)
     key_hash: String,
 }
@@ -40,34 +37,27 @@ impl AppKeyStore {
     /// )?;
     /// ```
     pub fn load_from_pfx<P: AsRef<Path>>(pfx_path: P, password: &str) -> Result<Self> {
-        // Load PFX container - use User type for application certificates
-        let pfx = PfxContainer::load_from_file(
-            pfx_path, 
-            password, 
-            CertificateUsageType::User
-        )?;
+        // Load PFX container - use Application type for self-signed application certificates
+        let pfx_bytes = std::fs::read(pfx_path)?;
+        let pfx = PfxContainer::from_pfx(&pfx_bytes, password, CertificateUsageType::Application)?;
         
-        // Load the private key
+        // Load the private key (OpenSSL PKey)
         let private_key = pfx.load_private_key()?;
         
-        // Extract public key from private key
-        let public_key = RsaPublicKey::from(&private_key);
+        // Extract public key from private key  
+        let public_key = pfx.load_public_key()?;
         
-        // Convert to PEM format
-        let private_key_pem = private_key.to_pkcs8_pem(rsa::pkcs8::LineEnding::LF)
-            .map_err(|e| anyhow::anyhow!("Failed to encode private key to PEM: {}", e))?;
-        
-        let pem_string = private_key_pem.to_string();
-        let pem_bytes = pem_string.as_bytes();
+        // Get private key DER for hashing
+        let private_key_der = private_key.private_key_to_der()
+            .map_err(|e| anyhow::anyhow!("Failed to encode private key to DER: {}", e))?;
         
         // Calculate SHA-256 hash for password derivation
-        let mut hasher = Sha256::new();
-        hasher.update(pem_bytes);
-        let key_hash = format!("{:x}", hasher.finalize());
+        let hash_bytes = CertificateTools::hash_sha256(&private_key_der)?;
+        let key_hash = hex::encode(hash_bytes);
         
         // Wrap in Secret to prevent accidental exposure
         Ok(Self {
-            private_key_pem: Secret::new(pem_string),
+            private_key: Secret::new(private_key_der),
             public_key,
             key_hash,
         })
@@ -89,7 +79,7 @@ impl AppKeyStore {
     /// Use this to encrypt AES keys in hybrid encryption operations.
     /// 
     /// # Returns
-    /// * `&RsaPublicKey` - Reference to the RSA public key
+    /// * `&PKey<Public>` - Reference to the OpenSSL public key
     /// 
     /// # Example
     /// ```no_run
@@ -100,26 +90,26 @@ impl AppKeyStore {
     ///     plaintext_data
     /// )?;
     /// ```
-    pub fn get_public_key(&self) -> &RsaPublicKey {
+    pub fn get_public_key(&self) -> &PKey<Public> {
         &self.public_key
     }
     
     /// Get the RSA private key for decryption operations
     /// 
-    /// This reconstructs the RsaPrivateKey from the stored PEM.
+    /// This reconstructs the PKey from the stored DER.
     /// Use for hybrid decryption or other cryptographic operations.
     /// 
     /// # Returns
-    /// * `Result<RsaPrivateKey>` - The RSA private key
+    /// * `Result<PKey<Private>>` - The OpenSSL private key
     /// 
     /// # Example
     /// ```no_run
     /// let private_key = app_key_store.get_private_key_rsa()?;
     /// let decrypted = hybrid_decrypt(&private_key, encrypted_data)?;
     /// ```
-    pub fn get_private_key_rsa(&self) -> Result<RsaPrivateKey> {
-        RsaPrivateKey::from_pkcs8_pem(self.private_key_pem.expose_secret())
-            .map_err(|e| anyhow::anyhow!("Failed to decode private key from PEM: {}", e))
+    pub fn get_private_key_rsa(&self) -> Result<PKey<Private>> {
+        PKey::private_key_from_der(self.private_key.expose_secret())
+            .map_err(|e| anyhow::anyhow!("Failed to decode private key from DER: {}", e))
     }
     
     /// Execute a closure with temporary access to the private key
@@ -128,35 +118,35 @@ impl AppKeyStore {
     /// Use sparingly and ensure the key material is not stored or logged.
     /// 
     /// # Arguments
-    /// * `f` - Closure that receives a reference to the private key PEM string
+    /// * `f` - Closure that receives a reference to the private key DER bytes
     /// 
     /// # Returns
     /// * `R` - The return value of the closure
     /// 
     /// # Example
     /// ```no_run
-    /// key_store.with_private_key(|key_pem| {
-    ///     // Use key_pem for cryptographic operations
+    /// key_store.with_private_key(|key_der| {
+    ///     // Use key_der for cryptographic operations
     ///     // DO NOT store or log the key!
-    ///     verify_signature(key_pem)
+    ///     verify_signature(key_der)
     /// });
     /// ```
     pub fn with_private_key<F, R>(&self, f: F) -> R 
     where
-        F: FnOnce(&str) -> R,
+        F: FnOnce(&[u8]) -> R,
     {
-        f(self.private_key_pem.expose_secret())
+        f(self.private_key.expose_secret())
     }
     
-    /// Get a copy of the private key PEM string
+    /// Get a copy of the private key DER bytes
     /// 
     /// WARNING: This exposes the private key! Use only when absolutely necessary
     /// and ensure the returned value is properly zeroized after use.
     /// 
     /// # Returns
-    /// * `String` - PEM-encoded private key
-    pub fn get_private_key_pem(&self) -> String {
-        self.private_key_pem.expose_secret().clone()
+    /// * `Vec<u8>` - DER-encoded private key
+    pub fn get_private_key_der(&self) -> Vec<u8> {
+        self.private_key.expose_secret().clone()
     }
     
     /// Calculate SHA-256 hash of arbitrary data using the same algorithm
@@ -169,9 +159,9 @@ impl AppKeyStore {
     /// # Returns
     /// * `String` - SHA-256 hash as hexadecimal string
     pub fn hash_sha256(data: &[u8]) -> String {
-        let mut hasher = Sha256::new();
-        hasher.update(data);
-        format!("{:x}", hasher.finalize())
+        CertificateTools::hash_sha256(data)
+            .map(|bytes| hex::encode(bytes))
+            .unwrap_or_else(|_| String::new())
     }
 }
 

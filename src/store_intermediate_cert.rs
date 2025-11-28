@@ -1,7 +1,7 @@
 use libcertcrypto::{hybrid_encrypt, hybrid_decrypt, HybridEncryptedData};
 use anyhow::{Result, anyhow};
 use libblockchainstor::BlockchainDb;
-use libblockchainstor::libblockchain::traits::BlockHeaderHasher;
+use libblockchainstor::libblockchain::BlockHeaderHasher;
 use crate::app_key_store::AppKeyStore;
 use crate::store_intermediate_key::get_intermediate_ca_pfx;
 
@@ -37,11 +37,20 @@ use crate::store_intermediate_key::get_intermediate_ca_pfx;
 /// ```no_run
 /// use pki_chain::store_intermediate_ca_certificate;
 /// use libblockchainstor::BlockchainDb;
-/// use sha2::{Sha256, Digest};
+/// use libblockchainstor::libblockchain::BlockHeaderHasher;
+/// use libcertcrypto::CertificateTools;
+///
+/// struct Sha256Hasher;
+/// impl BlockHeaderHasher for Sha256Hasher {
+///     fn hash(&self, data: &[u8]) -> Vec<u8> {
+///         CertificateTools::hash_sha256(data).unwrap_or_default()
+///     }
+///     fn hash_size(&self) -> usize { 32 }
+/// }
 ///
 /// let pfx_chain = BlockchainDb::open("../data/pfx")?;
 /// let cert_chain = BlockchainDb::open("../data/certificates")?;
-/// let hasher = Sha256::new();
+/// let hasher = Sha256Hasher;
 ///
 /// let (block_uid, height) = store_intermediate_ca_certificate(
 ///     &pfx_chain,

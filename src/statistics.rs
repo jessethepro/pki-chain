@@ -1,16 +1,14 @@
 use anyhow::{Result, anyhow};
 use libblockchainstor::BlockchainDb;
-use libblockchainstor::libblockchain::traits::BlockHeaderHasher;
-use sha2::{Sha256, Digest};
+use libblockchainstor::libblockchain::BlockHeaderHasher;
+use libcertcrypto::CertificateTools;
 
 /// SHA-256 hasher implementation for blockchain validation
 struct Sha256Hasher;
 
 impl BlockHeaderHasher for Sha256Hasher {
     fn hash(&self, data: &[u8]) -> Vec<u8> {
-        let mut hasher = Sha256::new();
-        hasher.update(data);
-        hasher.finalize().to_vec()
+        CertificateTools::hash_sha256(data).unwrap_or_default()
     }
     
     fn hash_size(&self) -> usize {
