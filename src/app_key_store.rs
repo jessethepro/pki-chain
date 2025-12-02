@@ -1,203 +1,127 @@
-use secrecy::{Secret, ExposeSecret};
-use libcertcrypto::{PfxContainer, CertificateUsageType, CertificateTools, PKey, Private, Public};
-use anyhow::Result;
-use std::path::Path;
+//! Secure storage for application private key using the secrecy crate
+//!
+//! This module provides a secure in-memory container for the application's private key
+//! with automatic zeroization on drop to prevent key material from lingering in memory.
 
-/// Secure in-memory storage for application private key
-/// 
-/// This struct provides secure storage for the application's private key
-/// with automatic memory zeroization on drop. The private key is never
-/// exposed in logs or debug output.
+use anyhow::{Context, Result};
+use openssl::pkey::{PKey, Private};
+use secrecy::{ExposeSecret, Secret, Zeroize};
+use std::fmt;
+
+/// A securely stored private key that implements Zeroize
+#[derive(Clone)]
+struct SecurePrivateKey {
+    der_bytes: Vec<u8>,
+}
+
+impl Zeroize for SecurePrivateKey {
+    fn zeroize(&mut self) {
+        self.der_bytes.zeroize();
+    }
+}
+
+impl fmt::Debug for SecurePrivateKey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SecurePrivateKey")
+            .field("der_bytes", &"<redacted>")
+            .finish()
+    }
+}
+
+/// Secure container for the application's private key
+///
+/// Uses the `secrecy` crate to ensure the private key material is:
+/// - Protected from accidental exposure (won't appear in debug output)
+/// - Automatically zeroized when dropped
+/// - Only accessible through explicit `expose_secret()` calls
 pub struct AppKeyStore {
-    /// Private key stored securely (zeroized on drop)
-    private_key: Secret<Vec<u8>>,
-    /// Public key for hybrid encryption operations  
-    public_key: PKey<Public>,
-    /// SHA-256 hash of the private key (used for password derivation)
-    key_hash: String,
+    private_key: Secret<SecurePrivateKey>,
 }
 
 impl AppKeyStore {
-    /// Load application PFX file and extract private key securely
-    /// 
+    /// Create a new AppKeyStore from a PKey<Private>
+    ///
     /// # Arguments
-    /// * `pfx_path` - Path to the application PFX file
-    /// * `password` - Password to decrypt the PFX file
-    /// 
+    /// * `key` - The private key to store securely
+    ///
     /// # Returns
-    /// * `Result<Self>` - AppKeyStore instance with private key loaded
-    /// 
-    /// # Example
-    /// ```no_run
-    /// use pki_chain::AppKeyStore;
-    /// 
-    /// let key_store = AppKeyStore::load_from_pfx(
-    ///     "key/pki-chain-app.pfx",
-    ///     "my-secure-password"
-    /// )?;
-    /// ```
-    pub fn load_from_pfx<P: AsRef<Path>>(pfx_path: P, password: &str) -> Result<Self> {
-        // Load PFX container - use Application type for self-signed application certificates
-        let pfx_bytes = std::fs::read(pfx_path)?;
-        let pfx = PfxContainer::from_pfx(&pfx_bytes, password, CertificateUsageType::Application)?;
-        
-        // Load the private key (OpenSSL PKey)
-        let private_key = pfx.load_private_key()?;
-        
-        // Extract public key from private key  
-        let public_key = pfx.load_public_key()?;
-        
-        // Get private key DER for hashing
-        let private_key_der = private_key.private_key_to_der()
-            .map_err(|e| anyhow::anyhow!("Failed to encode private key to DER: {}", e))?;
-        
-        // Calculate SHA-256 hash for password derivation
-        let hash_bytes = CertificateTools::hash_sha256(&private_key_der)?;
-        let key_hash = hex::encode(hash_bytes);
-        
-        // Wrap in Secret to prevent accidental exposure
+    /// * `Result<Self>` - The secure key store or an error
+    pub fn new(key: PKey<Private>) -> Result<Self> {
+        let der_bytes = key
+            .private_key_to_der()
+            .context("Failed to convert private key to DER")?;
+
+        let secure_key = SecurePrivateKey { der_bytes };
+
         Ok(Self {
-            private_key: Secret::new(private_key_der),
-            public_key,
-            key_hash,
+            private_key: Secret::new(secure_key),
         })
     }
-    
-    /// Get the derived password (SHA-256 hash) for PKI operations
-    /// 
-    /// This password is used for all CA and user certificates in the PKI chain.
-    /// It's derived from the SHA-256 hash of the application's private key.
-    /// 
-    /// # Returns
-    /// * `&str` - The SHA-256 hash as a hexadecimal string
-    pub fn get_derived_password(&self) -> &str {
-        &self.key_hash
-    }
-    
-    /// Get a reference to the public key for hybrid encryption
-    /// 
-    /// Use this to encrypt AES keys in hybrid encryption operations.
-    /// 
-    /// # Returns
-    /// * `&PKey<Public>` - Reference to the OpenSSL public key
-    /// 
-    /// # Example
-    /// ```no_run
-    /// use libcertcrypto::hybrid_encrypt;
-    /// 
-    /// let encrypted = hybrid_encrypt(
-    ///     app_key_store.get_public_key(),
-    ///     plaintext_data
-    /// )?;
-    /// ```
-    pub fn get_public_key(&self) -> &PKey<Public> {
-        &self.public_key
-    }
-    
-    /// Get the RSA private key for decryption operations
-    /// 
-    /// This reconstructs the PKey from the stored DER.
-    /// Use for hybrid decryption or other cryptographic operations.
-    /// 
-    /// # Returns
-    /// * `Result<PKey<Private>>` - The OpenSSL private key
-    /// 
-    /// # Example
-    /// ```no_run
-    /// let private_key = app_key_store.get_private_key_rsa()?;
-    /// let decrypted = hybrid_decrypt(&private_key, encrypted_data)?;
-    /// ```
-    pub fn get_private_key_rsa(&self) -> Result<PKey<Private>> {
-        PKey::private_key_from_der(self.private_key.expose_secret())
-            .map_err(|e| anyhow::anyhow!("Failed to decode private key from DER: {}", e))
-    }
-    
-    /// Execute a closure with temporary access to the private key
-    /// 
-    /// This method provides controlled access to the raw private key bytes.
-    /// Use sparingly and ensure the key material is not stored or logged.
-    /// 
+
+    /// Load a private key from PEM file and store it securely
+    ///
     /// # Arguments
-    /// * `f` - Closure that receives a reference to the private key DER bytes
-    /// 
+    /// * `pem_path` - Path to the PEM-encoded private key file
+    /// * `password` - Optional password if the key is encrypted
+    ///
     /// # Returns
-    /// * `R` - The return value of the closure
-    /// 
-    /// # Example
-    /// ```no_run
-    /// key_store.with_private_key(|key_der| {
-    ///     // Use key_der for cryptographic operations
-    ///     // DO NOT store or log the key!
-    ///     verify_signature(key_der)
-    /// });
-    /// ```
-    pub fn with_private_key<F, R>(&self, f: F) -> R 
-    where
-        F: FnOnce(&[u8]) -> R,
-    {
-        f(self.private_key.expose_secret())
+    /// * `Result<Self>` - The secure key store or an error
+    pub fn from_pem_file(pem_path: &str, password: Option<&str>) -> Result<Self> {
+        let pem_data = std::fs::read(pem_path)
+            .context(format!("Failed to read private key from {}", pem_path))?;
+
+        let key = if let Some(pwd) = password {
+            PKey::private_key_from_pem_passphrase(&pem_data, pwd.as_bytes())
+                .context("Failed to decrypt private key with password")?
+        } else {
+            PKey::private_key_from_pem(&pem_data).context("Failed to parse private key PEM")?
+        };
+
+        Self::new(key)
     }
-    
-    /// Get a copy of the private key DER bytes
-    /// 
-    /// WARNING: This exposes the private key! Use only when absolutely necessary
-    /// and ensure the returned value is properly zeroized after use.
-    /// 
-    /// # Returns
-    /// * `Vec<u8>` - DER-encoded private key
-    pub fn get_private_key_der(&self) -> Vec<u8> {
-        self.private_key.expose_secret().clone()
-    }
-    
-    /// Calculate SHA-256 hash of arbitrary data using the same algorithm
-    /// 
-    /// This is a utility method for consistent hashing across the application.
-    /// 
+
+    /// Decrypt block data using the private key without exposing it
+    ///
+    /// This method performs decryption while keeping the private key
+    /// inside the Secret wrapper, minimizing exposure.
+    ///
     /// # Arguments
-    /// * `data` - Data to hash
-    /// 
+    /// * `block` - The encrypted block to decrypt
+    ///
     /// # Returns
-    /// * `String` - SHA-256 hash as hexadecimal string
-    pub fn hash_sha256(data: &[u8]) -> String {
-        CertificateTools::hash_sha256(data)
-            .map(|bytes| hex::encode(bytes))
-            .unwrap_or_else(|_| String::new())
+    /// * `Result<Vec<u8>>` - The decrypted block data
+    pub fn decrypt_block_data(&self, block: libblockchain::block::Block) -> Result<Vec<u8>> {
+        // Temporarily reconstruct the key only for the duration of this operation
+        let der_bytes = &self.private_key.expose_secret().der_bytes;
+        let pkey = PKey::private_key_from_der(der_bytes)
+            .context("Failed to reconstruct private key from secure storage")?;
+
+        libblockchain::block::Block::get_block_data(block, &pkey)
     }
 }
 
-// secrecy::Secret automatically zeroizes memory on drop
-// This implementation is here for documentation purposes
-impl Drop for AppKeyStore {
-    fn drop(&mut self) {
-        // The Secret<Vec<u8>> will be zeroized automatically
-        // when it goes out of scope, ensuring the private key
-        // is securely erased from memory
+impl fmt::Debug for AppKeyStore {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("AppKeyStore")
+            .field("private_key", &"<securely stored>")
+            .finish()
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use openssl::rsa::Rsa;
 
     #[test]
-    fn test_hash_sha256() {
-        let data = b"test data";
-        let hash1 = AppKeyStore::hash_sha256(data);
-        let hash2 = AppKeyStore::hash_sha256(data);
-        
-        // Same input should produce same hash
-        assert_eq!(hash1, hash2);
-        
-        // Hash should be 64 hex characters (256 bits)
-        assert_eq!(hash1.len(), 64);
-    }
-    
-    #[test]
-    fn test_hash_sha256_different_inputs() {
-        let hash1 = AppKeyStore::hash_sha256(b"data1");
-        let hash2 = AppKeyStore::hash_sha256(b"data2");
-        
-        // Different inputs should produce different hashes
-        assert_ne!(hash1, hash2);
+    fn test_debug_no_leak() {
+        let rsa = Rsa::generate(2048).unwrap();
+        let pkey = PKey::from_rsa(rsa).unwrap();
+        let store = AppKeyStore::new(pkey).unwrap();
+
+        let debug_str = format!("{:?}", store);
+        // Ensure no key material appears in debug output
+        assert!(!debug_str.contains("der_bytes"));
+        assert!(debug_str.contains("securely stored"));
     }
 }

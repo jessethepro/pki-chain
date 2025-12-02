@@ -3,13 +3,12 @@ name = "pki-chain"
 version = "0.1.0"
 edition = "2021"
 
+
 [dependencies]
-libblockchainstor = { path = "../libblockchainstor" }
+libblockchain = { path = "../libblockchain" }
 libcertcrypto = { path = "../libcertcrypto" }
 anyhow = "1.0"
 secrecy = { version = "0.8", features = ["serde"] }
-zeroize = "1.7"
-sha2 = "0.10"
-rsa = "0.9"
 rpassword = "7.3"
 hex = "0.4.3"
+openssl = "0.10"

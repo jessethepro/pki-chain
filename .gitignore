@@ -7,3 +7,6 @@
 *.key
 *.csr
 *.pem
+
+# Blockchain data
+/data
