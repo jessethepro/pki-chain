@@ -6,7 +6,6 @@ edition = "2021"
 
 [dependencies]
 libblockchain = { path = "../libblockchain" }
-libcertcrypto = { path = "../libcertcrypto" }
 anyhow = "1.0"
 secrecy = { version = "0.8", features = ["serde"] }
 rpassword = "7.3"

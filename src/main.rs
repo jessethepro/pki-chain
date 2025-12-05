@@ -1,6 +1,12 @@
+mod generate_intermediate_ca;
+mod generate_root_ca;
+mod generate_user_keypair;
+
 use anyhow::{Context, Result};
+use generate_intermediate_ca::RsaIntermediateCABuilder;
+use generate_root_ca::RsaRootCABuilder;
+use generate_user_keypair::RsaUserKeyPairBuilder;
 use libblockchain::blockchain::BlockChain;
-use libcertcrypto::{RsaIntermediateCABuilder, RsaRootCABuilder, RsaUserKeyPairBuilder};
 use openssl::pkey::{PKey, Private};
 use openssl::x509::X509;
 use std::io::{self, Write};

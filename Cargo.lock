@@ -323,7 +323,6 @@ dependencies = [
  "anyhow",
  "hex",
  "libblockchain",
- "libcertcrypto",
  "openssl",
  "rpassword",
  "secrecy 0.8.0",
