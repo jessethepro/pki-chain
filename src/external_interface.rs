@@ -2,8 +2,11 @@
 //!
 //! Provides Unix socket-based IPC for external applications to interact with the PKI chain.
 
+use crate::chain_state::State;
+use crate::generate_user_keypair::RsaUserKeyPairBuilder;
 use anyhow::{Context, Result};
 use libblockchain::blockchain::BlockChain;
+use libblockchain::uuid::Uuid;
 use openssl::pkey::{PKey, Private};
 use openssl::x509::X509;
 use serde::{Deserialize, Serialize};
@@ -29,8 +32,14 @@ pub enum Request {
         validity_days: u32,
     },
     CreateUser {
-        common_name: String,
+        subject_common_name: String,
         organization: String,
+        organizational_unit: String,
+        locality: String,
+        state: String,
+        country: String,
+        validity_days: u32,
+        issuer_common_name: String,
     },
     ListCertificates,
     ListKeys,
@@ -71,7 +80,6 @@ pub fn start_socket_server(
             SOCKET_PATH
         ))?;
     }
-    use crate::chain_state::State;
     let state = Arc::new(Mutex::new(State::new()));
     // Initialize the state if needed
     {
@@ -95,7 +103,9 @@ pub fn start_socket_server(
                         );
                         state_lock.map_subject_name_to_uid(
                             subject_name,
-                            hex::encode(block.block_header.block_uid.clone()),
+                            Uuid::from_bytes(block.block_header.block_uid)
+                                .hyphenated()
+                                .to_string(),
                         );
                     }
                 }
@@ -117,7 +127,8 @@ pub fn start_socket_server(
             Ok(stream) => {
                 let cert_chain = Arc::clone(&certificate_chain);
                 let priv_chain = Arc::clone(&private_chain);
-                if let Err(e) = handle_client(stream, cert_chain, priv_chain) {
+                let state_clone = Arc::clone(&state);
+                if let Err(e) = handle_client(stream, cert_chain, priv_chain, state_clone) {
                     eprintln!("Error handling client: {}", e);
                 }
             }
@@ -135,6 +146,7 @@ fn handle_client(
     mut stream: UnixStream,
     certificate_chain: Arc<Mutex<BlockChain>>,
     private_chain: Arc<Mutex<BlockChain>>,
+    chain_state: Arc<Mutex<State>>,
 ) -> Result<()> {
     let mut reader = BufReader::new(stream.try_clone()?);
     let mut line = String::new();
@@ -168,15 +180,29 @@ fn handle_client(
             validity_days,
             &certificate_chain,
             &private_chain,
+            &chain_state,
         ),
         Request::CreateUser {
-            common_name,
+            subject_common_name,
             organization,
+            organizational_unit,
+            locality,
+            state,
+            country,
+            validity_days,
+            issuer_common_name,
         } => handle_create_user(
-            common_name,
+            subject_common_name,
             organization,
+            organizational_unit,
+            locality,
+            state,
+            country,
+            issuer_common_name,
+            validity_days,
             &certificate_chain,
             &private_chain,
+            &chain_state,
         ),
         Request::ListCertificates => handle_list_certificates(&certificate_chain),
         Request::ListKeys => handle_list_keys(&private_chain),
@@ -203,6 +229,7 @@ fn handle_create_intermediate(
     validity_days: u32,
     _certificate_chain: &Arc<Mutex<BlockChain>>,
     _private_chain: &Arc<Mutex<BlockChain>>,
+    _state: &Arc<Mutex<State>>,
 ) -> Response {
     use crate::generate_intermediate_ca::RsaIntermediateCABuilder;
     let (root_key, root_cert) = match (|| -> Result<(PKey<Private>, X509)> {
@@ -302,17 +329,135 @@ fn handle_create_intermediate(
 
 /// Handle CreateUser request
 fn handle_create_user(
-    common_name: String,
+    subject_common_name: String,
     organization: String,
+    organizational_unit: String,
+    locality: String,
+    state: String,
+    country: String,
+    issuer_common_name: String,
+    validity_days: u32,
     _certificate_chain: &Arc<Mutex<BlockChain>>,
     _private_chain: &Arc<Mutex<BlockChain>>,
+    chain_state: &Arc<Mutex<State>>,
 ) -> Response {
-    // TODO: Implement user certificate creation
+    let (intermediate_key, intermediate_cert) = match (|| -> Result<(PKey<Private>, X509)> {
+        let intermediate_uid = {
+            match chain_state
+                .lock()
+                .unwrap()
+                .subject_name_to_height
+                .get(&issuer_common_name)
+            {
+                Some(uid_hex) => {
+                    let uuid = Uuid::parse_str(uid_hex)
+                        .context("Failed to parse intermediate UID from state")?;
+                    *uuid.as_bytes()
+                }
+                None => {
+                    return Err(anyhow::anyhow!(
+                        "Issuer common name not found in state: {}",
+                        issuer_common_name
+                    ));
+                }
+            }
+        };
+
+        let block = _certificate_chain
+            .lock()
+            .unwrap()
+            .get_block_by_uuid(&intermediate_uid)?
+            .ok_or_else(|| anyhow::anyhow!("Intermediate certificate not found in blockchain"))?;
+
+        let cert = openssl::x509::X509::from_pem(&block.block_data)
+            .context("Failed to parse intermediate certificate from blockchain")?;
+
+        let key_block = _private_chain
+            .lock()
+            .unwrap()
+            .get_block_by_uuid(&intermediate_uid)?
+            .ok_or_else(|| anyhow::anyhow!("Intermediate private key not found in blockchain"))?;
+
+        let key = openssl::pkey::PKey::private_key_from_der(&key_block.block_data)
+            .context("Failed to parse intermediate private key from blockchain")?;
+
+        Ok((key, cert))
+    })() {
+        Ok(result) => result,
+        Err(e) => {
+            return Response::Error {
+                message: format!("Failed to retrieve Root CA from blockchain: {}", e),
+            };
+        }
+    };
+    let (private_key, certificate) =
+        match RsaUserKeyPairBuilder::new(intermediate_key, intermediate_cert)
+            .subject_common_name(subject_common_name.clone())
+            .organization(organization.clone())
+            .organizational_unit(organizational_unit.clone())
+            .locality(locality.clone())
+            .state(state.clone())
+            .country(country.clone())
+            .validity_days(validity_days)
+            .build()
+        {
+            Ok(result) => result,
+            Err(e) => {
+                return Response::Error {
+                    message: format!(
+                        "Failed to build intermediate certificate or private key: {}",
+                        e
+                    ),
+                };
+            }
+        };
+    // Store certificate in blockchain
+    if let Err(e) = (|| -> Result<()> {
+        let cert_pem = certificate
+            .to_pem()
+            .context("Failed to convert certificate to PEM")?;
+        _certificate_chain
+            .lock()
+            .unwrap()
+            .put_block(cert_pem)
+            .context("Failed to store certificate in blockchain")?;
+        Ok(())
+    })() {
+        return Response::Error {
+            message: format!("Failed to store certificate: {}", e),
+        };
+    }
+
+    // Store private key in blockchain
+    if let Err(e) = (|| -> Result<()> {
+        let key_der = private_key
+            .private_key_to_der()
+            .context("Failed to convert key to DER")?;
+        _private_chain
+            .lock()
+            .unwrap()
+            .put_block(key_der)
+            .context("Failed to store private key in blockchain")?;
+        Ok(())
+    })() {
+        return Response::Error {
+            message: format!("Failed to store private key: {}", e),
+        };
+    }
     Response::Success {
-        message: format!("User certificate creation requested for CN={}", common_name),
+        message: format!(
+            "User certificate creation requested for CN={}",
+            subject_common_name
+        ),
         data: Some(serde_json::json!({
-            "common_name": common_name,
+            "common_name": subject_common_name,
             "organization": organization,
+            "organizational_unit": organizational_unit,
+            "locality": locality,
+            "state": state,
+            "country": country,
+            "issuer_common_name": issuer_common_name,
+            "validity_days": validity_days,
         })),
     }
 }
