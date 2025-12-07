@@ -42,7 +42,6 @@ pub enum Request {
         issuer_common_name: String,
     },
     ListCertificates,
-    ListKeys,
     PKIStatus,
 }
 
@@ -205,8 +204,7 @@ fn handle_client(
             &chain_state,
         ),
         Request::ListCertificates => handle_list_certificates(&certificate_chain),
-        Request::ListKeys => handle_list_keys(&private_chain),
-        Request::PKIStatus => handle_pki_status(&certificate_chain, &private_chain),
+        Request::PKIStatus => handle_pki_status(&certificate_chain, &private_chain, &chain_state),
     };
 
     // Send response back to client
@@ -229,7 +227,7 @@ fn handle_create_intermediate(
     validity_days: u32,
     _certificate_chain: &Arc<Mutex<BlockChain>>,
     _private_chain: &Arc<Mutex<BlockChain>>,
-    _state: &Arc<Mutex<State>>,
+    chain_state: &Arc<Mutex<State>>,
 ) -> Response {
     use crate::generate_intermediate_ca::RsaIntermediateCABuilder;
     let (root_key, root_cert) = match (|| -> Result<(PKey<Private>, X509)> {
@@ -312,7 +310,14 @@ fn handle_create_intermediate(
             message: format!("Failed to store private key: {}", e),
         };
     }
-
+    {
+        let mut state_lock = chain_state.lock().unwrap();
+        state_lock.map_subject_name_to_uid(
+            subject_common_name.clone(),
+            Uuid::new_v4().hyphenated().to_string(),
+        );
+        state_lock.increment_block_count();
+    }
     Response::Success {
         message: format!(
             "Intermediate certificate creation requested for CN={}",
@@ -444,6 +449,15 @@ fn handle_create_user(
             message: format!("Failed to store private key: {}", e),
         };
     }
+    {
+        let mut state_lock = chain_state.lock().unwrap();
+        state_lock.map_subject_name_to_uid(
+            subject_common_name.clone(),
+            Uuid::new_v4().hyphenated().to_string(),
+        );
+        state_lock.increment_block_count();
+    }
+
     Response::Success {
         message: format!(
             "User certificate creation requested for CN={}",
@@ -474,26 +488,135 @@ fn handle_list_certificates(_certificate_chain: &Arc<Mutex<BlockChain>>) -> Resp
     //   "state": "California",
     //   "locality": "San Francisco",
     //   "validity_from": "2025-01-01T00:00:00Z",
-    //   "validity_to": "2026-01-01T00:00:00Z"
+    //   "validity_to": "2026-01-01T00:00:00Z",
+    //   "issuer_common_name": "Issuer CN",
+    //   "serial_number": "1234567890",
+    //   "type": "Root CA" | "Intermediate CA" | "User",
     // }
-    Response::Success {
-        message: "Certificate list retrieved".to_string(),
-        data: Some(serde_json::json!({
-            "certificates": [],
-            "count": 0,
-        })),
-    }
-}
+    let response_data_json = (|| -> Result<serde_json::Value, serde_json::Error> {
+        let certificates: Vec<serde_json::Value> = {
+            let chain = _certificate_chain.lock().unwrap();
+            let chain_iter = chain.iter();
+            let mut certs = Vec::new();
+            for block_result in chain_iter {
+                if let Ok(block) = block_result {
+                    if let Ok(cert) = openssl::x509::X509::from_pem(&block.block_data) {
+                        let subject_name = cert.subject_name().entries().next().map_or(
+                            "Unknown".to_string(),
+                            |entry| {
+                                entry
+                                    .data()
+                                    .as_utf8()
+                                    .map(|s| s.to_string())
+                                    .unwrap_or_else(|_| "InvalidUTF8".to_string())
+                            },
+                        );
+                        let issuer_name = cert.issuer_name().entries().next().map_or(
+                            "Unknown".to_string(),
+                            |entry| {
+                                entry
+                                    .data()
+                                    .as_utf8()
+                                    .map(|s| s.to_string())
+                                    .unwrap_or_else(|_| "InvalidUTF8".to_string())
+                            },
+                        );
+                        let serial_number = cert
+                            .serial_number()
+                            .to_bn()
+                            .ok()
+                            .and_then(|bn| bn.to_hex_str().ok())
+                            .map(|s| s.to_string())
+                            .unwrap_or_else(|| "Unknown".to_string());
 
-/// Handle ListKeys request
-fn handle_list_keys(_private_chain: &Arc<Mutex<BlockChain>>) -> Response {
-    // TODO: Implement private key listing from blockchain
-    Response::Success {
-        message: "Key list retrieved".to_string(),
-        data: Some(serde_json::json!({
-            "keys": [],
-            "count": 0,
-        })),
+                        // Determine certificate type by checking basic constraints
+                        let cert_type = {
+                            let subject_bytes = cert.subject_name().to_der().unwrap_or_default();
+                            let issuer_bytes = cert.issuer_name().to_der().unwrap_or_default();
+                            let is_self_signed = subject_bytes == issuer_bytes;
+
+                            // Check if certificate has CA basic constraints (pathlen indicates CA cert)
+                            let is_ca = cert.pathlen().is_some();
+
+                            if is_self_signed {
+                                "Root CA".to_string()
+                            } else if is_ca {
+                                "Intermediate CA".to_string()
+                            } else {
+                                "User Certificate".to_string()
+                            }
+                        };
+
+                        // Extract certificate details
+                        let (organization, organizational_unit, country, state, locality) = {
+                            let subject = cert.subject_name();
+                            let org = subject
+                                .entries_by_nid(openssl::nid::Nid::ORGANIZATIONNAME)
+                                .next()
+                                .and_then(|e| e.data().as_utf8().ok())
+                                .map(|s| s.to_string())
+                                .unwrap_or_else(|| "Unknown".to_string());
+                            let ou = subject
+                                .entries_by_nid(openssl::nid::Nid::ORGANIZATIONALUNITNAME)
+                                .next()
+                                .and_then(|e| e.data().as_utf8().ok())
+                                .map(|s| s.to_string())
+                                .unwrap_or_else(|| "Unknown".to_string());
+                            let c = subject
+                                .entries_by_nid(openssl::nid::Nid::COUNTRYNAME)
+                                .next()
+                                .and_then(|e| e.data().as_utf8().ok())
+                                .map(|s| s.to_string())
+                                .unwrap_or_else(|| "Unknown".to_string());
+                            let st = subject
+                                .entries_by_nid(openssl::nid::Nid::STATEORPROVINCENAME)
+                                .next()
+                                .and_then(|e| e.data().as_utf8().ok())
+                                .map(|s| s.to_string())
+                                .unwrap_or_else(|| "Unknown".to_string());
+                            let loc = subject
+                                .entries_by_nid(openssl::nid::Nid::LOCALITYNAME)
+                                .next()
+                                .and_then(|e| e.data().as_utf8().ok())
+                                .map(|s| s.to_string())
+                                .unwrap_or_else(|| "Unknown".to_string());
+                            (org, ou, c, st, loc)
+                        };
+
+                        let (validity_from, validity_to) = {
+                            let not_before = cert.not_before().to_string();
+                            let not_after = cert.not_after().to_string();
+                            (not_before, not_after)
+                        };
+
+                        certs.push(serde_json::json!({
+                            "subject_common_name": subject_name,
+                            "organization": organization,
+                            "organizational_unit": organizational_unit,
+                            "country": country,
+                            "state": state,
+                            "locality": locality,
+                            "validity_from": validity_from,
+                            "validity_to": validity_to,
+                            "issuer_common_name": issuer_name,
+                            "serial_number": serial_number,
+                            "type": cert_type,
+                        }));
+                    }
+                }
+            }
+            certs
+        };
+        Ok(serde_json::json!({ "certificates": certificates, "count": certificates.len() }))
+    })();
+    match response_data_json {
+        Ok(data) => Response::Success {
+            message: "Certificate list retrieved".to_string(),
+            data: Some(data),
+        },
+        Err(e) => Response::Error {
+            message: format!("Failed to serialize certificate list: {}", e),
+        },
     }
 }
 
@@ -501,13 +624,33 @@ fn handle_list_keys(_private_chain: &Arc<Mutex<BlockChain>>) -> Response {
 fn handle_pki_status(
     _certificate_chain: &Arc<Mutex<BlockChain>>,
     _private_chain: &Arc<Mutex<BlockChain>>,
+    _chain_staate: &Arc<Mutex<State>>,
 ) -> Response {
-    // TODO: Implement PKI status check
+    match _certificate_chain.lock().unwrap().validate() {
+        Ok(_) => {}
+        Err(e) => {
+            return Response::Error {
+                message: format!("Certificate chain validation failed: {}", e),
+            };
+        }
+    }
+    match _private_chain.lock().unwrap().validate() {
+        Ok(_) => {}
+        Err(e) => {
+            return Response::Error {
+                message: format!("Private key chain validation failed: {}", e),
+            };
+        }
+    }
     Response::Success {
         message: "PKI system operational".to_string(),
         data: Some(serde_json::json!({
             "status": "running",
-            "blockchain_initialized": true,
+            "blockchain_initialized": _chain_staate.lock().unwrap().initialized,
+            "total_blocks": _chain_staate.lock().unwrap().total_blocks,
+            "tracked_subjects": _chain_staate.lock().unwrap().subject_name_to_height.len(),
+            "certificate_chain_valid": true,
+            "private_key_chain_valid": true,
         })),
     }
 }
