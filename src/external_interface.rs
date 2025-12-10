@@ -11,7 +11,7 @@ use openssl::pkey::{PKey, Private};
 use openssl::x509::X509;
 use serde::{Deserialize, Serialize};
 use std::fs;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufReader, Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -43,6 +43,7 @@ pub enum Request {
     },
     ListCertificates,
     PKIStatus,
+    SocketTest,
 }
 
 /// Response types sent back to clients
@@ -148,14 +149,14 @@ fn handle_client(
     chain_state: Arc<Mutex<State>>,
 ) -> Result<()> {
     let mut reader = BufReader::new(stream.try_clone()?);
-    let mut line = String::new();
-
-    // Read JSON request from client
-    reader.read_line(&mut line)?;
-
-    // Parse JSON request
-    let request: Request =
-        serde_json::from_str(&line.trim()).context("Failed to parse JSON request")?;
+    let request: Request = {
+        let mut len_buf = [0u8; 4];
+        reader.read_exact(&mut len_buf)?;
+        let mut buf = vec![0u8; u32::from_le_bytes(len_buf) as usize];
+        reader.read_exact(&mut buf)?;
+        let message_str = String::from_utf8(buf).context("Failed to read message from client")?;
+        serde_json::from_str(&message_str).context("Failed to parse JSON message")?
+    };
 
     println!("Received request: {:?}", request);
 
@@ -205,12 +206,21 @@ fn handle_client(
         ),
         Request::ListCertificates => handle_list_certificates(&certificate_chain),
         Request::PKIStatus => handle_pki_status(&certificate_chain, &private_chain, &chain_state),
+        Request::SocketTest => Response::Success {
+            message: "Socket test successful".to_string(),
+            data: None,
+        },
     };
 
     // Send response back to client
-    let response_json = serde_json::to_string(&response)?;
-    stream.write_all(response_json.as_bytes())?;
-    stream.write_all(b"\n")?;
+    let response_bytes = {
+        let mut bytes_buf = Vec::new();
+        let response_json = serde_json::to_string(&response)?;
+        bytes_buf.extend_from_slice(&(response_json.len() as u32).to_le_bytes());
+        bytes_buf.extend_from_slice(response_json.as_bytes());
+        bytes_buf
+    };
+    stream.write_all(&response_bytes)?;
     stream.flush()?;
 
     Ok(())
@@ -536,7 +546,11 @@ fn handle_list_certificates(_certificate_chain: &Arc<Mutex<BlockChain>>) -> Resp
                             let is_self_signed = subject_bytes == issuer_bytes;
 
                             // Check if certificate has CA basic constraints (pathlen indicates CA cert)
-                            let is_ca = cert.pathlen().is_some();
+                            let pathlen = cert.pathlen();
+                            let is_ca = match pathlen {
+                                Some(_) => true,
+                                None => false,
+                            };
 
                             if is_self_signed {
                                 "Root CA".to_string()
