@@ -18,6 +18,15 @@ use std::sync::{Arc, Mutex};
 
 const SOCKET_PATH: &str = "/tmp/pki_socket";
 
+/// Filter options for listing certificates
+#[derive(Debug, Deserialize, Serialize)]
+enum Filter {
+    All,
+    Intermediate,
+    User,
+    Root,
+}
+
 /// Request types from external applications
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(tag = "type")]
@@ -41,7 +50,9 @@ pub enum Request {
         validity_days: u32,
         issuer_common_name: String,
     },
-    ListCertificates,
+    ListCertificates {
+        filter: String,
+    },
     PKIStatus,
     SocketTest,
 }
@@ -155,6 +166,7 @@ fn handle_client(
         let mut buf = vec![0u8; u32::from_le_bytes(len_buf) as usize];
         reader.read_exact(&mut buf)?;
         let message_str = String::from_utf8(buf).context("Failed to read message from client")?;
+        println!("Received raw message: {}", message_str);
         serde_json::from_str(&message_str).context("Failed to parse JSON message")?
     };
 
@@ -204,7 +216,15 @@ fn handle_client(
             &private_chain,
             &chain_state,
         ),
-        Request::ListCertificates => handle_list_certificates(&certificate_chain),
+        Request::ListCertificates { filter } => match filter.as_str() {
+            "All" => handle_list_certificates(&certificate_chain, Filter::All),
+            "Intermediate" => handle_list_certificates(&certificate_chain, Filter::Intermediate),
+            "User" => handle_list_certificates(&certificate_chain, Filter::User),
+            "Root" => handle_list_certificates(&certificate_chain, Filter::Root),
+            _ => Response::Error {
+                message: format!("Invalid filter option: {}", filter),
+            },
+        },
         Request::PKIStatus => handle_pki_status(&certificate_chain, &private_chain, &chain_state),
         Request::SocketTest => Response::Success {
             message: "Socket test successful".to_string(),
@@ -216,6 +236,7 @@ fn handle_client(
     let response_bytes = {
         let mut bytes_buf = Vec::new();
         let response_json = serde_json::to_string(&response)?;
+        println!("Sending response: {}", response_json);
         bytes_buf.extend_from_slice(&(response_json.len() as u32).to_le_bytes());
         bytes_buf.extend_from_slice(response_json.as_bytes());
         bytes_buf
@@ -239,7 +260,25 @@ fn handle_create_intermediate(
     _private_chain: &Arc<Mutex<BlockChain>>,
     chain_state: &Arc<Mutex<State>>,
 ) -> Response {
+    if chain_state
+        .lock()
+        .unwrap()
+        .subject_name_to_height
+        .get(&subject_common_name)
+        .is_some()
+    {
+        return Response::Error {
+            message: format!(
+                "An entry with the subject common name '{}' already exists",
+                subject_common_name
+            ),
+        };
+    }
     use crate::generate_intermediate_ca::RsaIntermediateCABuilder;
+    println!(
+        "Creating Intermediate CA: CN={}, O={}, OU={}",
+        subject_common_name, organization, organizational_unit
+    );
     let (root_key, root_cert) = match (|| -> Result<(PKey<Private>, X509)> {
         _certificate_chain
             .lock()
@@ -356,6 +395,20 @@ fn handle_create_user(
     _private_chain: &Arc<Mutex<BlockChain>>,
     chain_state: &Arc<Mutex<State>>,
 ) -> Response {
+    if chain_state
+        .lock()
+        .unwrap()
+        .subject_name_to_height
+        .get(&subject_common_name)
+        .is_some()
+    {
+        return Response::Error {
+            message: format!(
+                "An entry with the subject common name '{}' already exists",
+                subject_common_name
+            ),
+        };
+    }
     let (intermediate_key, intermediate_cert) = match (|| -> Result<(PKey<Private>, X509)> {
         let intermediate_uid = {
             match chain_state
@@ -487,8 +540,10 @@ fn handle_create_user(
 }
 
 /// Handle ListCertificates request
-fn handle_list_certificates(_certificate_chain: &Arc<Mutex<BlockChain>>) -> Response {
-    // TODO: Implement certificate listing from blockchain
+fn handle_list_certificates(
+    _certificate_chain: &Arc<Mutex<BlockChain>>,
+    filter: Filter,
+) -> Response {
     // Each certificate should have the format:
     // {
     //   "subject_common_name": "Example CN",
@@ -602,7 +657,25 @@ fn handle_list_certificates(_certificate_chain: &Arc<Mutex<BlockChain>>) -> Resp
                             let not_after = cert.not_after().to_string();
                             (not_before, not_after)
                         };
-
+                        // Apply filter
+                        match filter {
+                            Filter::All => {}
+                            Filter::Intermediate => {
+                                if cert_type != "Intermediate CA" {
+                                    continue;
+                                }
+                            }
+                            Filter::User => {
+                                if cert_type != "User Certificate" {
+                                    continue;
+                                }
+                            }
+                            Filter::Root => {
+                                if cert_type != "Root CA" {
+                                    continue;
+                                }
+                            }
+                        }
                         certs.push(serde_json::json!({
                             "subject_common_name": subject_name,
                             "organization": organization,
