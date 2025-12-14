@@ -1,8 +1,60 @@
+//! Storage Module
+//!
+//! Provides a unified abstraction over dual blockchain storage for PKI certificate management.
+//! This module manages the storage and retrieval of X.509 certificates and their associated
+//! private keys in separate blockchain instances, maintaining consistency through signature
+//! verification and transactional operations.
+//!
+//! # Architecture
+//!
+//! The storage layer uses two parallel blockchain instances:
+//! - **Certificate Chain**: Stores X.509 certificates in PEM format
+//! - **Private Key Chain**: Stores RSA private keys in DER format
+//!
+//! Both chains are kept in sync through:
+//! 1. Height-based indexing (certificates at height N correspond to keys at height N)
+//! 2. Signature verification (each block pair has matching signatures)
+//! 3. Transactional rollback (failed key storage rolls back certificate storage)
+//!
+//! # Example
+//!
+//! ```no_run
+//! use pki_chain::storage::Storage;
+//! use anyhow::Result;
+//!
+//! fn example() -> Result<()> {
+//!     let storage = Storage::new("key/app.key")?;
+//!     
+//!     if storage.is_empty()? {
+//!         println!("Blockchain is empty");
+//!     }
+//!     
+//!     if storage.validate()? {
+//!         println!("Blockchain validation successful");
+//!     }
+//!     
+//!     Ok(())
+//! }
+//! ```
+
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use libblockchain::blockchain::BlockChain;
 
+/// Storage abstraction for PKI certificate and private key blockchain management.
+///
+/// Manages two parallel blockchain instances that store certificates and their corresponding
+/// private keys. Ensures consistency through height-based indexing and signature verification.
+///
+/// # Fields
+///
+/// * `certificate_chain` - Blockchain storing X.509 certificates in PEM format
+/// * `private_chain` - Blockchain storing RSA private keys in DER format
+///
+/// # Thread Safety
+///
+/// Both blockchain instances are wrapped in `Arc` for safe sharing across threads.
 pub struct Storage {
     // Initialize blockchain storage for certificates and private keys
     pub certificate_chain: Arc<BlockChain>,
@@ -10,6 +62,34 @@ pub struct Storage {
 }
 
 impl Storage {
+    /// Creates a new Storage instance with dual blockchain initialization.
+    ///
+    /// Initializes two separate blockchain instances for certificates and private keys,
+    /// using the provided application key for encryption.
+    ///
+    /// # Arguments
+    ///
+    /// * `app_key_path` - Path to the application encryption key file
+    ///
+    /// # Returns
+    ///
+    /// * `Result<Self>` - Storage instance or error if blockchain initialization fails
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - The application key file cannot be read
+    /// - Blockchain directories cannot be created
+    /// - Database initialization fails
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use pki_chain::storage::Storage;
+    ///
+    /// let storage = Storage::new("key/pki-chain-app.key")?;
+    /// # Ok::<(), anyhow::Error>(())
+    /// ```
     pub fn new(app_key_path: &str) -> Result<Self> {
         Ok(Storage {
             // Initialize blockchain storage for certificates and private keys
@@ -17,6 +97,45 @@ impl Storage {
             private_chain: Arc::new(BlockChain::new("data/private_keys", app_key_path)?),
         })
     }
+
+    /// Stores a certificate and private key pair in their respective blockchains.
+    ///
+    /// This method performs a transactional operation:
+    /// 1. Stores the certificate in the certificate blockchain
+    /// 2. Stores the private key in the private key blockchain
+    /// 3. Creates matching signatures for both blocks
+    /// 4. Rolls back certificate storage if private key storage fails
+    ///
+    /// # Arguments
+    ///
+    /// * `private_key` - The RSA private key to store
+    /// * `certificate` - The X.509 certificate to store
+    ///
+    /// # Returns
+    ///
+    /// * `Result<u64>` - The blockchain height where the pair was stored
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - Certificate PEM conversion fails
+    /// - Private key DER conversion fails
+    /// - Blockchain storage operations fail
+    /// - Signature generation or storage fails
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// # use pki_chain::storage::Storage;
+    /// # use openssl::rsa::Rsa;
+    /// # use openssl::pkey::PKey;
+    /// # use openssl::x509::X509;
+    /// # fn example(storage: &Storage, key: &PKey<openssl::pkey::Private>, cert: &X509) -> anyhow::Result<()> {
+    /// let height = storage.store_key_certificate(&key, &cert)?;
+    /// println!("Stored at height: {}", height);
+    /// # Ok(())
+    /// # }
+    /// ```
     pub fn store_key_certificate(
         &self,
         private_key: &openssl::pkey::PKey<openssl::pkey::Private>,
@@ -71,10 +190,37 @@ impl Storage {
         Ok(certificate_height)
     }
 
+    /// Checks if both blockchains are empty.
+    ///
+    /// # Returns
+    ///
+    /// * `Result<bool>` - True if both chains have zero blocks, false otherwise
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// # use pki_chain::storage::Storage;
+    /// # fn example(storage: &Storage) -> anyhow::Result<()> {
+    /// if storage.is_empty()? {
+    ///     println!("No certificates stored yet");
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
     pub fn is_empty(&self) -> Result<bool> {
         Ok(self.certificate_chain.block_count()? == 0 && self.private_chain.block_count()? == 0)
     }
 
+    /// Verifies that a private key matches the one stored at the specified height.
+    ///
+    /// # Arguments
+    ///
+    /// * `private_key` - The private key to verify
+    /// * `height` - The blockchain height to check
+    ///
+    /// # Returns
+    ///
+    /// * `Result<bool>` - True if keys match, false otherwise
     pub fn verify_stored_key(
         &self,
         private_key: &openssl::pkey::PKey<openssl::pkey::Private>,
@@ -88,6 +234,16 @@ impl Storage {
         Ok(stored_key.private_key_to_der()? == private_key.private_key_to_der()?)
     }
 
+    /// Verifies that a certificate matches the one stored at the specified height.
+    ///
+    /// # Arguments
+    ///
+    /// * `certificate` - The certificate to verify
+    /// * `height` - The blockchain height to check
+    ///
+    /// # Returns
+    ///
+    /// * `Result<bool>` - True if certificates match, false otherwise
     pub fn verify_stored_certificate(
         &self,
         certificate: &openssl::x509::X509,
@@ -101,6 +257,20 @@ impl Storage {
         Ok(stored_cert.to_pem()? == certificate.to_pem()?)
     }
 
+    /// Verifies that both a certificate and private key match those stored at the specified height.
+    ///
+    /// This is a convenience method that calls both `verify_stored_key` and
+    /// `verify_stored_certificate`.
+    ///
+    /// # Arguments
+    ///
+    /// * `private_key` - The private key to verify
+    /// * `certificate` - The certificate to verify
+    /// * `height` - The blockchain height to check
+    ///
+    /// # Returns
+    ///
+    /// * `Result<bool>` - True if both match, false otherwise
     pub fn verify_stored_key_certificate_pair(
         &self,
         private_key: &openssl::pkey::PKey<openssl::pkey::Private>,
@@ -111,6 +281,34 @@ impl Storage {
             && self.verify_stored_certificate(certificate, height)?)
     }
 
+    /// Validates the integrity of both blockchains.
+    ///
+    /// Performs comprehensive validation:
+    /// 1. Verifies that certificate and key signatures match at each height
+    /// 2. Validates blockchain integrity (hashes, timestamps, etc.)
+    /// 3. Ensures both chains have consistent state
+    ///
+    /// # Returns
+    ///
+    /// * `Result<bool>` - True if validation succeeds, false if integrity check fails
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if blockchain operations fail during validation.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// # use pki_chain::storage::Storage;
+    /// # fn example(storage: &Storage) -> anyhow::Result<()> {
+    /// if storage.validate()? {
+    ///     println!("Blockchain integrity verified");
+    /// } else {
+    ///     println!("Validation failed - possible tampering detected");
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
     pub fn validate(&self) -> Result<bool> {
         let cert_iter = self.certificate_chain.iter();
         for cert_block in cert_iter {

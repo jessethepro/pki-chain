@@ -2,6 +2,12 @@
 name = "pki-chain"
 version = "0.1.0"
 edition = "2021"
+authors = ["jessethepro"]
+description = "Blockchain-backed PKI certificate authority with three-tier CA hierarchy"
+repository = "https://github.com/jessethepro/pki-chain"
+license = "MIT"
+keywords = ["pki", "blockchain", "certificate", "x509", "ca"]
+categories = ["cryptography", "authentication"]
 
 
 [dependencies]

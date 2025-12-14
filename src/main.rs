@@ -1,3 +1,47 @@
+//! PKI Chain - Blockchain-backed Certificate Authority
+//!
+//! A production-ready Public Key Infrastructure system that stores certificates and private keys
+//! in tamper-proof blockchain storage. Provides a complete three-tier CA hierarchy:
+//! Root CA → Intermediate CA → User Certificates.
+//!
+//! # Features
+//!
+//! - **Blockchain Storage**: Dual blockchain instances for certificates and private keys
+//! - **Unix Socket API**: External IPC interface for certificate operations
+//! - **Three-Tier PKI**: Root CA, Intermediate CAs, and User certificates
+//! - **4096-bit RSA**: Strong cryptographic keys with SHA-256 signatures
+//! - **Transactional Safety**: Automatic rollback on storage failures
+//! - **Signature Verification**: Cross-validation between certificate and key chains
+//!
+//! # Quick Start
+//!
+//! ```bash
+//! # Generate application key (first run only)
+//! ./generate_app_keypair.sh
+//!
+//! # Build and run
+//! cargo build --release
+//! ./target/release/pki-chain
+//! ```
+//!
+//! # Architecture
+//!
+//! The system consists of several key modules:
+//!
+//! - [`storage`]: Blockchain storage abstraction for certificates and keys
+//! - [`external_interface`]: Unix socket server for external certificate requests
+//! - [`generate_root_ca`]: Self-signed Root CA certificate generation
+//! - [`generate_intermediate_ca`]: Intermediate CA generation (signed by Root)
+//! - [`generate_user_keypair`]: User certificate generation (signed by Intermediate)
+//!
+//! # Example Usage
+//!
+//! The application provides an interactive menu for:
+//! 1. Validating blockchain integrity
+//! 2. Viewing certificate statistics
+//!
+//! External applications can request certificates via the Unix socket at `/tmp/pki_socket`.
+
 mod external_interface;
 mod generate_intermediate_ca;
 mod generate_root_ca;
