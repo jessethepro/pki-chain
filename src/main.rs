@@ -1,33 +1,23 @@
-mod chain_state;
 mod external_interface;
 mod generate_intermediate_ca;
 mod generate_root_ca;
 mod generate_user_keypair;
+mod storage;
 
 use anyhow::{Context, Result};
 use generate_root_ca::RsaRootCABuilder;
-use libblockchain::blockchain::BlockChain;
 use std::io::{self, Write};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+use storage::Storage;
 
 const APP_KEY_PATH: &str = "key/pki-chain-app.key";
 
 fn main() -> Result<()> {
     println!("=== PKI Chain Application ===\n");
-    // Initialize blockchain storage for certificates and private keys
-    let _certificate_chain = Arc::new(Mutex::new(BlockChain::new(
-        "data/certificates",
-        APP_KEY_PATH,
-    )?));
-    println!("✓ Certificate blockchain initialized from 'data/certificates'");
+    // Initialize storage
+    let storage = Arc::new(Storage::new(APP_KEY_PATH).context("Failed to initialize storage")?);
 
-    let _private_chain = Arc::new(Mutex::new(BlockChain::new(
-        "data/private_keys",
-        APP_KEY_PATH,
-    )?));
-    println!("✓ Private key blockchain initialized from 'data/private_keys'");
-
-    if _certificate_chain.lock().unwrap().block_count()? == 0 {
+    if storage.is_empty()? {
         let (private_key, certificate) = RsaRootCABuilder::new()
             .subject_common_name("PKI Chain Root CA".to_string())
             .organization("MenaceLabs".to_string())
@@ -39,52 +29,31 @@ fn main() -> Result<()> {
             .build()
             .context("Failed to generate Root CA")?;
         println!("✓ Root CA generated");
-        // Save certificate to blockchain
-        _certificate_chain
-            .lock()
-            .unwrap()
-            .put_block(certificate.to_pem()?)?;
-        _private_chain
-            .lock()
-            .unwrap()
-            .put_block(private_key.private_key_to_der()?)?;
+        // Save to blockchain
+        let height = storage
+            .store_key_certificate(&private_key, &certificate)
+            .context("Failed to store Root CA in blockchain")?;
         println!("✓ Root CA certificate and private key stored in blockchain as the genesis block");
-        // Verify stored Root CA
-        let stored_cert = {
-            let block = _certificate_chain.lock().unwrap().get_block_by_height(0)?;
-            openssl::x509::X509::from_pem(&block.block_data)
-                .context("Failed to parse stored Root CA certificate")?
-        };
-        assert_eq!(
-            stored_cert, certificate,
-            "Stored Root CA certificate does not match generated certificate"
-        );
-        let stored_key = {
-            let block = _private_chain.lock().unwrap().get_block_by_height(0)?;
-            openssl::pkey::PKey::private_key_from_der(&block.block_data)
-                .context("Failed to parse stored Root CA key")?
-        };
-        assert_eq!(
-            stored_key.private_key_to_der()?,
-            private_key.private_key_to_der()?,
-            "Stored Root CA key does not match generated key"
-        );
-        println!("✓ Verified stored Root CA certificate matches generated certificate\n");
-        println!("✓ Verified stored Root CA key matches generated key\n");
 
-        // Export Root CA private key to file
-        std::fs::create_dir_all("exports")?;
-        let key_pem = private_key.private_key_to_pem_pkcs8()?;
-        std::fs::write("exports/root_ca.key", key_pem)?;
-        println!("✓ Root CA private key exported to 'exports/root_ca.key'");
+        // Verify storage
+        if storage.verify_stored_key_certificate_pair(&private_key, &certificate, height)? {
+            println!("✓ Stored Root CA key-certificate pair verified successfully");
+            // Export Root CA private key to file
+            std::fs::create_dir_all("exports")?;
+            let key_pem = private_key.private_key_to_pem_pkcs8()?;
+            std::fs::write("exports/root_ca.key", key_pem)?;
+            println!("✓ Root CA private key exported to 'exports/root_ca.key'");
+        } else {
+            println!("✗ Verification of stored Root CA key-certificate pair failed");
+            return Err(anyhow::anyhow!(
+                "Stored Root CA key-certificate pair verification failed"
+            ));
+        }
     }
     // Start socket server in background thread
-    let cert_chain_clone = Arc::clone(&_certificate_chain);
-    let private_chain_clone = Arc::clone(&_private_chain);
+    let storage_clone = Arc::clone(&storage);
     std::thread::spawn(move || {
-        if let Err(e) =
-            external_interface::start_socket_server(cert_chain_clone, private_chain_clone)
-        {
+        if let Err(e) = external_interface::start_socket_server(&storage_clone) {
             eprintln!("Socket server error: {}", e);
         }
     });
@@ -102,7 +71,7 @@ fn main() -> Result<()> {
         io::stdin().read_line(&mut choice)?;
 
         match choice.trim() {
-            "1" => validate_blockchain(&_certificate_chain, &_private_chain)?,
+            "1" => validate_pki_storage(&storage)?,
             "2" => {
                 println!("\nExiting PKI Chain application...");
                 break;
@@ -114,35 +83,18 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-fn validate_blockchain(
-    certificate_chain: &Arc<Mutex<BlockChain>>,
-    private_chain: &Arc<Mutex<BlockChain>>,
-) -> Result<()> {
+fn validate_pki_storage(storage: &Storage) -> Result<()> {
     println!("\n=== Validate Blockchain ===");
+    if storage.is_empty()? {
+        println!("Blockchain is empty. No data to validate.");
+        return Ok(());
+    }
 
-    print!("Validating certificate blockchain... ");
-    io::stdout().flush()?;
-    certificate_chain.lock().unwrap().validate()?;
-    println!("✓ Valid");
-
-    print!("Validating private key blockchain... ");
-    io::stdout().flush()?;
-    private_chain.lock().unwrap().validate()?;
-    println!("✓ Valid");
-
-    println!("\n✓ Both blockchains are valid");
-    println!(
-        "  Certificate chain height: {}",
-        certificate_chain.lock().unwrap().get_height()?
-    );
-    println!(
-        "  Private key chain height: {}",
-        private_chain.lock().unwrap().get_height()?
-    );
-    println!(
-        "  Total blocks: {}",
-        certificate_chain.lock().unwrap().block_count()?
-    );
-
+    if storage.validate()? {
+        println!("✓ Blockchain validation successful");
+    } else {
+        println!("✗ Blockchain validation failed");
+        return Err(anyhow::anyhow!("Blockchain validation failed"));
+    }
     Ok(())
 }

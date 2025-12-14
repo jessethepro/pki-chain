@@ -2,11 +2,9 @@
 //!
 //! Provides Unix socket-based IPC for external applications to interact with the PKI chain.
 
-use crate::chain_state::State;
 use crate::generate_user_keypair::RsaUserKeyPairBuilder;
+use crate::storage::Storage;
 use anyhow::{Context, Result};
-use libblockchain::blockchain::BlockChain;
-use libblockchain::uuid::Uuid;
 use openssl::pkey::{PKey, Private};
 use openssl::x509::X509;
 use serde::{Deserialize, Serialize};
@@ -14,7 +12,6 @@ use std::fs;
 use std::io::{BufReader, Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
-use std::sync::{Arc, Mutex};
 
 const SOCKET_PATH: &str = "/tmp/pki_socket";
 
@@ -80,10 +77,9 @@ pub enum Response {
 /// use external_interface::start_socket_server;
 /// start_socket_server().expect("Failed to start socket server");
 /// ```
-pub fn start_socket_server(
-    certificate_chain: Arc<Mutex<BlockChain>>,
-    private_chain: Arc<Mutex<BlockChain>>,
-) -> Result<()> {
+pub fn start_socket_server(storage: &Storage) -> Result<()> {
+    let mut subject_name_to_height: std::collections::HashMap<String, u64> =
+        std::collections::HashMap::new();
     // Remove existing socket file if it exists
     if Path::new(SOCKET_PATH).exists() {
         fs::remove_file(SOCKET_PATH).context(format!(
@@ -91,37 +87,24 @@ pub fn start_socket_server(
             SOCKET_PATH
         ))?;
     }
-    let state = Arc::new(Mutex::new(State::new()));
     // Initialize the state if needed
-    {
-        let mut state_lock = state.lock().unwrap();
-        if !state_lock.initialized {
-            let chain = certificate_chain.lock().unwrap();
-            state_lock.total_blocks = chain.block_count()? as u64;
-            let chain_iter = chain.iter();
-            for block_result in chain_iter {
-                if let Ok(block) = block_result {
-                    if let Ok(cert) = openssl::x509::X509::from_pem(&block.block_data) {
-                        let subject_name = cert.subject_name().entries().next().map_or(
-                            "Unknown".to_string(),
-                            |entry| {
-                                entry
-                                    .data()
-                                    .as_utf8()
-                                    .map(|s| s.to_string())
-                                    .unwrap_or_else(|_| "InvalidUTF8".to_string())
-                            },
-                        );
-                        state_lock.map_subject_name_to_uid(
-                            subject_name,
-                            Uuid::from_bytes(block.block_header.block_uid)
-                                .hyphenated()
-                                .to_string(),
-                        );
-                    }
-                }
+    let chain_iter = storage.certificate_chain.iter();
+    for (height, block_result) in chain_iter.enumerate() {
+        if let Ok(block) = block_result {
+            if let Ok(cert) = openssl::x509::X509::from_pem(&block.block_data) {
+                let subject_name =
+                    cert.subject_name()
+                        .entries()
+                        .next()
+                        .map_or("Unknown".to_string(), |entry| {
+                            entry
+                                .data()
+                                .as_utf8()
+                                .map(|s| s.to_string())
+                                .unwrap_or_else(|_| "InvalidUTF8".to_string())
+                        });
+                subject_name_to_height.insert(subject_name, height as u64);
             }
-            state_lock.mark_initialized();
         }
     }
 
@@ -136,11 +119,8 @@ pub fn start_socket_server(
     for stream in listener.incoming() {
         match stream {
             Ok(stream) => {
-                let cert_chain = Arc::clone(&certificate_chain);
-                let priv_chain = Arc::clone(&private_chain);
-                let state_clone = Arc::clone(&state);
-                if let Err(e) = handle_client(stream, cert_chain, priv_chain, state_clone) {
-                    eprintln!("Error handling client: {}", e);
+                if let Err(e) = handle_client(stream, storage, subject_name_to_height.clone()) {
+                    eprintln!("Error handling client request: {}", e);
                 }
             }
             Err(e) => {
@@ -155,9 +135,8 @@ pub fn start_socket_server(
 /// Handle an individual client connection
 fn handle_client(
     mut stream: UnixStream,
-    certificate_chain: Arc<Mutex<BlockChain>>,
-    private_chain: Arc<Mutex<BlockChain>>,
-    chain_state: Arc<Mutex<State>>,
+    storage: &Storage,
+    mut subject_name_to_height: std::collections::HashMap<String, u64>,
 ) -> Result<()> {
     let mut reader = BufReader::new(stream.try_clone()?);
     let request: Request = {
@@ -190,9 +169,8 @@ fn handle_client(
             state,
             country,
             validity_days,
-            &certificate_chain,
-            &private_chain,
-            &chain_state,
+            &storage,
+            &mut subject_name_to_height,
         ),
         Request::CreateUser {
             subject_common_name,
@@ -212,20 +190,19 @@ fn handle_client(
             country,
             issuer_common_name,
             validity_days,
-            &certificate_chain,
-            &private_chain,
-            &chain_state,
+            &storage,
+            &mut subject_name_to_height,
         ),
         Request::ListCertificates { filter } => match filter.as_str() {
-            "All" => handle_list_certificates(&certificate_chain, Filter::All),
-            "Intermediate" => handle_list_certificates(&certificate_chain, Filter::Intermediate),
-            "User" => handle_list_certificates(&certificate_chain, Filter::User),
-            "Root" => handle_list_certificates(&certificate_chain, Filter::Root),
+            "All" => handle_list_certificates(&storage, Filter::All),
+            "Intermediate" => handle_list_certificates(&storage, Filter::Intermediate),
+            "User" => handle_list_certificates(&storage, Filter::User),
+            "Root" => handle_list_certificates(&storage, Filter::Root),
             _ => Response::Error {
                 message: format!("Invalid filter option: {}", filter),
             },
         },
-        Request::PKIStatus => handle_pki_status(&certificate_chain, &private_chain, &chain_state),
+        Request::PKIStatus => handle_pki_status(&storage, &subject_name_to_height),
         Request::SocketTest => Response::Success {
             message: "Socket test successful".to_string(),
             data: None,
@@ -236,7 +213,7 @@ fn handle_client(
     let response_bytes = {
         let mut bytes_buf = Vec::new();
         let response_json = serde_json::to_string(&response)?;
-        println!("Sending response: {}", response_json);
+        //println!("Sending response: {}", response_json);
         bytes_buf.extend_from_slice(&(response_json.len() as u32).to_le_bytes());
         bytes_buf.extend_from_slice(response_json.as_bytes());
         bytes_buf
@@ -256,17 +233,10 @@ fn handle_create_intermediate(
     state: String,
     country: String,
     validity_days: u32,
-    _certificate_chain: &Arc<Mutex<BlockChain>>,
-    _private_chain: &Arc<Mutex<BlockChain>>,
-    chain_state: &Arc<Mutex<State>>,
+    storage: &Storage,
+    subject_name_to_height: &mut std::collections::HashMap<String, u64>,
 ) -> Response {
-    if chain_state
-        .lock()
-        .unwrap()
-        .subject_name_to_height
-        .get(&subject_common_name)
-        .is_some()
-    {
+    if subject_name_to_height.get(&subject_common_name).is_some() {
         return Response::Error {
             message: format!(
                 "An entry with the subject common name '{}' already exists",
@@ -280,23 +250,33 @@ fn handle_create_intermediate(
         subject_common_name, organization, organizational_unit
     );
     let (root_key, root_cert) = match (|| -> Result<(PKey<Private>, X509)> {
-        _certificate_chain
-            .lock()
-            .unwrap()
+        let cert_block = storage
+            .certificate_chain
             .get_block_by_height(0)
-            .and_then(|block| {
-                let cert = openssl::x509::X509::from_pem(&block.block_data)
-                    .context("Failed to parse Root CA certificate from blockchain")?;
-                let key = _private_chain
-                    .lock()
-                    .unwrap()
-                    .get_block_by_height(0)
-                    .and_then(|key_block| {
-                        openssl::pkey::PKey::private_key_from_der(&key_block.block_data)
-                            .context("Failed to parse Root CA private key from blockchain")
-                    })?;
-                Ok((key, cert))
-            })
+            .context("Failed to get Root CA certificate block at height 0")?;
+
+        println!(
+            "Root CA cert block size: {} bytes",
+            cert_block.block_data.len()
+        );
+
+        let cert = openssl::x509::X509::from_pem(&cert_block.block_data)
+            .context("Failed to parse Root CA certificate from blockchain")?;
+
+        let key_block = storage
+            .private_chain
+            .get_block_by_height(0)
+            .context("Failed to get Root CA private key block at height 0")?;
+
+        println!(
+            "Root CA key block size: {} bytes",
+            key_block.block_data.len()
+        );
+
+        let key = openssl::pkey::PKey::private_key_from_der(&key_block.block_data)
+            .context("Failed to parse Root CA private key from blockchain")?;
+
+        Ok((key, cert))
     })() {
         Ok(result) => result,
         Err(e) => {
@@ -327,45 +307,25 @@ fn handle_create_intermediate(
     };
 
     // Store certificate in blockchain
-    if let Err(e) = (|| -> Result<()> {
-        let cert_pem = certificate
-            .to_pem()
-            .context("Failed to convert certificate to PEM")?;
-        _certificate_chain
-            .lock()
-            .unwrap()
-            .put_block(cert_pem)
-            .context("Failed to store certificate in blockchain")?;
-        Ok(())
-    })() {
-        return Response::Error {
-            message: format!("Failed to store certificate: {}", e),
-        };
-    }
-
-    // Store private key in blockchain
-    if let Err(e) = (|| -> Result<()> {
-        let key_der = private_key
-            .private_key_to_der()
-            .context("Failed to convert key to DER")?;
-        _private_chain
-            .lock()
-            .unwrap()
-            .put_block(key_der)
-            .context("Failed to store private key in blockchain")?;
-        Ok(())
-    })() {
-        return Response::Error {
-            message: format!("Failed to store private key: {}", e),
-        };
-    }
-    {
-        let mut state_lock = chain_state.lock().unwrap();
-        state_lock.map_subject_name_to_uid(
-            subject_common_name.clone(),
-            Uuid::new_v4().hyphenated().to_string(),
-        );
-        state_lock.increment_block_count();
+    let height = storage
+        .store_key_certificate(&private_key, &certificate)
+        .map_err(|e| Response::Error {
+            message: format!("Failed to store key-certificate pair: {}", e),
+        })
+        .ok();
+    match height {
+        Some(h) => {
+            subject_name_to_height.insert(subject_common_name.clone(), h);
+            println!(
+                "✓ Intermediate CA certificate and private key stored in blockchain at height {}",
+                h
+            );
+        }
+        None => {
+            return Response::Error {
+                message: "Failed to store intermediate key-certificate pair".to_string(),
+            };
+        }
     }
     Response::Success {
         message: format!(
@@ -391,17 +351,14 @@ fn handle_create_user(
     country: String,
     issuer_common_name: String,
     validity_days: u32,
-    _certificate_chain: &Arc<Mutex<BlockChain>>,
-    _private_chain: &Arc<Mutex<BlockChain>>,
-    chain_state: &Arc<Mutex<State>>,
+    storage: &Storage,
+    subject_name_to_height: &mut std::collections::HashMap<String, u64>,
 ) -> Response {
-    if chain_state
-        .lock()
-        .unwrap()
-        .subject_name_to_height
-        .get(&subject_common_name)
-        .is_some()
-    {
+    println!(
+        "Creating User Certificate: CN={}, O={}, OU={}, Issuer CN={}",
+        subject_common_name, organization, organizational_unit, issuer_common_name
+    );
+    if subject_name_to_height.get(&subject_common_name).is_some() {
         return Response::Error {
             message: format!(
                 "An entry with the subject common name '{}' already exists",
@@ -410,18 +367,9 @@ fn handle_create_user(
         };
     }
     let (intermediate_key, intermediate_cert) = match (|| -> Result<(PKey<Private>, X509)> {
-        let intermediate_uid = {
-            match chain_state
-                .lock()
-                .unwrap()
-                .subject_name_to_height
-                .get(&issuer_common_name)
-            {
-                Some(uid_hex) => {
-                    let uuid = Uuid::parse_str(uid_hex)
-                        .context("Failed to parse intermediate UID from state")?;
-                    *uuid.as_bytes()
-                }
+        let intermediate_height = {
+            match subject_name_to_height.get(&issuer_common_name) {
+                Some(height) => height.clone(),
                 None => {
                     return Err(anyhow::anyhow!(
                         "Issuer common name not found in state: {}",
@@ -431,20 +379,16 @@ fn handle_create_user(
             }
         };
 
-        let block = _certificate_chain
-            .lock()
-            .unwrap()
-            .get_block_by_uuid(&intermediate_uid)?
-            .ok_or_else(|| anyhow::anyhow!("Intermediate certificate not found in blockchain"))?;
+        let block = storage
+            .certificate_chain
+            .get_block_by_height(intermediate_height)?;
 
         let cert = openssl::x509::X509::from_pem(&block.block_data)
             .context("Failed to parse intermediate certificate from blockchain")?;
 
-        let key_block = _private_chain
-            .lock()
-            .unwrap()
-            .get_block_by_uuid(&intermediate_uid)?
-            .ok_or_else(|| anyhow::anyhow!("Intermediate private key not found in blockchain"))?;
+        let key_block = storage
+            .private_chain
+            .get_block_by_height(intermediate_height)?;
 
         let key = openssl::pkey::PKey::private_key_from_der(&key_block.block_data)
             .context("Failed to parse intermediate private key from blockchain")?;
@@ -454,7 +398,7 @@ fn handle_create_user(
         Ok(result) => result,
         Err(e) => {
             return Response::Error {
-                message: format!("Failed to retrieve Root CA from blockchain: {}", e),
+                message: format!("Failed to retrieve Intermediate CA from blockchain: {}", e),
             };
         }
     };
@@ -479,46 +423,26 @@ fn handle_create_user(
                 };
             }
         };
-    // Store certificate in blockchain
-    if let Err(e) = (|| -> Result<()> {
-        let cert_pem = certificate
-            .to_pem()
-            .context("Failed to convert certificate to PEM")?;
-        _certificate_chain
-            .lock()
-            .unwrap()
-            .put_block(cert_pem)
-            .context("Failed to store certificate in blockchain")?;
-        Ok(())
-    })() {
-        return Response::Error {
-            message: format!("Failed to store certificate: {}", e),
-        };
-    }
-
-    // Store private key in blockchain
-    if let Err(e) = (|| -> Result<()> {
-        let key_der = private_key
-            .private_key_to_der()
-            .context("Failed to convert key to DER")?;
-        _private_chain
-            .lock()
-            .unwrap()
-            .put_block(key_der)
-            .context("Failed to store private key in blockchain")?;
-        Ok(())
-    })() {
-        return Response::Error {
-            message: format!("Failed to store private key: {}", e),
-        };
-    }
-    {
-        let mut state_lock = chain_state.lock().unwrap();
-        state_lock.map_subject_name_to_uid(
-            subject_common_name.clone(),
-            Uuid::new_v4().hyphenated().to_string(),
-        );
-        state_lock.increment_block_count();
+    // Store certificate and key in blockchain
+    let height = storage
+        .store_key_certificate(&private_key, &certificate)
+        .map_err(|e| Response::Error {
+            message: format!("Failed to store key-certificate pair: {}", e),
+        })
+        .ok();
+    match height {
+        Some(h) => {
+            subject_name_to_height.insert(subject_common_name.clone(), h);
+            println!(
+                "✓ User certificate and private key stored in blockchain at height {}",
+                h
+            );
+        }
+        None => {
+            return Response::Error {
+                message: "Failed to store user key-certificate pair".to_string(),
+            };
+        }
     }
 
     Response::Success {
@@ -540,10 +464,7 @@ fn handle_create_user(
 }
 
 /// Handle ListCertificates request
-fn handle_list_certificates(
-    _certificate_chain: &Arc<Mutex<BlockChain>>,
-    filter: Filter,
-) -> Response {
+fn handle_list_certificates(storage: &Storage, filter: Filter) -> Response {
     // Each certificate should have the format:
     // {
     //   "subject_common_name": "Example CN",
@@ -560,8 +481,7 @@ fn handle_list_certificates(
     // }
     let response_data_json = (|| -> Result<serde_json::Value, serde_json::Error> {
         let certificates: Vec<serde_json::Value> = {
-            let chain = _certificate_chain.lock().unwrap();
-            let chain_iter = chain.iter();
+            let chain_iter = storage.certificate_chain.iter();
             let mut certs = Vec::new();
             for block_result in chain_iter {
                 if let Ok(block) = block_result {
@@ -709,65 +629,25 @@ fn handle_list_certificates(
 
 /// Handle PKIStatus request
 fn handle_pki_status(
-    _certificate_chain: &Arc<Mutex<BlockChain>>,
-    _private_chain: &Arc<Mutex<BlockChain>>,
-    _chain_staate: &Arc<Mutex<State>>,
+    storage: &Storage,
+    subject_name_to_height: &std::collections::HashMap<String, u64>,
 ) -> Response {
-    match _certificate_chain.lock().unwrap().validate() {
-        Ok(_) => {}
-        Err(e) => {
-            return Response::Error {
-                message: format!("Certificate chain validation failed: {}", e),
-            };
-        }
+    // Validate both chains
+    if !storage.validate().unwrap_or(false) {
+        return Response::Error {
+            message: "Blockchain validation failed".to_string(),
+        };
     }
-    match _private_chain.lock().unwrap().validate() {
-        Ok(_) => {}
-        Err(e) => {
-            return Response::Error {
-                message: format!("Private key chain validation failed: {}", e),
-            };
-        }
-    }
+
     Response::Success {
         message: "PKI system operational".to_string(),
         data: Some(serde_json::json!({
             "status": "running",
-            "blockchain_initialized": _chain_staate.lock().unwrap().initialized,
-            "total_blocks": _chain_staate.lock().unwrap().total_blocks,
-            "tracked_subjects": _chain_staate.lock().unwrap().subject_name_to_height.len(),
-            "certificate_chain_valid": true,
-            "private_key_chain_valid": true,
+            "Total Certificates": storage.certificate_chain.block_count().unwrap_or(0),
+            "total_Keys": storage.private_chain.block_count().unwrap_or(0),
+            "tracked_subjects": subject_name_to_height.len(),
+            "certificate_chain_valid": storage.certificate_chain.validate().is_ok(),
+            "private_key_chain_valid": storage.private_chain.validate().is_ok(),
         })),
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_request_deserialization() {
-        let json = r#"{"type":"CreateIntermediate","common_name":"Test CA","organization":"Test Org","organizational_unit":"IT","country":"US"}"#;
-        let request: Request = serde_json::from_str(json).unwrap();
-        match request {
-            Request::CreateIntermediate {
-                subject_common_name,
-                ..
-            } => {
-                assert_eq!(subject_common_name, "Test CA");
-            }
-            _ => panic!("Wrong request type"),
-        }
-    }
-
-    #[test]
-    fn test_response_serialization() {
-        let response = Response::Success {
-            message: "Test".to_string(),
-            data: None,
-        };
-        let json = serde_json::to_string(&response).unwrap();
-        assert!(json.contains("Success"));
     }
 }

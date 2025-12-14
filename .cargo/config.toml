@@ -1,0 +1,4 @@
+# Musl configuration (disabled for now - use `cross` for static builds)
+# [target.x86_64-unknown-linux-musl]
+# linker = "musl-gcc"
+# rustflags = ["-C", "target-feature=+crt-static"]
