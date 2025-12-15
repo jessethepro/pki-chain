@@ -13,7 +13,8 @@ A blockchain-backed Public Key Infrastructure (PKI) certificate authority system
 - 🔄 **Transactional Safety**: Automatic rollback on storage failures
 - ✅ **Signature Verification**: Cross-validation between certificate and key chains
 - 🔌 **Unix Socket API**: External IPC interface for certificate operations
-- 🎯 **Height-Based Indexing**: O(1) certificate lookups
+- 🎯 **Height-Based Indexing**: O(1) certificate lookups with thread-safe Mutex-protected HashMap
+- 🧵 **Thread Safety**: Arc-wrapped Storage with concurrent access support
 
 ## Architecture
 
@@ -32,9 +33,10 @@ A blockchain-backed Public Key Infrastructure (PKI) certificate authority system
          └───────────────┬───────────────────┘
                          │
          ┌───────────────▼────────────────┐
-         │      Storage Abstraction        │
+         │   Arc<Storage> (Thread-Safe)   │
          │  - Transactional Operations    │
          │  - Signature Verification      │
+         │  - Mutex<subject→height map>   │
          └───────────┬────────────────────┘
                      │
          ┌───────────┴────────────────┐

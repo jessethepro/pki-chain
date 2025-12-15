@@ -12,6 +12,7 @@ use std::fs;
 use std::io::{BufReader, Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
+use std::sync::Arc;
 
 const SOCKET_PATH: &str = "/tmp/pki_socket";
 
@@ -77,9 +78,7 @@ pub enum Response {
 /// use external_interface::start_socket_server;
 /// start_socket_server().expect("Failed to start socket server");
 /// ```
-pub fn start_socket_server(storage: &Storage) -> Result<()> {
-    let mut subject_name_to_height: std::collections::HashMap<String, u64> =
-        std::collections::HashMap::new();
+pub fn start_socket_server(storage: Arc<Storage>) -> Result<()> {
     // Remove existing socket file if it exists
     if Path::new(SOCKET_PATH).exists() {
         fs::remove_file(SOCKET_PATH).context(format!(
@@ -103,7 +102,11 @@ pub fn start_socket_server(storage: &Storage) -> Result<()> {
                                 .map(|s| s.to_string())
                                 .unwrap_or_else(|_| "InvalidUTF8".to_string())
                         });
-                subject_name_to_height.insert(subject_name, height as u64);
+                storage
+                    .subject_name_to_height
+                    .lock()
+                    .unwrap()
+                    .insert(subject_name, height as u64);
             }
         }
     }
@@ -119,7 +122,8 @@ pub fn start_socket_server(storage: &Storage) -> Result<()> {
     for stream in listener.incoming() {
         match stream {
             Ok(stream) => {
-                if let Err(e) = handle_client(stream, storage, subject_name_to_height.clone()) {
+                let storage_clone = Arc::clone(&storage);
+                if let Err(e) = handle_client(stream, storage_clone) {
                     eprintln!("Error handling client request: {}", e);
                 }
             }
@@ -133,11 +137,7 @@ pub fn start_socket_server(storage: &Storage) -> Result<()> {
 }
 
 /// Handle an individual client connection
-fn handle_client(
-    mut stream: UnixStream,
-    storage: &Storage,
-    mut subject_name_to_height: std::collections::HashMap<String, u64>,
-) -> Result<()> {
+fn handle_client(mut stream: UnixStream, storage: Arc<Storage>) -> Result<()> {
     let mut reader = BufReader::new(stream.try_clone()?);
     let request: Request = {
         let mut len_buf = [0u8; 4];
@@ -170,7 +170,6 @@ fn handle_client(
             country,
             validity_days,
             &storage,
-            &mut subject_name_to_height,
         ),
         Request::CreateUser {
             subject_common_name,
@@ -191,7 +190,6 @@ fn handle_client(
             issuer_common_name,
             validity_days,
             &storage,
-            &mut subject_name_to_height,
         ),
         Request::ListCertificates { filter } => match filter.as_str() {
             "All" => handle_list_certificates(&storage, Filter::All),
@@ -202,7 +200,7 @@ fn handle_client(
                 message: format!("Invalid filter option: {}", filter),
             },
         },
-        Request::PKIStatus => handle_pki_status(&storage, &subject_name_to_height),
+        Request::PKIStatus => handle_pki_status(&storage),
         Request::SocketTest => Response::Success {
             message: "Socket test successful".to_string(),
             data: None,
@@ -234,9 +232,14 @@ fn handle_create_intermediate(
     country: String,
     validity_days: u32,
     storage: &Storage,
-    subject_name_to_height: &mut std::collections::HashMap<String, u64>,
 ) -> Response {
-    if subject_name_to_height.get(&subject_common_name).is_some() {
+    if storage
+        .subject_name_to_height
+        .lock()
+        .unwrap()
+        .get(&subject_common_name)
+        .is_some()
+    {
         return Response::Error {
             message: format!(
                 "An entry with the subject common name '{}' already exists",
@@ -315,7 +318,11 @@ fn handle_create_intermediate(
         .ok();
     match height {
         Some(h) => {
-            subject_name_to_height.insert(subject_common_name.clone(), h);
+            storage
+                .subject_name_to_height
+                .lock()
+                .unwrap()
+                .insert(subject_common_name.clone(), h);
             println!(
                 "✓ Intermediate CA certificate and private key stored in blockchain at height {}",
                 h
@@ -352,13 +359,18 @@ fn handle_create_user(
     issuer_common_name: String,
     validity_days: u32,
     storage: &Storage,
-    subject_name_to_height: &mut std::collections::HashMap<String, u64>,
 ) -> Response {
     println!(
         "Creating User Certificate: CN={}, O={}, OU={}, Issuer CN={}",
         subject_common_name, organization, organizational_unit, issuer_common_name
     );
-    if subject_name_to_height.get(&subject_common_name).is_some() {
+    if storage
+        .subject_name_to_height
+        .lock()
+        .unwrap()
+        .get(&subject_common_name)
+        .is_some()
+    {
         return Response::Error {
             message: format!(
                 "An entry with the subject common name '{}' already exists",
@@ -368,7 +380,12 @@ fn handle_create_user(
     }
     let (intermediate_key, intermediate_cert) = match (|| -> Result<(PKey<Private>, X509)> {
         let intermediate_height = {
-            match subject_name_to_height.get(&issuer_common_name) {
+            match storage
+                .subject_name_to_height
+                .lock()
+                .unwrap()
+                .get(&issuer_common_name)
+            {
                 Some(height) => height.clone(),
                 None => {
                     return Err(anyhow::anyhow!(
@@ -432,7 +449,11 @@ fn handle_create_user(
         .ok();
     match height {
         Some(h) => {
-            subject_name_to_height.insert(subject_common_name.clone(), h);
+            storage
+                .subject_name_to_height
+                .lock()
+                .unwrap()
+                .insert(subject_common_name.clone(), h);
             println!(
                 "✓ User certificate and private key stored in blockchain at height {}",
                 h
@@ -628,10 +649,7 @@ fn handle_list_certificates(storage: &Storage, filter: Filter) -> Response {
 }
 
 /// Handle PKIStatus request
-fn handle_pki_status(
-    storage: &Storage,
-    subject_name_to_height: &std::collections::HashMap<String, u64>,
-) -> Response {
+fn handle_pki_status(storage: &Storage) -> Response {
     // Validate both chains
     if !storage.validate().unwrap_or(false) {
         return Response::Error {
@@ -645,9 +663,10 @@ fn handle_pki_status(
             "status": "running",
             "Total Certificates": storage.certificate_chain.block_count().unwrap_or(0),
             "total_Keys": storage.private_chain.block_count().unwrap_or(0),
-            "tracked_subjects": subject_name_to_height.len(),
+            "tracked_subject_names": storage.subject_name_to_height.lock().unwrap().len(),
             "certificate_chain_valid": storage.certificate_chain.validate().is_ok(),
             "private_key_chain_valid": storage.private_chain.validate().is_ok(),
+            "PKI Chain in Sync": true,
         })),
     }
 }

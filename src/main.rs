@@ -97,7 +97,7 @@ fn main() -> Result<()> {
     // Start socket server in background thread
     let storage_clone = Arc::clone(&storage);
     std::thread::spawn(move || {
-        if let Err(e) = external_interface::start_socket_server(&storage_clone) {
+        if let Err(e) = external_interface::start_socket_server(storage_clone) {
             eprintln!("Socket server error: {}", e);
         }
     });

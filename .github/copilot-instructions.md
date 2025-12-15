@@ -22,7 +22,7 @@ This is a blockchain-backed PKI (Public Key Infrastructure) certificate authorit
 
 1. **Initialization** ([main.rs](src/main.rs)): On first run, generates Root CA and stores as genesis blocks (height 0) in both blockchains. Validates stored certificates match generated ones. Exports Root CA private key to `exports/root_ca.key`. Subsequent runs skip generation if block_count() > 0.
 2. **Certificate Creation** ([external_interface.rs](src/external_interface.rs)): New certificates stored via `put_block()`. Blockchain automatically assigns UUIDs. On failure during private key storage, certificate is rolled back via `delete_latest_block()`.
-3. **State Management** ([chain_state.rs](src/chain_state.rs)): In-memory `subject_name_to_height` HashMap maps common names to block heights for fast certificate retrieval. Initialized at socket server startup by iterating entire certificate blockchain. Validates against duplicate subject common names before creation.
+3. **State Management** ([storage.rs](src/storage.rs)): In-memory `subject_name_to_height` Mutex-wrapped HashMap inside `Storage` struct maps common names to block heights for fast certificate retrieval. Initialized at socket server startup by iterating entire certificate blockchain. Validates against duplicate subject common names before creation. Thread-safe access via `.lock().unwrap()`.
 4. **Socket Protocol** ([external_interface.rs](src/external_interface.rs)): Length-prefixed JSON messages (4-byte LE length + JSON payload). Server spawns in background thread via `std::thread::spawn()`, listens on Unix socket, handles connections serially.
 
 ## Key Conventions
@@ -153,21 +153,23 @@ All cryptographic operations use `openssl` crate:
 
 ## Common Pitfalls
 
-1. **Mutex Deadlocks**: Always release `lock()` before blockchain operations that may take time. Use scoped blocks `{ let lock = mutex.lock().unwrap(); ... }` to force drops.
+1. **Mutex Deadlocks**: The `subject_name_to_height` HashMap is protected by a Mutex in the `Storage` struct. Always release `lock()` before blockchain operations that may take time. Use scoped blocks `{ let lock = storage.subject_name_to_height.lock().unwrap(); ... }` to force drops, or extract values immediately: `let height = storage.subject_name_to_height.lock().unwrap().get(&name).cloned();`.
 2. **Block Height vs UUID**: Genesis Root CA is at height 0 (accessed via `get_block_by_height(0)`). All blocks have UUIDs but state HashMap maps subject→height for O(1) lookups.
 3. **Certificate Validation**: Intermediate CAs have `pathlen=0` (can't sign other CAs). Root CA has `pathlen=1` (can sign one level of CAs). Set via `BasicConstraints::new().ca().pathlen(n)`.
 4. **Socket Message Protocol**: Must send 4-byte little-endian length prefix before JSON payload (`u32::from_le_bytes(len_buf)`). Missing length = connection hangs or deserialization failure.
-5. **State Initialization**: Socket server populates `chain_state` on startup by iterating entire certificate blockchain (see `start_socket_server()`). O(n) operation - consider optimization for large chains.
-6. **Rollback Transactions**: On certificate creation failure, rollback via `certificate_chain.delete_latest_block()` to maintain consistency between cert and key chains.
+5. **State Initialization**: Socket server populates `storage.subject_name_to_height` on startup by iterating entire certificate blockchain (see `start_socket_server()`). O(n) operation - consider optimization for large chains.
+6. **Rollback Transactions**: On certificate creation failure, rollback via `storage.certificate_chain.delete_latest_block()` to maintain consistency between cert and key chains.
+7. **Thread Safety**: `Storage` struct uses `Arc<Storage>` for sharing across threads. The `subject_name_to_height` field is wrapped in `Mutex` for concurrent access from multiple socket connections.
 
 ## File Organization
 
 - [src/main.rs](src/main.rs): Entry point, blockchain initialization, interactive menu
-- [src/external_interface.rs](src/external_interface.rs): Socket server, request handlers (~786 lines)
+- [src/storage.rs](src/storage.rs): Storage abstraction with dual blockchain management, transactional operations (~330 lines)
+- [src/external_interface.rs](src/external_interface.rs): Socket server, request handlers (~670 lines)
 - [src/generate_root_ca.rs](src/generate_root_ca.rs): Root CA builder (self-signed, pathlen=1)
 - [src/generate_intermediate_ca.rs](src/generate_intermediate_ca.rs): Intermediate CA builder (pathlen=0)
 - [src/generate_user_keypair.rs](src/generate_user_keypair.rs): User cert builder (CA=false)
-- [src/chain_state.rs](src/chain_state.rs): In-memory state tracking
+- [src/lib.rs](src/lib.rs): Library interface exposing public modules
 - Shell scripts: Test utilities and key generation helpers
 
 ## Constants and Paths

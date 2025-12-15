@@ -37,8 +37,6 @@
 //! }
 //! ```
 
-use std::sync::Arc;
-
 use anyhow::{Context, Result};
 use libblockchain::blockchain::BlockChain;
 
@@ -51,21 +49,27 @@ use libblockchain::blockchain::BlockChain;
 ///
 /// * `certificate_chain` - Blockchain storing X.509 certificates in PEM format
 /// * `private_chain` - Blockchain storing RSA private keys in DER format
+/// * `subject_name_to_height` - Thread-safe HashMap mapping certificate common names to blockchain heights
 ///
 /// # Thread Safety
 ///
-/// Both blockchain instances are wrapped in `Arc` for safe sharing across threads.
+/// The entire `Storage` struct is typically wrapped in `Arc<Storage>` for safe sharing across threads.
+/// The `subject_name_to_height` field uses `Mutex` for concurrent access protection when multiple
+/// threads (e.g., socket server connections) need to query or update the mapping.
 pub struct Storage {
     // Initialize blockchain storage for certificates and private keys
-    pub certificate_chain: Arc<BlockChain>,
-    pub private_chain: Arc<BlockChain>,
+    pub certificate_chain: BlockChain,
+    pub private_chain: BlockChain,
+    pub subject_name_to_height: std::sync::Mutex<std::collections::HashMap<String, u64>>,
 }
 
 impl Storage {
     /// Creates a new Storage instance with dual blockchain initialization.
     ///
     /// Initializes two separate blockchain instances for certificates and private keys,
-    /// using the provided application key for encryption.
+    /// using the provided application key for encryption. The `subject_name_to_height`
+    /// HashMap is initialized empty and should be populated by the caller (typically
+    /// in `start_socket_server()`) by iterating the certificate blockchain.
     ///
     /// # Arguments
     ///
@@ -86,15 +90,27 @@ impl Storage {
     ///
     /// ```no_run
     /// use pki_chain::storage::Storage;
+    /// use std::sync::Arc;
     ///
-    /// let storage = Storage::new("key/pki-chain-app.key")?;
+    /// let storage = Arc::new(Storage::new("key/pki-chain-app.key")?);
+    /// // Populate subject_name_to_height from blockchain
+    /// for (height, block_result) in storage.certificate_chain.iter().enumerate() {
+    ///     if let Ok(block) = block_result {
+    ///         if let Ok(cert) = openssl::x509::X509::from_pem(&block.block_data) {
+    ///             let subject_name = /* extract from cert */;
+    ///             storage.subject_name_to_height.lock().unwrap().insert(subject_name, height as u64);
+    /// #           break; // for doc test
+    ///         }
+    ///     }
+    /// }
     /// # Ok::<(), anyhow::Error>(())
     /// ```
     pub fn new(app_key_path: &str) -> Result<Self> {
         Ok(Storage {
             // Initialize blockchain storage for certificates and private keys
-            certificate_chain: Arc::new(BlockChain::new("data/certificates", app_key_path)?),
-            private_chain: Arc::new(BlockChain::new("data/private_keys", app_key_path)?),
+            certificate_chain: BlockChain::new("data/certificates", app_key_path)?,
+            private_chain: BlockChain::new("data/private_keys", app_key_path)?,
+            subject_name_to_height: std::sync::Mutex::new(std::collections::HashMap::new()),
         })
     }
 
