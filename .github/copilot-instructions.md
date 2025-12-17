@@ -20,10 +20,16 @@ This is a blockchain-backed PKI (Public Key Infrastructure) certificate authorit
 
 ### Critical Data Flow
 
-1. **Initialization** ([main.rs](src/main.rs)): On first run, generates Root CA and stores as genesis blocks (height 0) in both blockchains. Validates stored certificates match generated ones. Exports Root CA private key to `exports/root_ca.key`. Subsequent runs skip generation if block_count() > 0.
+1. **Initialization** ([main.rs](src/main.rs), [storage.rs](src/storage.rs)): On first run, generates a complete 3-tier TLS hierarchy and stores as the first three blocks:
+   - Height 0: Root CA (self-signed, pathlen=1, 5-year validity)
+   - Height 1: Intermediate TLS CA (signed by Root, pathlen=0, 3-year validity, CN="webclient_intermediate_tls_ca")
+   - Height 2: WebClient TLS Certificate (signed by Intermediate, CA=false, 1-year validity, CN="webclient_cert.local")
+   
+   Validates stored certificates match generated ones. Exports Root CA private key to `exports/root_ca.key`. Subsequent runs skip generation if block_count() > 0. **User certificates created via socket API start at height 3+**.
+
 2. **Certificate Creation** ([external_interface.rs](src/external_interface.rs)): New certificates stored via `put_block()`. Blockchain automatically assigns UUIDs. On failure during private key storage, certificate is rolled back via `delete_latest_block()`.
 3. **State Management** ([storage.rs](src/storage.rs)): In-memory `subject_name_to_height` Mutex-wrapped HashMap inside `Storage` struct maps common names to block heights for fast certificate retrieval. Initialized at socket server startup by iterating entire certificate blockchain. Validates against duplicate subject common names before creation. Thread-safe access via `.lock().unwrap()`.
-4. **Socket Protocol** ([external_interface.rs](src/external_interface.rs)): Length-prefixed JSON messages (4-byte LE length + JSON payload). Server spawns in background thread via `std::thread::spawn()`, listens on Unix socket, handles connections serially.
+4. **Socket Protocol** ([protocol.rs](src/protocol.rs), [external_interface.rs](src/external_interface.rs)): Length-prefixed JSON messages (4-byte LE length + JSON payload). Protocol module provides serialization/deserialization utilities (`serialize_request`, `deserialize_request`, `serialize_response`, `deserialize_response`). Server spawns in background thread via `std::thread::spawn()`, listens on Unix socket, handles connections serially.
 
 ## Key Conventions
 
@@ -108,7 +114,7 @@ Clients communicate via Unix socket at `/tmp/pki_socket` with JSON requests:
 
 ### Request Format
 
-All requests are length-prefixed: 4-byte little-endian length + JSON payload. The socket server validates against duplicate common names using the in-memory state HashMap. Read example in `handle_client()`: `read_exact(&mut len_buf)` then `read_exact(&mut buf)`.
+All requests are length-prefixed: 4-byte little-endian length + JSON payload. The socket server validates against duplicate common names using the in-memory state HashMap. Serialization helpers available in [protocol.rs](src/protocol.rs): `serialize_request(&request)` returns `(u32, Vec<u8>)` tuple. Deserialization via `deserialize_request(&bytes)`. Read example in `handle_client()`: `read_exact(&mut len_buf)` then `read_exact(&mut buf)`.
 
 ```json
 {
@@ -123,17 +129,31 @@ All requests are length-prefixed: 4-byte little-endian length + JSON payload. Th
 }
 ```
 
-**Supported request types**: `CreateIntermediate`, `CreateUser` (requires `issuer_common_name` field), `ListCertificates` (filter: All/Intermediate/User/Root), `PKIStatus`, `SocketTest`
+**Supported request types**: 
+- `CreateIntermediate`: Create new Intermediate CA (signed by Root at height 0)
+- `CreateUser`: Create user certificate (requires `issuer_common_name` field to specify signing Intermediate CA)
+- `ListCertificates`: List certificates (filter: All/Intermediate/User/Root)
+- `PKIStatus`: Get system status (block counts, validation state, tracked subject names)
+- `SocketTest`: Connectivity test
+- `GetWebClientTLSCertificate`: Retrieve pre-generated TLS cert at height 2 with full chain (Intermediate at height 1, Root at height 0). Returns certificate PEM, private key PEM, and chain array for HTTPS server configuration.
 
 ### Response Format
 
+All responses are length-prefixed and use tagged enums. Serialization via `serialize_response(&response)`, deserialization via `deserialize_response(&bytes)`. Example response structure:
+
 ```json
 {
-  "status": "Success",
-  "message": "Intermediate CA created",
-  "data": { "uid": "550e8400-e29b-41d4-a716-446655440000" }
+  "type": "CreateIntermediateResponse",
+  "message": "Intermediate CA created successfully",
+  "common_name": "Operations CA",
+  "organization": "ACME Corp",
+  "organizational_unit": "IT",
+  "country": "US",
+  "height": 3
 }
 ```
+
+**Note**: Response types are strongly typed enums (not generic status/data objects). Each request type has a corresponding response variant: `CreateIntermediateResponse`, `CreateUserResponse`, `ListCertificatesResponse`, `PKIStatusResponse`, `SocketTestResponse`, `GetWebClientTLSCertificateResponse`, and `Error`. See [protocol.rs](src/protocol.rs) for complete enum definitions.
 
 ## Integration Points
 
@@ -154,8 +174,8 @@ All cryptographic operations use `openssl` crate:
 ## Common Pitfalls
 
 1. **Mutex Deadlocks**: The `subject_name_to_height` HashMap is protected by a Mutex in the `Storage` struct. Always release `lock()` before blockchain operations that may take time. Use scoped blocks `{ let lock = storage.subject_name_to_height.lock().unwrap(); ... }` to force drops, or extract values immediately: `let height = storage.subject_name_to_height.lock().unwrap().get(&name).cloned();`.
-2. **Block Height vs UUID**: Genesis Root CA is at height 0 (accessed via `get_block_by_height(0)`). All blocks have UUIDs but state HashMap maps subject→height for O(1) lookups.
-3. **Certificate Validation**: Intermediate CAs have `pathlen=0` (can't sign other CAs). Root CA has `pathlen=1` (can sign one level of CAs). Set via `BasicConstraints::new().ca().pathlen(n)`.
+2. **Block Height vs UUID**: First three blocks are reserved for WebClient TLS chain (Root=0, Intermediate TLS=1, WebClient=2). User-created certificates start at height 3+. All blocks have UUIDs but state HashMap maps subject→height for O(1) lookups.
+3. **Certificate Validation**: Intermediate CAs have `pathlen=0` (can't sign other CAs). Root CA has `pathlen=1` (can sign one level of CAs). Set via `BasicConstraints::new().ca().pathlen(n)`. WebClient TLS cert at height 2 has CA=false with `serverAuth` extended key usage.
 4. **Socket Message Protocol**: Must send 4-byte little-endian length prefix before JSON payload (`u32::from_le_bytes(len_buf)`). Missing length = connection hangs or deserialization failure.
 5. **State Initialization**: Socket server populates `storage.subject_name_to_height` on startup by iterating entire certificate blockchain (see `start_socket_server()`). O(n) operation - consider optimization for large chains.
 6. **Rollback Transactions**: On certificate creation failure, rollback via `storage.certificate_chain.delete_latest_block()` to maintain consistency between cert and key chains.
@@ -163,12 +183,14 @@ All cryptographic operations use `openssl` crate:
 
 ## File Organization
 
-- [src/main.rs](src/main.rs): Entry point, blockchain initialization, interactive menu
-- [src/storage.rs](src/storage.rs): Storage abstraction with dual blockchain management, transactional operations (~330 lines)
-- [src/external_interface.rs](src/external_interface.rs): Socket server, request handlers (~670 lines)
+- [src/main.rs](src/main.rs): Entry point, blockchain initialization, interactive menu (~130 lines)
+- [src/storage.rs](src/storage.rs): Storage abstraction with dual blockchain management, transactional operations, initialization of 3-tier TLS hierarchy (~520 lines)
+- [src/external_interface.rs](src/external_interface.rs): Socket server, request handlers, WebClient TLS certificate retrieval (~820 lines)
+- [src/protocol.rs](src/protocol.rs): IPC protocol definitions - Request/Response enums, serialization/deserialization functions for length-prefixed JSON messages (~242 lines)
 - [src/generate_root_ca.rs](src/generate_root_ca.rs): Root CA builder (self-signed, pathlen=1)
 - [src/generate_intermediate_ca.rs](src/generate_intermediate_ca.rs): Intermediate CA builder (pathlen=0)
 - [src/generate_user_keypair.rs](src/generate_user_keypair.rs): User cert builder (CA=false)
+- [src/generate_webclient_tls.rs](src/generate_webclient_tls.rs): TLS server certificate builder with `serverAuth` extension, SubjectAltName (localhost, 127.0.0.1, ::1). Exports constants `WEBCLIENT_COMMON_NAME` and `WEBCLIENT_INTERMEDIATE_COMMON_NAME` (~398 lines)
 - [src/lib.rs](src/lib.rs): Library interface exposing public modules
 - Shell scripts: Test utilities and key generation helpers
 

@@ -3,70 +3,20 @@
 //! Provides Unix socket-based IPC for external applications to interact with the PKI chain.
 
 use crate::generate_user_keypair::RsaUserKeyPairBuilder;
+use crate::generate_webclient_tls::WEBCLIENT_COMMON_NAME;
+use crate::protocol::{deserialize_request, Filter, Request, Response};
 use crate::storage::Storage;
 use anyhow::{Context, Result};
 use openssl::pkey::{PKey, Private};
 use openssl::x509::X509;
-use serde::{Deserialize, Serialize};
 use std::fs;
 use std::io::{BufReader, Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
 use std::sync::Arc;
 
-const SOCKET_PATH: &str = "/tmp/pki_socket";
-
-/// Filter options for listing certificates
-#[derive(Debug, Deserialize, Serialize)]
-enum Filter {
-    All,
-    Intermediate,
-    User,
-    Root,
-}
-
-/// Request types from external applications
-#[derive(Debug, Deserialize, Serialize)]
-#[serde(tag = "type")]
-pub enum Request {
-    CreateIntermediate {
-        subject_common_name: String,
-        organization: String,
-        organizational_unit: String,
-        locality: String,
-        state: String,
-        country: String,
-        validity_days: u32,
-    },
-    CreateUser {
-        subject_common_name: String,
-        organization: String,
-        organizational_unit: String,
-        locality: String,
-        state: String,
-        country: String,
-        validity_days: u32,
-        issuer_common_name: String,
-    },
-    ListCertificates {
-        filter: String,
-    },
-    PKIStatus,
-    SocketTest,
-}
-
-/// Response types sent back to clients
-#[derive(Debug, Deserialize, Serialize)]
-#[serde(tag = "status")]
-pub enum Response {
-    Success {
-        message: String,
-        data: Option<serde_json::Value>,
-    },
-    Error {
-        message: String,
-    },
-}
+/// Unix socket path for external IPC communication
+pub const SOCKET_PATH: &str = "/tmp/pki_socket";
 
 /// Start the Unix socket server and listen for incoming requests
 ///
@@ -75,8 +25,13 @@ pub enum Response {
 ///
 /// # Example
 /// ```no_run
-/// use external_interface::start_socket_server;
-/// start_socket_server().expect("Failed to start socket server");
+/// use pki_chain::external_interface::start_socket_server;
+/// use pki_chain::storage::Storage;
+/// use std::sync::Arc;
+///
+/// let storage = Arc::new(Storage::new("key/pki-chain-app.key")?);
+/// start_socket_server(storage).expect("Failed to start socket server");
+/// # Ok::<(), anyhow::Error>(())
 /// ```
 pub fn start_socket_server(storage: Arc<Storage>) -> Result<()> {
     // Remove existing socket file if it exists
@@ -139,16 +94,14 @@ pub fn start_socket_server(storage: Arc<Storage>) -> Result<()> {
 /// Handle an individual client connection
 fn handle_client(mut stream: UnixStream, storage: Arc<Storage>) -> Result<()> {
     let mut reader = BufReader::new(stream.try_clone()?);
-    let request: Request = {
-        let mut len_buf = [0u8; 4];
-        reader.read_exact(&mut len_buf)?;
-        let mut buf = vec![0u8; u32::from_le_bytes(len_buf) as usize];
-        reader.read_exact(&mut buf)?;
-        let message_str = String::from_utf8(buf).context("Failed to read message from client")?;
-        println!("Received raw message: {}", message_str);
-        serde_json::from_str(&message_str).context("Failed to parse JSON message")?
-    };
 
+    // Read length-prefixed request
+    let mut len_buf = [0u8; 4];
+    reader.read_exact(&mut len_buf)?;
+    let mut buf = vec![0u8; u32::from_le_bytes(len_buf) as usize];
+    reader.read_exact(&mut buf)?;
+
+    let request = deserialize_request(&buf)?;
     println!("Received request: {:?}", request);
 
     // Process request and generate response
@@ -201,17 +154,17 @@ fn handle_client(mut stream: UnixStream, storage: Arc<Storage>) -> Result<()> {
             },
         },
         Request::PKIStatus => handle_pki_status(&storage),
-        Request::SocketTest => Response::Success {
+        Request::SocketTest => Response::SocketTestResponse {
             message: "Socket test successful".to_string(),
-            data: None,
         },
+        Request::GetWebClientTLSCertificate => handle_get_webclient_tls_certificate(&storage),
     };
 
     // Send response back to client
     let response_bytes = {
         let mut bytes_buf = Vec::new();
         let response_json = serde_json::to_string(&response)?;
-        //println!("Sending response: {}", response_json);
+        println!("Sending response: {}", response_json);
         bytes_buf.extend_from_slice(&(response_json.len() as u32).to_le_bytes());
         bytes_buf.extend_from_slice(response_json.as_bytes());
         bytes_buf
@@ -327,24 +280,21 @@ fn handle_create_intermediate(
                 "✓ Intermediate CA certificate and private key stored in blockchain at height {}",
                 h
             );
+            Response::CreateIntermediateResponse {
+                message: format!(
+                    "Intermediate certificate created successfully for CN={}",
+                    subject_common_name
+                ),
+                common_name: subject_common_name,
+                organization,
+                organizational_unit,
+                country,
+                height: h,
+            }
         }
-        None => {
-            return Response::Error {
-                message: "Failed to store intermediate key-certificate pair".to_string(),
-            };
-        }
-    }
-    Response::Success {
-        message: format!(
-            "Intermediate certificate creation requested for CN={}",
-            subject_common_name
-        ),
-        data: Some(serde_json::json!({
-            "common_name": subject_common_name,
-            "organization": organization,
-            "organizational_unit": organizational_unit,
-            "country": country,
-        })),
+        None => Response::Error {
+            message: "Failed to store intermediate key-certificate pair".to_string(),
+        },
     }
 }
 
@@ -458,29 +408,25 @@ fn handle_create_user(
                 "✓ User certificate and private key stored in blockchain at height {}",
                 h
             );
+            Response::CreateUserResponse {
+                message: format!(
+                    "User certificate created successfully for CN={}",
+                    subject_common_name
+                ),
+                common_name: subject_common_name,
+                organization,
+                organizational_unit,
+                locality,
+                state,
+                country,
+                issuer_common_name,
+                validity_days,
+                height: h,
+            }
         }
-        None => {
-            return Response::Error {
-                message: "Failed to store user key-certificate pair".to_string(),
-            };
-        }
-    }
-
-    Response::Success {
-        message: format!(
-            "User certificate creation requested for CN={}",
-            subject_common_name
-        ),
-        data: Some(serde_json::json!({
-            "common_name": subject_common_name,
-            "organization": organization,
-            "organizational_unit": organizational_unit,
-            "locality": locality,
-            "state": state,
-            "country": country,
-            "issuer_common_name": issuer_common_name,
-            "validity_days": validity_days,
-        })),
+        None => Response::Error {
+            message: "Failed to store user key-certificate pair".to_string(),
+        },
     }
 }
 
@@ -500,7 +446,7 @@ fn handle_list_certificates(storage: &Storage, filter: Filter) -> Response {
     //   "serial_number": "1234567890",
     //   "type": "Root CA" | "Intermediate CA" | "User",
     // }
-    let response_data_json = (|| -> Result<serde_json::Value, serde_json::Error> {
+    let response_data_json = (|| -> Result<(Vec<serde_json::Value>, usize), serde_json::Error> {
         let certificates: Vec<serde_json::Value> = {
             let chain_iter = storage.certificate_chain.iter();
             let mut certs = Vec::new();
@@ -635,15 +581,17 @@ fn handle_list_certificates(storage: &Storage, filter: Filter) -> Response {
             }
             certs
         };
-        Ok(serde_json::json!({ "certificates": certificates, "count": certificates.len() }))
+        let count = certificates.len();
+        Ok((certificates, count))
     })();
     match response_data_json {
-        Ok(data) => Response::Success {
-            message: "Certificate list retrieved".to_string(),
-            data: Some(data),
+        Ok((certificates, count)) => Response::ListCertificatesResponse {
+            message: "Certificate list retrieved successfully".to_string(),
+            certificates,
+            count,
         },
         Err(e) => Response::Error {
-            message: format!("Failed to serialize certificate list: {}", e),
+            message: format!("Failed to retrieve certificate list: {}", e),
         },
     }
 }
@@ -657,16 +605,158 @@ fn handle_pki_status(storage: &Storage) -> Response {
         };
     }
 
-    Response::Success {
+    Response::PKIStatusResponse {
         message: "PKI system operational".to_string(),
-        data: Some(serde_json::json!({
-            "status": "running",
-            "Total Certificates": storage.certificate_chain.block_count().unwrap_or(0),
-            "total_Keys": storage.private_chain.block_count().unwrap_or(0),
-            "tracked_subject_names": storage.subject_name_to_height.lock().unwrap().len(),
-            "certificate_chain_valid": storage.certificate_chain.validate().is_ok(),
-            "private_key_chain_valid": storage.private_chain.validate().is_ok(),
-            "PKI Chain in Sync": true,
-        })),
+        status: "running".to_string(),
+        total_certificates: storage.certificate_chain.block_count().unwrap_or(0),
+        total_keys: storage.private_chain.block_count().unwrap_or(0),
+        tracked_subject_names: storage.subject_name_to_height.lock().unwrap().len(),
+        certificate_chain_valid: storage.certificate_chain.validate().is_ok(),
+        private_key_chain_valid: storage.private_chain.validate().is_ok(),
+        pki_chain_in_sync: true,
+    }
+}
+
+/// Handle GetWebClientTLSCertificate request
+fn handle_get_webclient_tls_certificate(storage: &Storage) -> Response {
+    let root_certificate_pem = {
+        match storage.certificate_chain.get_block_by_height(0) {
+            Ok(b) => match String::from_utf8(b.block_data.clone()) {
+                Ok(pem) => {
+                    if pem.is_empty() {
+                        return Response::Error {
+                            message: "Root TLS CA certificate is empty".to_string(),
+                        };
+                    }
+                    pem
+                }
+                Err(e) => {
+                    return Response::Error {
+                        message: format!(
+                            "Failed to decode Root TLS CA certificate as UTF-8: {}",
+                            e
+                        ),
+                    };
+                }
+            },
+            Err(e) => {
+                return Response::Error {
+                    message: format!("Root TLS CA not found at height 0: {}", e),
+                };
+            }
+        }
+    };
+    println!("Root Certificate PEM:\n{}", root_certificate_pem);
+
+    let intermediate_certificate_pem = {
+        match storage.certificate_chain.get_block_by_height(1) {
+            Ok(b) => match String::from_utf8(b.block_data.clone()) {
+                Ok(pem) => {
+                    if pem.is_empty() {
+                        return Response::Error {
+                            message: "Intermediate TLS CA certificate is empty".to_string(),
+                        };
+                    }
+                    pem
+                }
+                Err(e) => {
+                    return Response::Error {
+                        message: format!(
+                            "Failed to decode Intermediate TLS CA certificate as UTF-8: {}",
+                            e
+                        ),
+                    };
+                }
+            },
+            Err(e) => {
+                return Response::Error {
+                    message: format!("Intermediate TLS CA not found at height 1: {}", e),
+                };
+            }
+        }
+    };
+    println!(
+        "Intermediate Certificate PEM:\n{}",
+        intermediate_certificate_pem
+    );
+
+    let webserver_certificate_pem = {
+        match storage.certificate_chain.get_block_by_height(2) {
+            Ok(b) => match String::from_utf8(b.block_data.clone()) {
+                Ok(pem) => {
+                    if pem.is_empty() {
+                        return Response::Error {
+                            message: "Web Client TLS certificate is empty".to_string(),
+                        };
+                    }
+                    pem
+                }
+                Err(e) => {
+                    return Response::Error {
+                        message: format!(
+                            "Failed to decode Web Client TLS certificate as UTF-8: {}",
+                            e
+                        ),
+                    };
+                }
+            },
+            Err(e) => {
+                return Response::Error {
+                    message: format!("Web Client TLS certificate not found at height 2: {}", e),
+                };
+            }
+        }
+    };
+    println!("Web Client Certificate PEM:\n{}", webserver_certificate_pem);
+
+    let webserver_private_key_pem = {
+        match storage.private_chain.get_block_by_height(2) {
+            Ok(b) => match PKey::private_key_from_der(b.block_data.as_slice()) {
+                Ok(key) => match key.private_key_to_pem_pkcs8() {
+                    Ok(pem_bytes) => match String::from_utf8(pem_bytes) {
+                        Ok(pem) => {
+                            if pem.is_empty() {
+                                return Response::Error {
+                                    message: "Web Client TLS private key is empty".to_string(),
+                                };
+                            }
+                            pem
+                        }
+                        Err(e) => {
+                            return Response::Error {
+                                message: format!("Failed to decode private key as UTF-8: {}", e),
+                            };
+                        }
+                    },
+                    Err(e) => {
+                        return Response::Error {
+                            message: format!("Failed to convert private key to PEM format: {}", e),
+                        };
+                    }
+                },
+                Err(e) => {
+                    return Response::Error {
+                        message: format!(
+                            "Failed to parse Web Client TLS private key from DER: {}",
+                            e
+                        ),
+                    };
+                }
+            },
+            Err(e) => {
+                return Response::Error {
+                    message: format!("Web Client TLS private key not found at height 2: {}", e),
+                };
+            }
+        }
+    };
+    println!("Web Client Private Key PEM:\n{}", webserver_private_key_pem);
+
+    Response::GetWebClientTLSCertificateResponse {
+        message: "WebClient TLS certificate retrieved successfully".to_string(),
+        certificate: webserver_certificate_pem,
+        private_key: webserver_private_key_pem,
+        certificate_chain: vec![intermediate_certificate_pem, root_certificate_pem],
+        subject_common_name: WEBCLIENT_COMMON_NAME.to_string(),
     }
 }

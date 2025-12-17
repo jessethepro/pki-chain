@@ -140,14 +140,21 @@ All requests use length-prefixed JSON:
 
 #### Response Format
 
+Responses use strongly-typed enums with tagged JSON:
+
 ```json
 {
-  "status": "Success",
-  "message": "Certificate created successfully",
-  "data": {
-    "common_name": "john.doe@example.com",
-    "organization": "ACME Corp"
-  }
+  "type": "CreateUserResponse",
+  "message": "User certificate created successfully",
+  "common_name": "john.doe@example.com",
+  "organization": "ACME Corp",
+  "organizational_unit": "Engineering",
+  "locality": "Seattle",
+  "state": "WA",
+  "country": "US",
+  "issuer_common_name": "Operations CA",
+  "validity_days": 365,
+  "height": 3
 }
 ```
 
@@ -160,6 +167,7 @@ All requests use length-prefixed JSON:
 | `ListCertificates` | List certificates (filter: All/Intermediate/User/Root) |
 | `PKIStatus` | Get PKI system status and statistics |
 | `SocketTest` | Test socket connectivity |
+| `GetWebClientTLSCertificate` | Retrieve pre-generated TLS certificate with full chain |
 
 ## Testing
 
@@ -201,11 +209,14 @@ This script:
 ```
 pki-chain/
 ├── src/
-│   ├── main.rs                      # Application entry point
+│   ├── lib.rs                       # Library interface
 │   ├── storage.rs                   # Blockchain storage abstraction
 │   ├── external_interface.rs        # Unix socket server
+│   ├── protocol.rs                  # IPC protocol definitions
 │   ├── generate_root_ca.rs          # Root CA builder
 │   ├── generate_intermediate_ca.rs  # Intermediate CA builder
+│   ├── generate_user_keypair.rs     # User certificate builder
+│   └── generate_webclient_tls.rs    # TLSrmediate CA builder
 │   └── generate_user_keypair.rs     # User certificate builder
 ├── .github/
 │   └── copilot-instructions.md      # AI coding assistant instructions

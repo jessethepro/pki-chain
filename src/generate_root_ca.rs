@@ -103,7 +103,7 @@ const ROOT_CA_PATH_LENGTH: u32 = 1;
 /// # Ok(())
 /// # }
 /// ```
-pub struct RsaRootCABuilder {
+pub(crate) struct RsaRootCABuilder {
     subject_common_name: String,
     organization: String,
     oganizational_unit: String,
@@ -115,7 +115,7 @@ pub struct RsaRootCABuilder {
 
 impl RsaRootCABuilder {
     /// Create a new RSA key and certificate builder with default values
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             subject_common_name: String::new(),
             organization: String::new(),
@@ -136,42 +136,42 @@ impl RsaRootCABuilder {
     ///
     /// # Returns
     /// Self for method chaining
-    pub fn subject_common_name(mut self, cn: String) -> Self {
+    pub(crate) fn subject_common_name(mut self, cn: String) -> Self {
         self.subject_common_name = cn;
         self
     }
     /// Set the organization (O) for the certificate
-    pub fn organization(mut self, org: String) -> Self {
+    pub(crate) fn organization(mut self, org: String) -> Self {
         self.organization = org;
         self
     }
 
     /// Set the organizational unit (OU) for the certificate
-    pub fn organizational_unit(mut self, ou: String) -> Self {
+    pub(crate) fn organizational_unit(mut self, ou: String) -> Self {
         self.oganizational_unit = ou;
         self
     }
 
     /// Set the locality (L) for the certificate
-    pub fn locality(mut self, locality: String) -> Self {
+    pub(crate) fn locality(mut self, locality: String) -> Self {
         self.locality = locality;
         self
     }
 
     /// Set the state/province (ST) for the certificate
-    pub fn state(mut self, state: String) -> Self {
+    pub(crate) fn state(mut self, state: String) -> Self {
         self.state = state;
         self
     }
 
     /// Set the country (C) for the certificate (2-letter ISO code)
-    pub fn country(mut self, country: String) -> Self {
+    pub(crate) fn country(mut self, country: String) -> Self {
         self.country = country;
         self
     }
 
     /// Set validity period in days
-    pub fn validity_days(mut self, days: u32) -> Self {
+    pub(crate) fn validity_days(mut self, days: u32) -> Self {
         self.validity_days = days;
         self
     }
@@ -204,7 +204,7 @@ impl RsaRootCABuilder {
     /// # Security Warning
     /// The returned private key must be stored securely. For production root CAs,
     /// consider using hardware security modules (HSMs) or air-gapped systems.
-    pub fn build(self) -> Result<(PKey<Private>, X509)> {
+    pub(crate) fn build(self) -> Result<(PKey<Private>, X509)> {
         // Generate RSA key pair
         let rsa = openssl::rsa::Rsa::generate(RSA_KEY_SIZE_DEFAULT)
             .map_err(|e| anyhow!("Failed to generate RSA keypair: {}", e))?;

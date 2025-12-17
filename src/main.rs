@@ -42,17 +42,11 @@
 //!
 //! External applications can request certificates via the Unix socket at `/tmp/pki_socket`.
 
-mod external_interface;
-mod generate_intermediate_ca;
-mod generate_root_ca;
-mod generate_user_keypair;
-mod storage;
-
 use anyhow::{Context, Result};
-use generate_root_ca::RsaRootCABuilder;
+use pki_chain::external_interface;
+use pki_chain::storage::Storage;
 use std::io::{self, Write};
 use std::sync::Arc;
-use storage::Storage;
 
 const APP_KEY_PATH: &str = "key/pki-chain-app.key";
 
@@ -62,37 +56,10 @@ fn main() -> Result<()> {
     let storage = Arc::new(Storage::new(APP_KEY_PATH).context("Failed to initialize storage")?);
 
     if storage.is_empty()? {
-        let (private_key, certificate) = RsaRootCABuilder::new()
-            .subject_common_name("PKI Chain Root CA".to_string())
-            .organization("MenaceLabs".to_string())
-            .organizational_unit("CY".to_string())
-            .country("BR".to_string())
-            .state("SP".to_string())
-            .locality("Sao Jose dos Campos".to_string())
-            .validity_days(365 * 5) // 5 years
-            .build()
-            .context("Failed to generate Root CA")?;
-        println!("✓ Root CA generated");
-        // Save to blockchain
-        let height = storage
-            .store_key_certificate(&private_key, &certificate)
-            .context("Failed to store Root CA in blockchain")?;
-        println!("✓ Root CA certificate and private key stored in blockchain as the genesis block");
-
-        // Verify storage
-        if storage.verify_stored_key_certificate_pair(&private_key, &certificate, height)? {
-            println!("✓ Stored Root CA key-certificate pair verified successfully");
-            // Export Root CA private key to file
-            std::fs::create_dir_all("exports")?;
-            let key_pem = private_key.private_key_to_pem_pkcs8()?;
-            std::fs::write("exports/root_ca.key", key_pem)?;
-            println!("✓ Root CA private key exported to 'exports/root_ca.key'");
-        } else {
-            println!("✗ Verification of stored Root CA key-certificate pair failed");
-            return Err(anyhow::anyhow!(
-                "Stored Root CA key-certificate pair verification failed"
-            ));
-        }
+        storage
+            .initialize()
+            .context("Failed to initialize PKI storage")?;
+        println!("✓ PKI storage initialized with Root CA, Intermediate TLS certificate and Web Client TLS certificate\n");
     }
     // Start socket server in background thread
     let storage_clone = Arc::clone(&storage);
@@ -135,6 +102,18 @@ fn validate_pki_storage(storage: &Storage) -> Result<()> {
     }
 
     if storage.validate()? {
+        println!(
+            "Total Certificates Stored: {}",
+            storage.certificate_chain.block_count()?
+        );
+        println!(
+            "Total Private Keys Stored: {}",
+            storage.private_chain.block_count()?
+        );
+        println!(
+            "Total Subject Names: {}",
+            storage.subject_name_to_height.lock().unwrap().len()
+        );
         println!("✓ Blockchain validation successful");
     } else {
         println!("✗ Blockchain validation failed");

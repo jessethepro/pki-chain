@@ -1,30 +1,44 @@
-//! Intermediate CA Certificate Generation Module
+//! TLS Server Certificate Generation Module for PKIWebClient
 //!
-//! This module provides functionality for generating intermediate CA certificates
-//! signed by a root CA. Intermediate CAs act as a bridge between the root CA and
-//! end-entity certificates, allowing the root CA to remain offline while still
-//! enabling certificate issuance.
+//! This module generates TLS/HTTPS server certificates signed by an Intermediate CA,
+//! which creates a complete certificate chain validated by the Root CA:
 //!
-//! # PKI Hierarchy Position
-//! ```text
-//! Root CA (self-signed)
-//!   └── Intermediate CA (signed by Root) ← This module
-//!       └── User Certificate (signed by Intermediate)
+//! **Certificate Chain**: Root CA → Intermediate CA → TLS Server Certificate
+//!
+//! The generated certificates are specifically for securing the PKIWebClient HTTPS server,
+//! enabling encrypted communication between clients and the web interface.
+//!
+//! # X.509 Extensions
+//! TLS server certificates include:
+//! - **Key Usage**: `digitalSignature`, `keyEncipherment` (for TLS handshakes and RSA key exchange)
+//! - **Extended Key Usage**: `serverAuth` (explicitly marks certificate for TLS server authentication)
+//! - **Subject Alternative Name (SAN)**: Default entries for local development
+//!   - DNS: `localhost` (for local hostname access)
+//!   - IP: `127.0.0.1` (IPv4 loopback)
+//!   - IP: `::1` (IPv6 loopback)
+//!   - DNS: Common Name from certificate (as specified in builder)
+//!
+//! # Example
+//! ```rust,no_run
+//! # use anyhow::Result;
+//! # use openssl::pkey::PKey;
+//! # use openssl::x509::X509;
+//! # fn example(intermediate_key: PKey<openssl::pkey::Private>, intermediate_cert: X509) -> Result<()> {
+//! let (server_key, server_cert) = RsaHttpServerCABuilder::new(
+//!     intermediate_key,
+//!     intermediate_cert
+//! )
+//!     .subject_common_name("pki.example.com".to_string())
+//!     .organization("Example Corp".to_string())
+//!     .organizational_unit("IT Operations".to_string())
+//!     .locality("San Francisco".to_string())
+//!     .state("California".to_string())
+//!     .country("US".to_string())
+//!     .validity_days(365)
+//!     .build()?;
+//! # Ok(())
+//! # }
 //! ```
-//!
-//! # Certificate Properties
-//! - **Signed by**: Root CA
-//! - **Key Usage**: keyCertSign, cRLSign, digitalSignature
-//! - **Basic Constraints**: CA=true, pathlen=0 (can only sign end-entity certs)
-//! - **Default Key Size**: RSA 4096-bit
-//! - **Default Validity**: 1825 days (5 years)
-//! - **Version**: X.509v3 with extensions
-//!
-//! # Purpose
-//! - Allows root CA to remain offline for security
-//! - Can be revoked without affecting root CA trust
-//! - Enables operational flexibility (multiple intermediates for different purposes)
-//! - Pathlen=0 prevents further CA delegation (only signs user certs)
 
 use anyhow::{anyhow, Result};
 use openssl::bn::{BigNum, MsbOption};
@@ -33,67 +47,71 @@ use openssl::pkey::{PKey, Private};
 use openssl::x509::X509;
 
 // Add X.509v3 extensions
-use openssl::x509::extension::{BasicConstraints, KeyUsage};
+use openssl::x509::extension::{
+    BasicConstraints, ExtendedKeyUsage, KeyUsage, SubjectAlternativeName,
+};
 
 const X509_VERSION_3: i32 = 2; // X509 version 3 is represented by 2
 const RSA_KEY_SIZE_DEFAULT: u32 = 4096;
-const INTERMEDIATE_CA_PATH_LENGTH: u32 = 0; // Can only sign end-entity certs, not other CAs
+pub(crate) const WEBCLIENT_COMMON_NAME: &str = "webclient_cert.local";
+pub(crate) const WEBCLIENT_INTERMEDIATE_COMMON_NAME: &str = "webclient_intermediate_tls_ca";
 
-// ================= RSA Intermediate CA Builder =================
+// ================= RSA TLS Server Certificate Builder =================
 
-/// Builder for generating RSA key pairs and intermediate CA certificates signed by a root CA
+/// Builder for generating RSA key pairs and TLS server certificates signed by an Intermediate CA
 ///
-/// Creates intermediate CA certificates that sit between the root CA and end-entity
-/// certificates. This allows the root CA to remain offline while still enabling
-/// certificate issuance operations.
+/// Creates end-entity TLS/HTTPS server certificates for the PKIWebClient server. These certificates
+/// are signed by an Intermediate CA, which forms a complete trust chain back to the Root CA.
+///
+/// # Certificate Chain
+/// Root CA → Intermediate CA → **TLS Server Certificate** (this module)
 ///
 /// # Required Fields
 /// All distinguished name fields must be set before calling `build()`:
-/// - `subject_common_name` - Intermediate CA name (e.g., "Example Intermediate CA")
+/// - `subject_common_name` - Server hostname/FQDN (e.g., "pki.example.com", "localhost")
 /// - `organization` - Organization name
-/// - `organizational_unit` - Department (typically "Operations" or "Issuing CA")
+/// - `organizational_unit` - Department (e.g., "IT Operations", "Web Services")
 /// - `locality` - City
 /// - `state` - State or province
 /// - `country` - Two-letter ISO country code
 ///
-/// # Certificate Chain
-/// Intermediate CA certificates:
-/// - Are signed by the root CA
-/// - Have `pathlen=0`, meaning they can only sign end-entity certificates
-/// - Cannot sign other intermediate or root CAs
-/// - Should have shorter validity periods than root CAs (typically 3-5 years)
+/// # Certificate Properties
+/// TLS server certificates:
+/// - Are signed by an Intermediate CA
+/// - Have `CA=false` (end-entity certificate, cannot sign other certificates)
+/// - Include Key Usage: `digitalSignature` and `keyEncipherment` for TLS
+/// - Should have shorter validity periods (typically 1 year or less)
 ///
 /// # Use Cases
-/// - **Operational Security**: Keep root CA offline, use intermediate for daily operations
-/// - **Purpose Separation**: Different intermediates for TLS, email, code signing
-/// - **Geographic Distribution**: Regional intermediate CAs
-/// - **Revocation Strategy**: Revoke intermediate without compromising root
+/// - **HTTPS Server**: Secure web interface for PKIWebClient
+/// - **TLS Authentication**: Enable encrypted client-server communication
+/// - **Certificate Chain Validation**: Browsers can validate the full chain to Root CA
 ///
 /// # Examples
 /// ```rust,no_run
 /// # use anyhow::Result;
 /// # use openssl::pkey::PKey;
 /// # use openssl::x509::X509;
-/// # fn example(root_key: PKey<openssl::pkey::Private>, root_cert: X509) -> Result<()> {
+/// # fn example(intermediate_key: PKey<openssl::pkey::Private>, intermediate_cert: X509) -> Result<()> {
 ///
-/// let (intermediate_private_key, intermediate_cert) = RsaIntermediateCABuilder::new(
-///     root_key,
-///     root_cert
+/// let (server_private_key, server_cert) = RsaHttpServerCABuilder::new(
+///     intermediate_key,
+///     intermediate_cert
 /// )
-///     .subject_common_name("ACME Issuing CA 2025".to_string())
-///     .organization("ACME Corporation".to_string())
-///     .organizational_unit("Certificate Operations".to_string())
+///     .subject_common_name("pki-webclient.example.com".to_string())
+///     .organization("Example Corporation".to_string())
+///     .organizational_unit("Web Operations".to_string())
 ///     .locality("Seattle".to_string())
 ///     .state("Washington".to_string())
 ///     .country("US".to_string())
-///     .validity_days(1825)  // 5 years
+///     .validity_days(365)  // 1 year
 ///     .build()?;
 ///
-/// // Use intermediate_key to sign user certificates
+/// // Use server_key and server_cert to configure HTTPS server
 /// # Ok(())
 /// # }
 /// ```
-pub(crate) struct RsaIntermediateCABuilder {
+pub(crate) struct RsaHttpServerCABuilder {
     subject_common_name: String,
     organization: String,
     oganizational_unit: String,
@@ -105,13 +123,13 @@ pub(crate) struct RsaIntermediateCABuilder {
     signing_cert: X509,
 }
 
-impl RsaIntermediateCABuilder {
-    /// Create a new RSA intermediate CA builder
+impl RsaHttpServerCABuilder {
+    /// Create a new RSA TLS server certificate builder
     ///
     /// # Arguments
-    /// * `ca_key` - Root CA's private key for signing
-    /// * `ca_cert` - Root CA's certificate (issuer information)
-    pub(crate) fn new(ca_key: PKey<Private>, ca_cert: X509) -> Self {
+    /// * `intermediate_ca_key` - Intermediate CA's private key for signing the server certificate
+    /// * `intermediate_ca_cert` - Intermediate CA's certificate (issuer information)
+    pub(crate) fn new(intermediate_ca_key: PKey<Private>, intermediate_ca_cert: X509) -> Self {
         Self {
             subject_common_name: String::new(),
             organization: String::new(),
@@ -120,17 +138,18 @@ impl RsaIntermediateCABuilder {
             state: String::new(),
             country: String::new(),
             validity_days: 1825, // Default 5 years
-            signing_key: ca_key,
-            signing_cert: ca_cert,
+            signing_key: intermediate_ca_key,
+            signing_cert: intermediate_ca_cert,
         }
     }
 
-    /// Set the common name (CN) for the certificate
+    /// Set the common name (CN) for the TLS server certificate
     ///
-    /// For intermediate CAs, this should clearly identify the CA's role and purpose.
+    /// For TLS certificates, this should be the fully qualified domain name (FQDN) or hostname
+    /// of the server where the PKIWebClient will run.
     ///
     /// # Arguments
-    /// * `cn` - Common name (e.g., "Example Issuing CA", "ACME TLS Intermediate CA")
+    /// * `cn` - Server hostname (e.g., "pki.example.com", "localhost", "192.168.1.100")
     ///
     /// # Returns
     /// Self for method chaining
@@ -186,24 +205,30 @@ impl RsaIntermediateCABuilder {
         self
     }
 
-    /// Build the RSA key pair and intermediate CA certificate signed by root CA
+    /// Build the RSA key pair and TLS server certificate signed by Intermediate CA
     ///
-    /// Generates a new RSA-4096 key pair and creates an X.509v3 certificate
-    /// signed by the root CA provided during builder construction.
+    /// Generates a new RSA-4096 key pair and creates an X.509v3 TLS server certificate
+    /// for the PKIWebClient HTTPS server, signed by the Intermediate CA provided during
+    /// builder construction. This creates the complete trust chain:
+    /// **Root CA → Intermediate CA → TLS Server Certificate**
     ///
     /// # Certificate Properties
     /// - **Version**: X.509v3
     /// - **Key Size**: RSA 4096-bit
     /// - **Signature Algorithm**: SHA-256 with RSA
-    /// - **Basic Constraints**: CA=true, pathlen=0, critical
-    /// - **Key Usage**: keyCertSign, cRLSign, digitalSignature
+    /// - **Basic Constraints**: CA=false (end-entity certificate)
+    /// - **Key Usage**: digitalSignature, keyEncipherment (critical, for TLS/HTTPS)
+    /// - **Extended Key Usage**: serverAuth (TLS server authentication)
+    /// - **Subject Alternative Name**: localhost, 127.0.0.1, ::1, plus CN (for local development)
     /// - **Serial Number**: Random 128-bit number
-    /// - **Issuer**: Root CA (from signing_cert)
-    ///
-    /// # Path Length Constraint
-    /// The `pathlen=0` constraint means this intermediate CA can only sign
-    /// end-entity certificates, not other CAs. This prevents unauthorized
-    /// CA hierarchy extension.
+    /// # TLS Server Purpose
+    /// This certificate is specifically designed for securing the PKIWebClient web interface
+    /// with HTTPS. The X.509v3 extensions ensure proper TLS/SSL functionality:
+    /// - **Key Usage**: `digitalSignature` (TLS handshakes), `keyEncipherment` (RSA key exchange)
+    /// - **Extended Key Usage**: `serverAuth` (explicitly identifies TLS server authentication purpose)
+    /// - **Subject Alternative Name**: Includes localhost, 127.0.0.1, ::1, and CN for local development access
+    /// - `digitalSignature`: Required for TLS handshakes and server authentication
+    /// - `keyEncipherment`: Required for RSA key exchange during TLS connection establishment
     ///
     /// # Returns
     /// * `Ok((PKey<Private>, X509))` - Tuple of (private key, signed certificate)
@@ -218,21 +243,22 @@ impl RsaIntermediateCABuilder {
     ///
     /// # Example
     /// ```rust,no_run
-    /// # use libcertcrypto::RsaIntermediateCABuilder;
+    /// # use libcertcrypto::RsaHttpServerCABuilder;
     /// # use anyhow::Result;
     /// # use openssl::pkey::PKey;
     /// # use openssl::x509::X509;
-    /// # fn example(root_key: PKey<openssl::pkey::Private>, root_cert: X509) -> Result<()> {
-    /// let (private_key, certificate) = RsaIntermediateCABuilder::new(root_key, root_cert)
-    ///     .subject_common_name("Intermediate CA".to_string())
+    /// # fn example(intermediate_key: PKey<openssl::pkey::Private>, intermediate_cert: X509) -> Result<()> {
+    /// let (server_key, server_cert) = RsaHttpServerCABuilder::new(intermediate_key, intermediate_cert)
+    ///     .subject_common_name("pki-webclient.example.com".to_string())
     ///     .organization("Example Corp".to_string())
-    ///     .organizational_unit("PKI Operations".to_string())
+    ///     .organizational_unit("Web Services".to_string())
     ///     .locality("Boston".to_string())
     ///     .state("Massachusetts".to_string())
     ///     .country("US".to_string())
+    ///     .validity_days(365)
     ///     .build()?;
     ///
-    /// // Use private_key to sign user certificates
+    /// // Use server_key and server_cert to configure PKIWebClient HTTPS server
     /// # Ok(())
     /// # }
     /// ```
@@ -317,33 +343,49 @@ impl RsaIntermediateCABuilder {
             .set_pubkey(&private_key)
             .map_err(|e| anyhow!("Failed to set public key: {}", e))?;
 
-        // Add Basic Constraints: CA=true, pathlen=0 (can only sign end-entity certs)
-        let mut bc = BasicConstraints::new();
-        bc.critical().ca();
-        bc.pathlen(INTERMEDIATE_CA_PATH_LENGTH); // 0 = can only sign user certs, not other CAs
-
-        let extension = bc
+        // Add Basic Constraints: CA=false (end-entity TLS server certificate)
+        let bc = BasicConstraints::new()
+            .critical()
             .build()
             .map_err(|e| anyhow!("Failed to build BasicConstraints: {}", e))?;
         builder
-            .append_extension(extension)
+            .append_extension(bc)
             .map_err(|e| anyhow!("Failed to add BasicConstraints: {}", e))?;
 
-        // Add Key Usage extension for intermediate CA
-        let mut ku = KeyUsage::new();
-        ku.critical();
-        ku.key_cert_sign(); // Can sign certificates
-        ku.crl_sign(); // Can sign CRLs
-        ku.digital_signature();
-
-        let ku_extension = ku
+        // Add Key Usage extension for TLS/HTTPS server certificate
+        let ku = KeyUsage::new()
+            .critical()
+            .digital_signature() // For TLS handshakes and signatures
+            .key_encipherment() // For RSA key exchange in TLS
             .build()
             .map_err(|e| anyhow!("Failed to build KeyUsage: {}", e))?;
         builder
-            .append_extension(ku_extension)
+            .append_extension(ku)
             .map_err(|e| anyhow!("Failed to add KeyUsage: {}", e))?;
 
-        // Sign with root CA's private key
+        // Add Extended Key Usage: serverAuth (required for TLS/HTTPS servers)
+        let eku = ExtendedKeyUsage::new()
+            .server_auth() // Explicitly mark as TLS server certificate
+            .build()
+            .map_err(|e| anyhow!("Failed to build ExtendedKeyUsage: {}", e))?;
+        builder
+            .append_extension(eku)
+            .map_err(|e| anyhow!("Failed to add ExtendedKeyUsage: {}", e))?;
+
+        // Add Subject Alternative Name (SAN) - required by modern browsers
+        // Default SAN entries for local development: localhost, 127.0.0.1, and ::1
+        let san = SubjectAlternativeName::new()
+            .dns("localhost")
+            .ip("127.0.0.1")
+            .ip("::1")
+            .dns(&self.subject_common_name) // Also include the CN
+            .build(&builder.x509v3_context(Some(&self.signing_cert), None))
+            .map_err(|e| anyhow!("Failed to build SubjectAlternativeName: {}", e))?;
+        builder
+            .append_extension(san)
+            .map_err(|e| anyhow!("Failed to add SubjectAlternativeName: {}", e))?;
+
+        // Sign with intermediate CA's private key
         builder
             .sign(&self.signing_key, MessageDigest::sha256())
             .map_err(|e| anyhow!("Failed to sign certificate: {}", e))?;

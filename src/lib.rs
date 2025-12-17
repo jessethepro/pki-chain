@@ -53,121 +53,75 @@
 //! Use in your code:
 //!
 //! ```no_run
-//! use pki_chain::storage::Storage;
-//! use pki_chain::generate_root_ca::RsaRootCABuilder;
-//! use anyhow::Result;
+//! use pki_chain::{Request, Response, SOCKET_PATH};
+//! use std::os::unix::net::UnixStream;
+//! use std::io::{Read, Write};
 //!
-//! fn main() -> Result<()> {
-//!     // Initialize storage
-//!     let storage = Storage::new("key/app.key")?;
+//! fn request_certificate() -> anyhow::Result<()> {
+//!     // Connect to PKI Chain socket
+//!     let mut stream = UnixStream::connect(SOCKET_PATH)?;
 //!     
-//!     // Generate Root CA
-//!     let (private_key, certificate) = RsaRootCABuilder::new()
-//!         .subject_common_name("My Root CA".to_string())
-//!         .organization("My Organization".to_string())
-//!         .organizational_unit("IT".to_string())
-//!         .country("US".to_string())
-//!         .state("CA".to_string())
-//!         .locality("San Francisco".to_string())
-//!         .validity_days(365 * 10)
-//!         .build()?;
+//!     // Create certificate request
+//!     let request = Request::CreateUser {
+//!         subject_common_name: "user@example.com".to_string(),
+//!         organization: "ACME Corp".to_string(),
+//!         organizational_unit: "Engineering".to_string(),
+//!         locality: "San Francisco".to_string(),
+//!         state: "CA".to_string(),
+//!         country: "US".to_string(),
+//!         validity_days: 365,
+//!         issuer_common_name: "Operations CA".to_string(),
+//!     };
 //!     
-//!     // Store in blockchain
-//!     let height = storage.store_key_certificate(&private_key, &certificate)?;
-//!     println!("Root CA stored at height: {}", height);
+//!     // Send request (4-byte length prefix + JSON)
+//!     let json = serde_json::to_string(&request)?;
+//!     stream.write_all(&(json.len() as u32).to_le_bytes())?;
+//!     stream.write_all(json.as_bytes())?;
 //!     
-//!     // Validate blockchain
-//!     if storage.validate()? {
-//!         println!("Blockchain integrity verified");
-//!     }
+//!     // Read response
+//!     let mut len_buf = [0u8; 4];
+//!     stream.read_exact(&mut len_buf)?;
+//!     let mut response_buf = vec![0u8; u32::from_le_bytes(len_buf) as usize];
+//!     stream.read_exact(&mut response_buf)?;
+//!     
+//!     let response: Response = serde_json::from_slice(&response_buf)?;
+//!     println!("Response: {:?}", response);
 //!     
 //!     Ok(())
 //! }
 //! ```
 //!
-//! # Module Overview
+//! # Public API
 //!
-//! ## [`storage`]
+//! This library exposes a minimal IPC-based API for interacting with the PKI Chain server:
 //!
-//! Core blockchain storage abstraction that manages dual blockchain instances for certificates
-//! and private keys. Provides transactional operations with automatic rollback.
+//! ## [`Request`]
 //!
-//! ```no_run
-//! use pki_chain::storage::Storage;
+//! Enum defining all supported certificate operations. Serializes to JSON for socket communication.
 //!
-//! let storage = Storage::new("key/app.key")?;
-//! # Ok::<(), anyhow::Error>(())
-//! ```
+//! Supported operations:
+//! - `CreateIntermediate` - Create a new Intermediate CA
+//! - `CreateUser` - Create a user certificate
+//! - `ListCertificates` - List certificates with filtering
+//! - `PKIStatus` - Get system status
+//! - `SocketTest` - Test connectivity
+//! - `GetWebClientTLSCertificate` - Retrieve pre-generated TLS certificate
 //!
-//! ## [`generate_root_ca`]
+//! ## [`Response`]
 //!
-//! Builder for creating self-signed Root CA certificates. Root CAs are the trust anchor
-//! of the PKI hierarchy.
+//! Enum containing type-safe responses for each request type:
 //!
-//! ```no_run
-//! use pki_chain::generate_root_ca::RsaRootCABuilder;
+//! - `CreateIntermediateResponse` - Returns certificate details and blockchain height
+//! - `CreateUserResponse` - Returns certificate details and blockchain height
+//! - `ListCertificatesResponse` - Returns array of certificates
+//! - `PKIStatusResponse` - Returns system metrics and validation status
+//! - `SocketTestResponse` - Simple confirmation
+//! - `GetWebClientTLSCertificateResponse` - Returns certificate, key, and chain
+//! - `Error` - Error message
 //!
-//! let (key, cert) = RsaRootCABuilder::new()
-//!     .subject_common_name("Root CA".to_string())
-//!     .organization("ACME Corp".to_string())
-//!     .organizational_unit("Security".to_string())
-//!     .country("US".to_string())
-//!     .state("CA".to_string())
-//!     .locality("San Francisco".to_string())
-//!     .validity_days(3650)
-//!     .build()?;
-//! # Ok::<(), anyhow::Error>(())
-//! ```
+//! ## [`SOCKET_PATH`]
 //!
-//! ## [`generate_intermediate_ca`]
-//!
-//! Builder for creating Intermediate CA certificates signed by the Root CA.
-//!
-//! ```no_run
-//! use pki_chain::generate_intermediate_ca::RsaIntermediateCABuilder;
-//! # use openssl::pkey::PKey;
-//! # use openssl::x509::X509;
-//! # fn example(root_key: PKey<openssl::pkey::Private>, root_cert: X509) -> anyhow::Result<()> {
-//!
-//! let (key, cert) = RsaIntermediateCABuilder::new(root_key, root_cert)
-//!     .subject_common_name("Intermediate CA".to_string())
-//!     .organization("ACME Corp".to_string())
-//!     .organizational_unit("Operations".to_string())
-//!     .country("US".to_string())
-//!     .state("CA".to_string())
-//!     .locality("San Francisco".to_string())
-//!     .validity_days(1825)
-//!     .build()?;
-//! # Ok(())
-//! # }
-//! ```
-//!
-//! ## [`generate_user_keypair`]
-//!
-//! Builder for creating end-user certificates signed by an Intermediate CA.
-//!
-//! ```no_run
-//! use pki_chain::generate_user_keypair::RsaUserKeyPairBuilder;
-//! # use openssl::pkey::PKey;
-//! # use openssl::x509::X509;
-//! # fn example(int_key: PKey<openssl::pkey::Private>, int_cert: X509) -> anyhow::Result<()> {
-//!
-//! let (key, cert) = RsaUserKeyPairBuilder::new(int_key, int_cert)
-//!     .subject_common_name("user@example.com".to_string())
-//!     .organization("ACME Corp".to_string())
-//!     .organizational_unit("Engineering".to_string())
-//!     .country("US".to_string())
-//!     .state("CA".to_string())
-//!     .locality("San Francisco".to_string())
-//!     .validity_days(365)
-//!     .build()?;
-//! # Ok(())
-//! # }
-//! ```
-//!
-//! ## [`external_interface`]
-//!
-//! Unix socket server for external IPC. Provides a JSON-based API for certificate operations.
+//! Unix socket path for IPC: `/tmp/pki_socket`
 //!
 //! # Architecture Details
 //!
@@ -269,20 +223,81 @@
 //! }
 //! ```
 //!
-//! # Error Handling
-//!
-//! All public APIs return `anyhow::Result<T>` for flexible error handling:
+//! ## Request a User Certificate
 //!
 //! ```no_run
-//! use pki_chain::storage::Storage;
-//! use anyhow::{Context, Result};
+//! use pki_chain::{Request, Response, SOCKET_PATH};
+//! use std::os::unix::net::UnixStream;
+//! use std::io::{Read, Write};
 //!
-//! fn example() -> Result<()> {
-//!     let storage = Storage::new("key/app.key")
-//!         .context("Failed to initialize storage - check app key exists")?;
+//! fn create_user_cert() -> anyhow::Result<()> {
+//!     let mut stream = UnixStream::connect(SOCKET_PATH)?;
 //!     
-//!     if !storage.is_empty()? {
-//!         println!("Blockchain already initialized");
+//!     let request = Request::CreateUser {
+//!         subject_common_name: "alice@example.com".to_string(),
+//!         organization: "ACME Corp".to_string(),
+//!         organizational_unit: "Engineering".to_string(),
+//!         locality: "San Francisco".to_string(),
+//!         state: "CA".to_string(),
+//!         country: "US".to_string(),
+//!         validity_days: 365,
+//!         issuer_common_name: "Operations CA".to_string(),
+//!     };
+//!     
+//!     // Send request
+//!     let json = serde_json::to_string(&request)?;
+//!     stream.write_all(&(json.len() as u32).to_le_bytes())?;
+//!     stream.write_all(json.as_bytes())?;
+//!     
+//!     // Read response
+//!     let mut len_buf = [0u8; 4];
+//!     stream.read_exact(&mut len_buf)?;
+//!     let mut buf = vec![0u8; u32::from_le_bytes(len_buf) as usize];
+//!     stream.read_exact(&mut buf)?;
+//!     
+//!     match serde_json::from_slice::<Response>(&buf)? {
+//!         Response::CreateUserResponse { message, height, .. } => {
+//!             println!("{} at height {}", message, height);
+//!         }
+//!         Response::Error { message } => {
+//!             eprintln!("Error: {}", message);
+//!         }
+//!         _ => {}
+//!     }
+//!     
+//!     Ok(())
+//! }
+//! ```
+//!
+//! ## Get PKI System Status
+//!
+//! ```no_run
+//! use pki_chain::{Request, Response, SOCKET_PATH};
+//! use std::os::unix::net::UnixStream;
+//! use std::io::{Read, Write};
+//!
+//! fn check_status() -> anyhow::Result<()> {
+//!     let mut stream = UnixStream::connect(SOCKET_PATH)?;
+//!     
+//!     let request = Request::PKIStatus;
+//!     let json = serde_json::to_string(&request)?;
+//!     stream.write_all(&(json.len() as u32).to_le_bytes())?;
+//!     stream.write_all(json.as_bytes())?;
+//!     
+//!     let mut len_buf = [0u8; 4];
+//!     stream.read_exact(&mut len_buf)?;
+//!     let mut buf = vec![0u8; u32::from_le_bytes(len_buf) as usize];
+//!     stream.read_exact(&mut buf)?;
+//!     
+//!     if let Response::PKIStatusResponse {
+//!         total_certificates,
+//!         total_keys,
+//!         certificate_chain_valid,
+//!         ..
+//!     } = serde_json::from_slice(&buf)?
+//!     {
+//!         println!("Certificates: {}, Keys: {}, Valid: {}",
+//!             total_certificates, total_keys, certificate_chain_valid);
 //!     }
 //!     
 //!     Ok(())
@@ -290,7 +305,16 @@
 //! ```
 
 pub mod external_interface;
-pub mod generate_intermediate_ca;
-pub mod generate_root_ca;
-pub mod generate_user_keypair;
+mod generate_intermediate_ca;
+mod generate_root_ca;
+mod generate_user_keypair;
+mod generate_webclient_tls;
+pub mod protocol;
 pub mod storage;
+
+// Public API - only expose Request/Response enums, socket path, and protocol functions
+pub use external_interface::SOCKET_PATH;
+pub use protocol::{
+    deserialize_request, deserialize_response, serialize_request, serialize_response, Request,
+    Response,
+};

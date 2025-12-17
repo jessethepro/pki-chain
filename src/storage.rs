@@ -57,9 +57,11 @@ use libblockchain::blockchain::BlockChain;
 /// The `subject_name_to_height` field uses `Mutex` for concurrent access protection when multiple
 /// threads (e.g., socket server connections) need to query or update the mapping.
 pub struct Storage {
-    // Initialize blockchain storage for certificates and private keys
+    /// Blockchain storing X.509 certificates in PEM format
     pub certificate_chain: BlockChain,
+    /// Blockchain storing RSA private keys in DER format
     pub private_chain: BlockChain,
+    /// Thread-safe HashMap mapping certificate common names to blockchain heights
     pub subject_name_to_height: std::sync::Mutex<std::collections::HashMap<String, u64>>,
 }
 
@@ -152,7 +154,7 @@ impl Storage {
     /// # Ok(())
     /// # }
     /// ```
-    pub fn store_key_certificate(
+    pub(crate) fn store_key_certificate(
         &self,
         private_key: &openssl::pkey::PKey<openssl::pkey::Private>,
         certificate: &openssl::x509::X509,
@@ -227,6 +229,181 @@ impl Storage {
         Ok(self.certificate_chain.block_count()? == 0 && self.private_chain.block_count()? == 0)
     }
 
+    pub fn initialize(&self) -> Result<()> {
+        use crate::generate_webclient_tls::{
+            WEBCLIENT_COMMON_NAME, WEBCLIENT_INTERMEDIATE_COMMON_NAME,
+        };
+        let root_height = (|| -> Result<u64> {
+            use crate::generate_root_ca::RsaRootCABuilder;
+            // Initialize Root CA
+            let (root_private_key, root_certificate) = RsaRootCABuilder::new()
+                .subject_common_name("PKI Chain Root CA".to_string())
+                .organization("MenaceLabs".to_string())
+                .organizational_unit("CY".to_string())
+                .country("BR".to_string())
+                .state("SP".to_string())
+                .locality("Sao Jose dos Campos".to_string())
+                .validity_days(365 * 5) // 5 years
+                .build()
+                .context("Failed to generate Root CA")?;
+            println!("✓ Root CA generated");
+            // Save to blockchain
+            let height = self
+                .store_key_certificate(&root_private_key, &root_certificate)
+                .context("Failed to store Root CA in blockchain")?;
+            println!(
+                "✓ Root CA certificate and private key stored in blockchain as the genesis block"
+            );
+
+            // Verify storage
+            if self.verify_stored_key_certificate_pair(
+                &root_private_key,
+                &root_certificate,
+                height,
+            )? {
+                println!("✓ Stored Root CA key-certificate pair verified successfully");
+                // Export Root CA private key to file
+                std::fs::create_dir_all("exports")?;
+                let key_pem = root_private_key.private_key_to_pem_pkcs8()?;
+                std::fs::write("exports/root_ca.key", key_pem)?;
+                println!("✓ Root CA private key exported to 'exports/root_ca.key'");
+            } else {
+                println!("✗ Verification of stored Root CA key-certificate pair failed");
+                return Err(anyhow::anyhow!(
+                    "Stored Root CA key-certificate pair verification failed"
+                ));
+            }
+            match height {
+                0 => Ok(0),
+                _ => Err(anyhow::anyhow!(
+                    "Unexpected height for Root CA storage: {}",
+                    height
+                )),
+            }
+        })()?;
+        let intermediate_tls_height = (|| -> Result<u64> {
+            use crate::generate_intermediate_ca::RsaIntermediateCABuilder;
+            let root_certificate = {
+                let block = self.certificate_chain.get_block_by_height(root_height)?;
+                openssl::x509::X509::from_pem(&block.block_data)
+                    .context("Failed to parse stored Root CA certificate")?
+            };
+            let root_private_key = {
+                let block = self.private_chain.get_block_by_height(root_height)?;
+                openssl::pkey::PKey::private_key_from_der(&block.block_data)
+                    .context("Failed to parse stored Root CA key")?
+            };
+            // Initialize Intermediate TLS CA
+            let (intermediate_private_key, intermediate_certificate) =
+                RsaIntermediateCABuilder::new(root_private_key, root_certificate)
+                    .subject_common_name(WEBCLIENT_INTERMEDIATE_COMMON_NAME.to_string())
+                    .organization("MenaceLabs".to_string())
+                    .organizational_unit("CY".to_string())
+                    .country("BR".to_string())
+                    .state("SP".to_string())
+                    .locality("Sao Jose dos Campos".to_string())
+                    .validity_days(365 * 3) // 3 years
+                    .build()
+                    .context("Failed to generate Intermediate TLS CA")?;
+            println!("✓ Intermediate TLS CA generated");
+            // Save to blockchain
+            let height = self
+                .store_key_certificate(&intermediate_private_key, &intermediate_certificate)
+                .context("Failed to store Webserver Intermediate TLS CA in blockchain")?;
+            println!(
+                "✓ Webserver Intermediate TLS CA certificate and private key stored in blockchain"
+            );
+            // Verify storage
+            if self.verify_stored_key_certificate_pair(
+                &intermediate_private_key,
+                &intermediate_certificate,
+                height,
+            )? {
+                println!("✓ Stored Webserver Intermediate TLS CA key-certificate pair verified successfully");
+            } else {
+                println!(
+                    "✗ Verification of stored Intermediate TLS CA key-certificate pair failed"
+                );
+                return Err(anyhow::anyhow!(
+                    "Stored Webserver Intermediate TLS CA key-certificate pair verification failed"
+                ));
+            }
+            match height {
+                1 => Ok(1),
+                _ => Err(anyhow::anyhow!(
+                    "Unexpected height for Webserver Intermediate TLS CA storage: {}",
+                    height
+                )),
+            }
+        })()?;
+        // Initialize Web Client TLS Certificate
+        let http_server_tls_height = (|| -> Result<u64> {
+            use crate::generate_webclient_tls::RsaHttpServerCABuilder;
+            let intermediate_certificate = {
+                let block = self
+                    .certificate_chain
+                    .get_block_by_height(intermediate_tls_height)?;
+                openssl::x509::X509::from_pem(&block.block_data)
+                    .context("Failed to parse stored Webserver Intermediate TLS CA certificate")?
+            };
+            let intermediate_private_key = {
+                let block = self
+                    .private_chain
+                    .get_block_by_height(intermediate_tls_height)?;
+                openssl::pkey::PKey::private_key_from_der(&block.block_data)
+                    .context("Failed to parse stored Webserver Intermediate TLS CA key")?
+            };
+            // Initialize Web Client TLS Certificate
+            let (webclient_private_key, webclient_certificate) =
+                RsaHttpServerCABuilder::new(intermediate_private_key, intermediate_certificate)
+                    .subject_common_name(WEBCLIENT_COMMON_NAME.to_string())
+                    .organization("MenaceLabs".to_string())
+                    .organizational_unit("CY".to_string())
+                    .country("BR".to_string())
+                    .state("SP".to_string())
+                    .locality("Sao Jose dos Campos".to_string())
+                    .validity_days(365) // 1 year
+                    .build()
+                    .context("Failed to generate Web Client TLS certificate")?;
+            println!("✓ Web Client TLS certificate generated");
+            // Save to blockchain
+            let height = self
+                .store_key_certificate(&webclient_private_key, &webclient_certificate)
+                .context("Failed to store Web Client TLS certificate in blockchain")?;
+            println!("✓ Web Client TLS certificate and private key stored in blockchain");
+            if self.verify_stored_key_certificate_pair(
+                &webclient_private_key,
+                &webclient_certificate,
+                height,
+            )? {
+                println!("✓ Stored Intermediate TLS CA key-certificate pair verified successfully");
+            } else {
+                println!(
+                    "✗ Verification of stored Intermediate TLS CA key-certificate pair failed"
+                );
+                return Err(anyhow::anyhow!(
+                    "Stored Intermediate TLS CA key-certificate pair verification failed"
+                ));
+            }
+            match height {
+                2 => Ok(2),
+                _ => Err(anyhow::anyhow!(
+                    "Unexpected height for Webserver TLS certificate storage: {}",
+                    height
+                )),
+            }
+        })()?;
+        match http_server_tls_height {
+            h if h > intermediate_tls_height && intermediate_tls_height > root_height => Ok(()),
+            _ => Err(anyhow::anyhow!(
+                "Unexpected heights for TLS certificate storage: root {}, intermediate {}, webclient {}",
+                root_height,
+                intermediate_tls_height,
+                http_server_tls_height
+            )),
+        }
+    }
+
     /// Verifies that a private key matches the one stored at the specified height.
     ///
     /// # Arguments
@@ -237,7 +414,7 @@ impl Storage {
     /// # Returns
     ///
     /// * `Result<bool>` - True if keys match, false otherwise
-    pub fn verify_stored_key(
+    pub(crate) fn verify_stored_key(
         &self,
         private_key: &openssl::pkey::PKey<openssl::pkey::Private>,
         height: u64,
@@ -260,7 +437,7 @@ impl Storage {
     /// # Returns
     ///
     /// * `Result<bool>` - True if certificates match, false otherwise
-    pub fn verify_stored_certificate(
+    pub(crate) fn verify_stored_certificate(
         &self,
         certificate: &openssl::x509::X509,
         height: u64,
@@ -287,14 +464,15 @@ impl Storage {
     /// # Returns
     ///
     /// * `Result<bool>` - True if both match, false otherwise
-    pub fn verify_stored_key_certificate_pair(
+    pub(crate) fn verify_stored_key_certificate_pair(
         &self,
         private_key: &openssl::pkey::PKey<openssl::pkey::Private>,
         certificate: &openssl::x509::X509,
         height: u64,
     ) -> Result<bool> {
-        Ok(self.verify_stored_key(private_key, height)?
-            && self.verify_stored_certificate(certificate, height)?)
+        let key_matches = self.verify_stored_key(private_key, height)?;
+        let cert_matches = self.verify_stored_certificate(certificate, height)?;
+        Ok(key_matches && cert_matches)
     }
 
     /// Validates the integrity of both blockchains.
