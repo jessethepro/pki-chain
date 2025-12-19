@@ -16,7 +16,7 @@ pub(crate) enum Filter {
 }
 
 /// Request types from external applications
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 #[serde(tag = "type")]
 pub enum Request {
     CreateIntermediate {
@@ -47,7 +47,7 @@ pub enum Request {
 }
 
 /// Response types sent back to clients
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 #[serde(tag = "type")]
 pub enum Response {
     CreateIntermediateResponse {
@@ -117,7 +117,7 @@ pub enum Response {
 /// // bytes = [4-byte length] + [JSON data]
 /// # Ok::<(), anyhow::Error>(())
 /// ```
-pub fn serialize_request(request: &Request) -> Result<(u32, Vec<u8>)> {
+pub fn serialize_request(request: &Request) -> Result<Vec<u8>> {
     let json = serde_json::to_string(request).context("Failed to serialize request to JSON")?;
 
     let json_bytes = json.as_bytes();
@@ -127,7 +127,7 @@ pub fn serialize_request(request: &Request) -> Result<(u32, Vec<u8>)> {
     buffer.extend_from_slice(&length.to_le_bytes());
     buffer.extend_from_slice(json_bytes);
 
-    Ok((length, buffer))
+    Ok(buffer)
 }
 
 /// Deserialize a byte array to Request
@@ -221,9 +221,12 @@ mod tests {
         let result = serialize_request(&request);
         assert!(result.is_ok());
 
-        let (length, bytes) = result.unwrap();
-        assert!(length > 0);
-        assert_eq!(bytes.len(), (length + 4) as usize);
+        let bytes = result.unwrap();
+        assert!(bytes.len() > 4);
+        assert_eq!(
+            bytes.len(),
+            (u32::from_le_bytes(bytes[0..4].try_into().unwrap()) + 4) as usize
+        );
     }
 
     #[test]

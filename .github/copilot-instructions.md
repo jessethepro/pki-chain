@@ -10,9 +10,10 @@ This is a blockchain-backed PKI (Public Key Infrastructure) certificate authorit
 
 ### Core Components
 
-- **Dual Blockchain Storage**: Two separate `libblockchain::blockchain::BlockChain` instances stored in `data/certificates/` and `data/private_keys/`. These are encrypted sled databases with blockchain validation.
+- **Terminal User Interface**: Cursive-based TUI (src/ui.rs) provides interactive certificate management with form-based input, validation, and real-time status displays. Primary interface for certificate operations.
+- **Dual Blockchain Storage**: Two separate `libblockchain::blockchain::BlockChain` instances stored in `data/certificates/` and `data/private_keys/`. These are encrypted RocksDB databases with blockchain validation.
 - **Application Key**: `key/pki-chain-app.key` is the master key used to encrypt/decrypt both blockchain databases. Generated via `./generate_app_keypair.sh`.
-- **Unix Socket Server**: External IPC interface at `/tmp/pki_socket` for clients to request certificate operations without direct blockchain access.
+- **Unix Socket Server**: External IPC interface at `/tmp/pki_socket` for clients to request certificate operations without direct blockchain access. **Currently disabled** - socket server code is commented out in main.rs. TUI is the primary interface.
 - **Three-Tier Certificate Hierarchy**:
   - Root CA (self-signed, genesis block at height 0)
   - Intermediate CAs (signed by Root, pathlen=0)
@@ -25,11 +26,15 @@ This is a blockchain-backed PKI (Public Key Infrastructure) certificate authorit
    - Height 1: Intermediate TLS CA (signed by Root, pathlen=0, 3-year validity, CN="webclient_intermediate_tls_ca")
    - Height 2: WebClient TLS Certificate (signed by Intermediate, CA=false, 1-year validity, CN="webclient_cert.local")
    
-   Validates stored certificates match generated ones. Exports Root CA private key to `exports/root_ca.key`. Subsequent runs skip generation if block_count() > 0. **User certificates created via socket API start at height 3+**.
+   Validates stored certificates match generated ones. Exports Root CA private key to `exports/root_ca.key`. Subsequent runs skip generation if block_count() > 0. **User certificates created via TUI or socket API start at height 3+**.
 
-2. **Certificate Creation** ([external_interface.rs](src/external_interface.rs)): New certificates stored via `put_block()`. Blockchain automatically assigns UUIDs. On failure during private key storage, certificate is rolled back via `delete_latest_block()`.
-3. **State Management** ([storage.rs](src/storage.rs)): In-memory `subject_name_to_height` Mutex-wrapped HashMap inside `Storage` struct maps common names to block heights for fast certificate retrieval. Initialized at socket server startup by iterating entire certificate blockchain. Validates against duplicate subject common names before creation. Thread-safe access via `.lock().unwrap()`.
-4. **Socket Protocol** ([protocol.rs](src/protocol.rs), [external_interface.rs](src/external_interface.rs)): Length-prefixed JSON messages (4-byte LE length + JSON payload). Protocol module provides serialization/deserialization utilities (`serialize_request`, `deserialize_request`, `serialize_response`, `deserialize_response`). Server spawns in background thread via `std::thread::spawn()`, listens on Unix socket, handles connections serially.
+2. **TUI Certificate Creation** ([ui.rs](src/ui.rs)): Users create Intermediate CAs through interactive forms with real-time validation. Form validates all DN fields (CN, O, OU, L, ST, C), country code format (exactly 2 letters), and validity period (positive integer). Uses `RsaIntermediateCABuilder` to generate certificates. Calls `Storage::store_key_certificate()` which atomically stores both certificate and private key with rollback on failure.
+
+3. **Certificate Storage** ([storage.rs](src/storage.rs)): New certificates stored via `put_block()`. Blockchain automatically assigns UUIDs. On failure during private key storage, certificate is rolled back via `delete_latest_block()`. All operations are transactional.
+
+4. **State Management** ([storage.rs](src/storage.rs)): In-memory `subject_name_to_height` Mutex-wrapped HashMap inside `Storage` struct maps common names to block heights for fast certificate retrieval. Populated on startup by iterating entire certificate blockchain (called from main.rs via `populate_subject_name_index()`). Validates against duplicate subject common names before creation. Thread-safe access via `.lock().unwrap()`.
+
+5. **Socket Protocol** ([protocol.rs](src/protocol.rs), [external_interface.rs](src/external_interface.rs)): **Currently disabled**. Length-prefixed JSON messages (4-byte LE length + JSON payload). Protocol module provides serialization/deserialization utilities (`serialize_request`, `deserialize_request`, `serialize_response`, `deserialize_response`). Server would spawn in background thread via `std::thread::spawn()`, listen on Unix socket, handle connections serially.
 
 ## Key Conventions
 
@@ -84,9 +89,11 @@ cargo build --release
 
 **First run prerequisites**: Execute `./generate_app_keypair.sh` to create `key/pki-chain-app.key` before running the application.
 
-Interactive menu options:
-1. **Validate Blockchain** - Runs `validate()` on both certificate and private key chains, displays block counts and heights
-2. **Exit** - Terminates application (socket server thread stops with main process)
+TUI menu options (cursive-based interface):
+1. **Create Intermediate Certificate** - Interactive form for creating Intermediate CA certificates with all DN fields (CN, O, OU, L, ST, C) and validity period. Includes real-time validation.
+2. **Validate Blockchain** - Runs `validate()` on both certificate and private key chains, displays block counts and validation status
+3. **View System Status** - Shows blockchain statistics, block heights, and tracked subject names
+4. **Exit** - Terminates application gracefully
 
 ### Testing PKI Operations
 
@@ -183,9 +190,10 @@ All cryptographic operations use `openssl` crate:
 
 ## File Organization
 
-- [src/main.rs](src/main.rs): Entry point, blockchain initialization, interactive menu (~130 lines)
-- [src/storage.rs](src/storage.rs): Storage abstraction with dual blockchain management, transactional operations, initialization of 3-tier TLS hierarchy (~520 lines)
-- [src/external_interface.rs](src/external_interface.rs): Socket server, request handlers, WebClient TLS certificate retrieval (~820 lines)
+- [src/main.rs](src/main.rs): Entry point, blockchain initialization, launches TUI (~97 lines)
+- [src/ui.rs](src/ui.rs): Cursive-based terminal user interface - main menu, certificate creation forms with validation, blockchain validation view, system status dashboard (~331 lines)
+- [src/storage.rs](src/storage.rs): Storage abstraction with dual blockchain management, transactional operations, initialization of 3-tier TLS hierarchy (~557 lines)
+- [src/external_interface.rs](src/external_interface.rs): Socket server, request handlers, WebClient TLS certificate retrieval (currently disabled) (~820 lines)
 - [src/protocol.rs](src/protocol.rs): IPC protocol definitions - Request/Response enums, serialization/deserialization functions for length-prefixed JSON messages (~242 lines)
 - [src/generate_root_ca.rs](src/generate_root_ca.rs): Root CA builder (self-signed, pathlen=1)
 - [src/generate_intermediate_ca.rs](src/generate_intermediate_ca.rs): Intermediate CA builder (pathlen=0)

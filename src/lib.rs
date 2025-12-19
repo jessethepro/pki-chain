@@ -22,11 +22,13 @@
 //!
 //! # Features
 //!
+//! - � **Terminal User Interface**: Cursive-based TUI for interactive certificate management
 //! - 🔐 **Blockchain Storage**: Dual blockchain instances for certificates and keys
 //! - 🔗 **Three-Tier PKI**: Complete CA hierarchy implementation
 //! - 🔒 **Strong Cryptography**: 4096-bit RSA with SHA-256 signatures
 //! - 🔄 **Transactional Operations**: Automatic rollback on failures
 //! - ✅ **Integrity Validation**: Cross-chain signature verification
+//! - 🧵 **Thread Safety**: Arc-wrapped storage with concurrent access support
 //!
 //! # Quick Start
 //!
@@ -43,6 +45,9 @@
 //!
 //! ## As a Library
 //!
+//! **Note**: The Unix socket API is currently disabled in favor of the TUI interface.
+//! To re-enable socket communication, uncomment the socket server code in `src/main.rs`.
+//!
 //! Add to your `Cargo.toml`:
 //!
 //! ```toml
@@ -50,7 +55,7 @@
 //! pki-chain = { git = "https://github.com/jessethepro/pki-chain.git" }
 //! ```
 //!
-//! Use in your code:
+//! Use in your code (when socket server is enabled):
 //!
 //! ```no_run
 //! use pki_chain::{Request, Response, SOCKET_PATH};
@@ -305,7 +310,7 @@
 //! ```
 
 pub mod external_interface;
-mod generate_intermediate_ca;
+pub mod generate_intermediate_ca;
 mod generate_root_ca;
 mod generate_user_keypair;
 mod generate_webclient_tls;

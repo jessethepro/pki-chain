@@ -154,7 +154,7 @@ impl Storage {
     /// # Ok(())
     /// # }
     /// ```
-    pub(crate) fn store_key_certificate(
+    pub fn store_key_certificate(
         &self,
         private_key: &openssl::pkey::PKey<openssl::pkey::Private>,
         certificate: &openssl::x509::X509,
@@ -204,7 +204,18 @@ impl Storage {
                 "Stored signatures do not match"
             );
         }
-
+        // Update subject name to height mapping
+        let subject_name = certificate
+            .subject_name()
+            .entries_by_nid(openssl::nid::Nid::COMMONNAME)
+            .next()
+            .and_then(|entry| entry.data().as_utf8().ok())
+            .map(|data| data.to_string())
+            .context("Certificate missing Common Name")?;
+        self.subject_name_to_height
+            .lock()
+            .unwrap()
+            .insert(subject_name, certificate_height);
         Ok(certificate_height)
     }
 
@@ -394,7 +405,11 @@ impl Storage {
             }
         })()?;
         match http_server_tls_height {
-            h if h > intermediate_tls_height && intermediate_tls_height > root_height => Ok(()),
+            h if h > intermediate_tls_height && intermediate_tls_height > root_height => {
+                // Populate subject name index on initialization
+                self.populate_subject_name_index()?;
+                Ok(())
+            },
             _ => Err(anyhow::anyhow!(
                 "Unexpected heights for TLS certificate storage: root {}, intermediate {}, webclient {}",
                 root_height,
@@ -402,6 +417,27 @@ impl Storage {
                 http_server_tls_height
             )),
         }
+    }
+
+    pub fn populate_subject_name_index(&self) -> Result<usize> {
+        let mut map = self.subject_name_to_height.lock().unwrap();
+        map.clear();
+        let cert_iter = self.certificate_chain.iter();
+        for block_result in cert_iter {
+            let block = block_result?;
+            let height = block.block_header.height;
+            let certificate = openssl::x509::X509::from_pem(&block.block_data)
+                .context("Failed to parse stored certificate")?;
+            let subject_name = certificate
+                .subject_name()
+                .entries_by_nid(openssl::nid::Nid::COMMONNAME)
+                .next()
+                .and_then(|entry| entry.data().as_utf8().ok())
+                .map(|data| data.to_string())
+                .context("Certificate missing Common Name")?;
+            map.insert(subject_name, height);
+        }
+        Ok(map.len())
     }
 
     /// Verifies that a private key matches the one stored at the specified height.

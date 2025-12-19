@@ -93,7 +93,7 @@ const INTERMEDIATE_CA_PATH_LENGTH: u32 = 0; // Can only sign end-entity certs, n
 /// # Ok(())
 /// # }
 /// ```
-pub(crate) struct RsaIntermediateCABuilder {
+pub struct RsaIntermediateCABuilder {
     subject_common_name: String,
     organization: String,
     oganizational_unit: String,
@@ -111,7 +111,7 @@ impl RsaIntermediateCABuilder {
     /// # Arguments
     /// * `ca_key` - Root CA's private key for signing
     /// * `ca_cert` - Root CA's certificate (issuer information)
-    pub(crate) fn new(ca_key: PKey<Private>, ca_cert: X509) -> Self {
+    pub fn new(ca_key: PKey<Private>, ca_cert: X509) -> Self {
         Self {
             subject_common_name: String::new(),
             organization: String::new(),
@@ -134,37 +134,37 @@ impl RsaIntermediateCABuilder {
     ///
     /// # Returns
     /// Self for method chaining
-    pub(crate) fn subject_common_name(mut self, cn: String) -> Self {
+    pub fn subject_common_name(mut self, cn: String) -> Self {
         self.subject_common_name = cn;
         self
     }
 
     /// Set the organization (O) for the certificate
-    pub(crate) fn organization(mut self, org: String) -> Self {
+    pub fn organization(mut self, org: String) -> Self {
         self.organization = org;
         self
     }
 
     /// Set the organizational unit (OU) for the certificate
-    pub(crate) fn organizational_unit(mut self, ou: String) -> Self {
+    pub fn organizational_unit(mut self, ou: String) -> Self {
         self.oganizational_unit = ou;
         self
     }
 
     /// Set the locality (L) for the certificate
-    pub(crate) fn locality(mut self, locality: String) -> Self {
+    pub fn locality(mut self, locality: String) -> Self {
         self.locality = locality;
         self
     }
 
     /// Set the state/province (ST) for the certificate
-    pub(crate) fn state(mut self, state: String) -> Self {
+    pub fn state(mut self, state: String) -> Self {
         self.state = state;
         self
     }
 
     /// Set the country (C) for the certificate (2-letter ISO code)
-    pub(crate) fn country(mut self, country: String) -> Self {
+    pub fn country(mut self, country: String) -> Self {
         self.country = country;
         self
     }
@@ -181,7 +181,7 @@ impl RsaIntermediateCABuilder {
     /// - Intermediate CAs: 1825-3650 days (5-10 years)
     /// - Should be shorter than root CA validity
     /// - Should be longer than end-entity certificate validity
-    pub(crate) fn validity_days(mut self, days: u32) -> Self {
+    pub fn validity_days(mut self, days: u32) -> Self {
         self.validity_days = days;
         self
     }
@@ -236,7 +236,7 @@ impl RsaIntermediateCABuilder {
     /// # Ok(())
     /// # }
     /// ```
-    pub(crate) fn build(self) -> Result<(PKey<Private>, X509)> {
+    pub fn build(self) -> Result<(PKey<Private>, X509)> {
         // Generate RSA key pair for intermediate CA
         let rsa = openssl::rsa::Rsa::generate(RSA_KEY_SIZE_DEFAULT)
             .map_err(|e| anyhow!("Failed to generate RSA keypair: {}", e))?;

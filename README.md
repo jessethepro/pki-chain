@@ -1,51 +1,95 @@
 # PKI Chain
 
-A blockchain-backed Public Key Infrastructure (PKI) certificate authority system written in Rust. Provides a complete three-tier CA hierarchy (Root CA → Intermediate CA → User Certificates) with all certificates and private keys stored in tamper-proof blockchain storage.
+**A production-ready blockchain-backed Public Key Infrastructure (PKI) certificate authority system with an interactive terminal UI.**
+
+Built in Rust with enterprise-grade cryptography, PKI Chain provides a complete three-tier CA hierarchy (Root CA → Intermediate CA → User Certificates) where all certificates and private keys are stored in tamper-proof blockchain storage powered by [libblockchain](https://github.com/jessethepro/libblockchain).
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Rust](https://img.shields.io/badge/rust-1.70%2B-orange.svg)](https://www.rust-lang.org/)
 
+## Highlights
+
+✨ **Interactive TUI** - Manage certificates through a modern terminal interface  
+🔐 **Blockchain Security** - Immutable storage with tamper detection  
+🏗️ **Complete PKI** - Root CA, Intermediate CAs, and User certificates  
+🔒 **RSA-4096** - Industry-standard cryptography with SHA-256 signatures  
+🎯 **Fast Lookups** - O(1) certificate retrieval with in-memory indexing
+
 ## Features
 
+- � **Terminal User Interface**: Modern cursive-based TUI for interactive certificate management
+- 📝 **Interactive Forms**: Create Intermediate CA certificates with form-based input and validation
 - 🔐 **Blockchain Storage**: Dual blockchain instances ensure tamper-proof certificate and key storage
 - 🔗 **Three-Tier PKI Hierarchy**: Complete CA chain (Root → Intermediate → User)
 - 🔒 **Strong Cryptography**: 4096-bit RSA keys with SHA-256 signatures
 - 🔄 **Transactional Safety**: Automatic rollback on storage failures
 - ✅ **Signature Verification**: Cross-validation between certificate and key chains
-- 🔌 **Unix Socket API**: External IPC interface for certificate operations
 - 🎯 **Height-Based Indexing**: O(1) certificate lookups with thread-safe Mutex-protected HashMap
 - 🧵 **Thread Safety**: Arc-wrapped Storage with concurrent access support
+- 📊 **Real-Time Status**: View blockchain statistics and certificate inventory
+
+## Quick Start
+
+```bash
+# 1. Clone the repository
+git clone https://github.com/jessethepro/pki-chain.git
+cd pki-chain
+
+# 2. Generate master encryption key (REQUIRED for first run)
+./generate_app_keypair.sh
+
+# 3. Build the application
+cargo build --release
+
+# 4. Run the TUI
+./target/release/pki-chain
+```
+
+On first run, the application automatically initializes a complete 3-tier TLS certificate hierarchy in the blockchain. Use the interactive menu to:
+- Create new Intermediate CA certificates
+- Validate blockchain integrity
+- View system status and statistics
 
 ## Architecture
 
 ### Core Components
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│                      PKI Chain Application                    │
-├─────────────────────────────────────────────────────────────┤
-│  Main Process          │  Socket Server (Background Thread)  │
-│  - Interactive Menu    │  - Unix Socket: /tmp/pki_socket    │
-│  - Blockchain Init     │  - JSON Request/Response            │
-│  - Root CA Generation  │  - Certificate Operations           │
-└────────┬────────────────┴──────────────────┬─────────────────┘
-         │                                   │
-         └───────────────┬───────────────────┘
-                         │
-         ┌───────────────▼────────────────┐
-         │   Arc<Storage> (Thread-Safe)   │
-         │  - Transactional Operations    │
-         │  - Signature Verification      │
-         │  - Mutex<subject→height map>   │
-         └───────────┬────────────────────┘
-                     │
-         ┌───────────┴────────────────┐
-         │                            │
-    ┌────▼────────┐          ┌───────▼──────┐
-    │ Certificate │          │  Private Key │
-    │ Blockchain  │          │  Blockchain  │
-    │ (PEM)       │          │  (DER)       │
-    └─────────────┘          └──────────────┘
+┌──────────────────────────────────────────────────────────────┐
+│                   PKI Chain Application                       │
+│                                                               │
+│  ┌────────────────────────────────────────────────────────┐  │
+│  │           Cursive Terminal UI (Main Thread)            │  │
+│  │  ┌──────────────────────────────────────────────────┐  │  │
+│  │  │  Main Menu                                       │  │  │
+│  │  │  1. Create Intermediate Certificate              │  │  │
+│  │  │  2. Validate Blockchain                          │  │  │
+│  │  │  3. View System Status                           │  │  │
+│  │  │  4. Exit                                         │  │  │
+│  │  └──────────────────────────────────────────────────┘  │  │
+│  │                                                          │  │
+│  │  Forms: EditView, LinearLayout, Dialog                  │  │
+│  │  Validation: Required fields, Country code, Duplicates  │  │
+│  └─────────────────────┬────────────────────────────────────┘  │
+│                        │                                       │
+│       ┌────────────────▼────────────────┐                      │
+│       │   Arc<Storage> (Thread-Safe)    │                      │
+│       │  - Transactional Operations     │                      │
+│       │  - Signature Verification       │                      │
+│       │  - Mutex<subject→height map>    │                      │
+│       └────────────┬────────────────────┘                      │
+│                    │                                           │
+│       ┌────────────┴────────────────┐                          │
+│       │                             │                          │
+│  ┌────▼────────┐          ┌─────────▼──────┐                  │
+│  │ Certificate │          │  Private Key   │                  │
+│  │ Blockchain  │          │  Blockchain    │                  │
+│  │ (PEM)       │          │  (DER)         │                  │
+│  │ RocksDB     │          │  RocksDB       │                  │
+│  └─────────────┘          └────────────────┘                  │
+│                                                                │
+│  Socket Server: Currently disabled (can be re-enabled)        │
+└────────────────────────────────────────────────────────────────┘
 ```
 
 ### PKI Hierarchy
@@ -85,19 +129,73 @@ cargo build --release
 
 ## Usage
 
-### Interactive Mode
+### Terminal User Interface
 
-Run the application to start the interactive menu:
+Run the application to launch the interactive TUI:
 
 ```bash
 ./target/release/pki-chain
 ```
 
-**Menu Options:**
-1. **Validate Blockchain** - Verify integrity of certificate and key chains
-2. **Exit** - Shutdown application
+**TUI Features:**
 
-### Socket API
+1. **Create Intermediate Certificate**
+   - Interactive form with all Distinguished Name fields
+   - Fields: Common Name (CN), Organization (O), Organizational Unit (OU), Locality (L), State (ST), Country (C)
+   - Configurable validity period (default: 1825 days / 5 years)
+   - Real-time validation:
+     - All fields required
+     - Country code must be exactly 2 letters
+     - Validity must be positive
+     - Duplicate subject name detection
+   - Automatic blockchain storage with transactional safety
+
+2. **Validate Blockchain**
+   - Runs `validate()` on both certificate and private key chains
+   - Displays block counts and validation status
+   - Ensures signature consistency between chains
+
+3. **View System Status**
+   - Certificate blockchain statistics
+   - Private key blockchain statistics
+   - List of all tracked subject names
+   - Block heights and validation state
+
+4. **Exit**
+   - Gracefully shutdown application
+
+### Typical Workflow
+
+```
+1. First Run:
+   $ ./generate_app_keypair.sh        # Create master encryption key
+   $ ./target/release/pki-chain       # Initialize with 3-tier TLS hierarchy
+
+2. Create Intermediate CA:
+   - Select "Create Intermediate Certificate"
+   - Fill form fields:
+     CN: "Operations CA"
+     O: "ACME Corp"
+     OU: "IT Department"
+     L: "Seattle"
+     ST: "Washington"
+     C: "US"
+     Validity: 1825 (days)
+   - Press OK to generate and store
+   - Blockchain automatically assigns height (e.g., height 3)
+
+3. Verify Storage:
+   - Select "View System Status"
+   - Check certificate count increased
+   - Verify new subject name in tracked list
+
+4. Validate Integrity:
+   - Select "Validate Blockchain"
+   - Confirms both chains are valid
+   - Shows total block count
+```
+
+### Socket API (Currently Disabled)
 
 External applications can interact with the PKI system via the Unix socket at `/tmp/pki_socket`.
 
@@ -169,6 +267,8 @@ Responses use strongly-typed enums with tagged JSON:
 | `SocketTest` | Test socket connectivity |
 | `GetWebClientTLSCertificate` | Retrieve pre-generated TLS certificate with full chain |
 
+**Note**: The socket server is currently disabled in favor of the TUI interface. To re-enable, uncomment the socket server code in `src/main.rs`.
+
 ## Testing
 
 ### End-to-End Testing
@@ -183,6 +283,42 @@ This script:
 - Generates Root CA → Intermediate CA → 5 User certificates
 - Validates the complete certificate chain
 - Tests certificate exports and integrity
+
+## Initial Certificate Structure
+
+On first run, the application automatically initializes a complete 3-tier TLS certificate hierarchy in the blockchain:
+
+### Height 0: Root CA
+- **Subject CN**: `PKI Chain Root CA`
+- **Type**: Self-signed Root Certificate Authority
+- **Constraints**: CA=true, pathlen=1 (can sign one level of CAs)
+- **Validity**: 5 years (1825 days)
+- **Usage**: Signs Intermediate CAs
+- **Export**: Private key exported to `exports/root_ca.key`
+
+### Height 1: Intermediate TLS CA
+- **Subject CN**: `webclient_intermediate_tls_ca`
+- **Type**: Intermediate Certificate Authority
+- **Constraints**: CA=true, pathlen=0 (can only sign end-entity certificates)
+- **Validity**: 3 years (1095 days)
+- **Signed By**: Root CA (Height 0)
+- **Usage**: Signs TLS server certificates
+
+### Height 2: WebClient TLS Certificate
+- **Subject CN**: `webclient_cert.local`
+- **Type**: TLS Server Certificate (end-entity)
+- **Constraints**: CA=false
+- **Extended Key Usage**: serverAuth (TLS server authentication)
+- **Subject Alternative Names**:
+  - DNS: localhost
+  - IP: 127.0.0.1
+  - IP: ::1
+- **Validity**: 1 year (365 days)
+- **Signed By**: Intermediate TLS CA (Height 1)
+- **Usage**: Secures PKIWebClient HTTPS server
+
+### User-Created Certificates
+All certificates created via the TUI (or socket API) are stored at **heights 3 and above**.
 
 ## Configuration
 
@@ -211,13 +347,15 @@ pki-chain/
 ├── src/
 │   ├── lib.rs                       # Library interface
 │   ├── storage.rs                   # Blockchain storage abstraction
-│   ├── external_interface.rs        # Unix socket server
+│   ├── main.rs                      # Application entry point
+│   ├── ui.rs                        # Terminal user interface (TUI)
+│   ├── storage.rs                   # Blockchain storage abstraction
+│   ├── external_interface.rs        # Unix socket server (disabled)
 │   ├── protocol.rs                  # IPC protocol definitions
 │   ├── generate_root_ca.rs          # Root CA builder
 │   ├── generate_intermediate_ca.rs  # Intermediate CA builder
 │   ├── generate_user_keypair.rs     # User certificate builder
-│   └── generate_webclient_tls.rs    # TLSrmediate CA builder
-│   └── generate_user_keypair.rs     # User certificate builder
+│   └── generate_webclient_tls.rs    # TLS server certificate builder
 ├── .github/
 │   └── copilot-instructions.md      # AI coding assistant instructions
 ├── generate_app_keypair.sh          # Application key generator
@@ -235,12 +373,17 @@ cargo doc --open
 
 ### Dependencies
 
-Key dependencies:
-- [`libblockchain`](https://github.com/jessethepro/libblockchain) - Blockchain storage engine
-- `openssl` - Cryptographic operations
-- `anyhow` - Error handling
-- `serde`/`serde_json` - Serialization
-- `rpassword` - Secure password input
+Key dependencies and their purposes:
+- [`libblockchain`](https://github.com/jessethepro/libblockchain) - Custom blockchain storage engine with hybrid encryption
+- `openssl` (0.10) - RSA-4096 key generation, X.509 certificate operations, SHA-256 signatures
+- `cursive` (0.21) - Terminal user interface framework for interactive forms and menus
+- `anyhow` - Ergonomic error handling with context chains
+- `serde`/`serde_json` - JSON serialization for socket protocol
+- `rpassword` - Secure password input without echo
+
+### Development Dependencies
+- Standard Rust toolchain (1.70+)
+- System OpenSSL development libraries (`libssl-dev` on Debian/Ubuntu)
 
 ## Security Considerations
 
