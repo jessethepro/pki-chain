@@ -18,15 +18,16 @@ Built in Rust with enterprise-grade cryptography, PKI Chain provides a complete 
 ## Features
 
 - � **Terminal User Interface**: Modern cursive-based TUI for interactive certificate management
-- 📝 **Interactive Forms**: Create Intermediate CA certificates with form-based input and validation
+- 📝 **Interactive Forms**: Create both Intermediate CA and User certificates with form-based input and validation
 - 🔐 **Blockchain Storage**: Dual blockchain instances ensure tamper-proof certificate and key storage
 - 🔗 **Three-Tier PKI Hierarchy**: Complete CA chain (Root → Intermediate → User)
 - 🔒 **Strong Cryptography**: 4096-bit RSA keys with SHA-256 signatures
 - 🔄 **Transactional Safety**: Automatic rollback on storage failures
-- ✅ **Signature Verification**: Cross-validation between certificate and key chains
+- ✅ **Certificate Validation**: OpenSSL X509Store-based chain validation with signature verification
 - 🎯 **Height-Based Indexing**: O(1) certificate lookups with thread-safe Mutex-protected HashMap
-- 🧵 **Thread Safety**: Arc-wrapped Storage with concurrent access support
+- 🧵 **Thread Safety**: Arc-wrapped Protocol with concurrent access support
 - 📊 **Real-Time Status**: View blockchain statistics and certificate inventory
+- 🏗️ **Protocol Layer**: All storage operations through Request/Response interface ensuring clean abstraction
 
 ## Quick Start
 
@@ -63,21 +64,29 @@ On first run, the application automatically initializes a complete 3-tier TLS ce
 │  │  ┌──────────────────────────────────────────────────┐  │  │
 │  │  │  Main Menu                                       │  │  │
 │  │  │  1. Create Intermediate Certificate              │  │  │
-│  │  │  2. Validate Blockchain                          │  │  │
-│  │  │  3. View System Status                           │  │  │
-│  │  │  4. Exit                                         │  │  │
+│  │  │  2. Create User Certificate                      │  │  │
+│  │  │  3. Validate Blockchain                          │  │  │
+│  │  │  4. View System Status                           │  │  │
+│  │  │  5. Exit                                         │  │  │
 │  │  └──────────────────────────────────────────────────┘  │  │
 │  │                                                          │  │
-│  │  Forms: EditView, LinearLayout, Dialog                  │  │
+│  │  Forms: EditView, SelectView, LinearLayout, Dialog      │  │
 │  │  Validation: Required fields, Country code, Duplicates  │  │
 │  └─────────────────────┬────────────────────────────────────┘  │
 │                        │                                       │
 │       ┌────────────────▼────────────────┐                      │
-│       │   Arc<Storage> (Thread-Safe)    │                      │
-│       │  - Transactional Operations     │                      │
-│       │  - Signature Verification       │                      │
-│       │  - Mutex<subject→height map>    │                      │
+│       │   Arc<Protocol> (Thread-Safe)   │                      │
+│       │  - Request/Response Interface   │                      │
+│       │  - Storage Ownership            │                      │
+│       │  - Certificate Validation       │                      │
 │       └────────────┬────────────────────┘                      │
+│                    │                                           │
+│       ┌────────────▼────────────────┐                          │
+│       │   Storage (Owned by Protocol)│                         │
+│       │  - Transactional Operations  │                         │
+│       │  - Signature Verification    │                         │
+│       │  - Mutex<subject→height map> │                         │
+│       └────────────┬─────────────────┘                         │
 │                    │                                           │
 │       ┌────────────┴────────────────┐                          │
 │       │                             │                          │
@@ -150,18 +159,30 @@ Run the application to launch the interactive TUI:
      - Duplicate subject name detection
    - Automatic blockchain storage with transactional safety
 
-2. **Validate Blockchain**
+2. **Create User Certificate**
+   - Interactive form with all Distinguished Name fields
+   - Dropdown menu to select issuing Intermediate CA
+   - Fields: Common Name (CN), Organization (O), Organizational Unit (OU), Locality (L), State (ST), Country (C), Issuer CA
+   - Configurable validity period (default: 365 days / 1 year)
+   - Real-time validation:
+     - All fields required
+     - Country code must be exactly 2 letters
+     - Validity must be positive
+     - Duplicate subject name detection
+   - Automatic blockchain storage with transactional safety
+
+3. **Validate Blockchain**
    - Runs `validate()` on both certificate and private key chains
    - Displays block counts and validation status
    - Ensures signature consistency between chains
 
-3. **View System Status**
+4. **View System Status**
    - Certificate blockchain statistics
    - Private key blockchain statistics
    - List of all tracked subject names
    - Block heights and validation state
 
-4. **Exit**
+5. **Exit**
    - Gracefully shutdown application
 
 ### Typical Workflow
@@ -184,12 +205,26 @@ Run the application to launch the interactive TUI:
    - Press OK to generate and store
    - Blockchain automatically assigns height (e.g., height 3)
 
-3. Verify Storage:
+3. Create User Certificate:
+   - Select "Create User Certificate"
+   - Choose issuing CA from dropdown (e.g., "Operations CA")
+   - Fill form fields:
+     CN: "john.doe@example.com"
+     O: "ACME Corp"
+     OU: "Engineering"
+     L: "Seattle"
+     ST: "Washington"
+     C: "US"
+     Validity: 365 (days)
+   - Press OK to generate and store
+   - Blockchain automatically assigns height (e.g., height 4)
+
+4. Verify Storage:
    - Select "View System Status"
    - Check certificate count increased
-   - Verify new subject name in tracked list
+   - Verify new subject names in tracked list
 
-4. Validate Integrity:
+5. Validate Integrity:
    - Select "Validate Blockchain"
    - Confirms both chains are valid
    - Shows total block count
@@ -346,12 +381,11 @@ All certificates created via the TUI (or socket API) are stored at **heights 3 a
 pki-chain/
 ├── src/
 │   ├── lib.rs                       # Library interface
-│   ├── storage.rs                   # Blockchain storage abstraction
 │   ├── main.rs                      # Application entry point
 │   ├── ui.rs                        # Terminal user interface (TUI)
+│   ├── protocol.rs                  # Protocol layer (owns Storage, Request/Response interface)
 │   ├── storage.rs                   # Blockchain storage abstraction
 │   ├── external_interface.rs        # Unix socket server (disabled)
-│   ├── protocol.rs                  # IPC protocol definitions
 │   ├── generate_root_ca.rs          # Root CA builder
 │   ├── generate_intermediate_ca.rs  # Intermediate CA builder
 │   ├── generate_user_keypair.rs     # User certificate builder

@@ -63,6 +63,7 @@
 mod ui;
 
 use anyhow::{Context, Result};
+use pki_chain::protocol::Protocol;
 use pki_chain::storage::Storage;
 use std::sync::Arc;
 
@@ -70,7 +71,7 @@ const APP_KEY_PATH: &str = "key/pki-chain-app.key";
 
 fn main() -> Result<()> {
     // Initialize storage
-    let storage = Arc::new(Storage::new(APP_KEY_PATH).context("Failed to initialize storage")?);
+    let storage = Storage::new(APP_KEY_PATH).context("Failed to initialize storage")?;
 
     if storage.is_empty()? {
         storage
@@ -81,16 +82,19 @@ fn main() -> Result<()> {
         .populate_subject_name_index()
         .context("Failed to populate subject name index")?;
 
+    // Create protocol that owns storage
+    let protocol = Arc::new(Protocol::new(storage));
+
     // Socket server disabled for now
-    // let storage_clone = Arc::clone(&storage);
+    // let protocol_clone = Arc::clone(&protocol);
     // std::thread::spawn(move || {
-    //     if let Err(e) = pki_chain::external_interface::start_socket_server(storage_clone) {
+    //     if let Err(e) = pki_chain::external_interface::start_socket_server(protocol_clone) {
     //         eprintln!("Socket server error: {}", e);
     //     }
     // });
 
     // Run the TUI
-    ui::run_ui(storage);
+    ui::run_ui(protocol);
 
     Ok(())
 }

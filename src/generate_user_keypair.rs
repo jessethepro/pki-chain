@@ -97,7 +97,7 @@ const RSA_KEY_SIZE_DEFAULT: u32 = 4096;
 /// # Ok(())
 /// # }
 /// ```
-pub(crate) struct RsaUserKeyPairBuilder {
+pub struct RsaUserKeyPairBuilder {
     subject_common_name: String,
     organization: String,
     oganizational_unit: String,
@@ -115,7 +115,7 @@ impl RsaUserKeyPairBuilder {
     /// # Arguments
     /// * `ca_key` - Intermediate CA's private key for signing
     /// * `ca_cert` - Intermediate CA's certificate (issuer information)
-    pub(crate) fn new(ca_key: PKey<Private>, ca_cert: X509) -> Self {
+    pub fn new(ca_key: PKey<Private>, ca_cert: X509) -> Self {
         Self {
             subject_common_name: String::new(),
             organization: String::new(),
@@ -142,7 +142,7 @@ impl RsaUserKeyPairBuilder {
     ///
     /// # Returns
     /// Self for method chaining
-    pub(crate) fn subject_common_name(mut self, cn: String) -> Self {
+    pub fn subject_common_name(mut self, cn: String) -> Self {
         self.subject_common_name = cn;
         self
     }
@@ -154,7 +154,7 @@ impl RsaUserKeyPairBuilder {
     ///
     /// # Returns
     /// Self for method chaining
-    pub(crate) fn organization(mut self, org: String) -> Self {
+    pub fn organization(mut self, org: String) -> Self {
         self.organization = org;
         self
     }
@@ -166,7 +166,7 @@ impl RsaUserKeyPairBuilder {
     ///
     /// # Returns
     /// Self for method chaining
-    pub(crate) fn organizational_unit(mut self, ou: String) -> Self {
+    pub fn organizational_unit(mut self, ou: String) -> Self {
         self.oganizational_unit = ou;
         self
     }
@@ -178,7 +178,7 @@ impl RsaUserKeyPairBuilder {
     ///
     /// # Returns
     /// Self for method chaining
-    pub(crate) fn locality(mut self, locality: String) -> Self {
+    pub fn locality(mut self, locality: String) -> Self {
         self.locality = locality;
         self
     }
@@ -190,7 +190,7 @@ impl RsaUserKeyPairBuilder {
     ///
     /// # Returns
     /// Self for method chaining
-    pub(crate) fn state(mut self, state: String) -> Self {
+    pub fn state(mut self, state: String) -> Self {
         self.state = state;
         self
     }
@@ -202,7 +202,7 @@ impl RsaUserKeyPairBuilder {
     ///
     /// # Returns
     /// Self for method chaining
-    pub(crate) fn country(mut self, country: String) -> Self {
+    pub fn country(mut self, country: String) -> Self {
         self.country = country;
         self
     }
@@ -219,7 +219,7 @@ impl RsaUserKeyPairBuilder {
     /// - User certificates: 365-730 days (1-2 years)
     /// - Device certificates: 730-1095 days (2-3 years)
     /// - Short-lived certificates: 30-90 days
-    pub(crate) fn validity_days(mut self, days: u32) -> Self {
+    pub fn validity_days(mut self, days: u32) -> Self {
         self.validity_days = days;
         self
     }
@@ -268,7 +268,7 @@ impl RsaUserKeyPairBuilder {
     /// # Ok(())
     /// # }
     /// ```
-    pub(crate) fn build(self) -> Result<(PKey<Private>, X509)> {
+    pub fn build(self) -> Result<(PKey<Private>, X509)> {
         // Generate RSA key pair for user
         let rsa = openssl::rsa::Rsa::generate(RSA_KEY_SIZE_DEFAULT)
             .map_err(|e| anyhow!("Failed to generate RSA keypair: {}", e))?;

@@ -168,7 +168,7 @@ All responses are length-prefixed and use tagged enums. Serialization via `seria
 
 - **Source**: GitHub repository `jessethepro/libblockchain` (specified in Cargo.toml as git dependency)
 - **Key APIs**: `BlockChain::new(path, key_path)`, `put_block()`, `get_block_by_height()`, `get_block_by_uuid()`, `validate()`, `block_count()`, `delete_latest_block()`, `iter()`
-- **Storage**: Each blockchain uses RocksDB (sled) database with SST files and LOG snapshots in `data/certificates/` and `data/private_keys/`
+- **Storage**: Each blockchain uses RocksDB database with SST files and LOG snapshots in `data/certificates/` and `data/private_keys/`
 - **Thread Safety**: Wrapped in `Arc<BlockChain>` for shared ownership across threads
 
 ### OpenSSL Usage
@@ -206,6 +206,6 @@ All cryptographic operations use `openssl` crate:
 
 - **Application Key**: `key/pki-chain-app.key` (constant: `APP_KEY_PATH`)
 - **Unix Socket**: `/tmp/pki_socket` (constant: `SOCKET_PATH`)
-- **Certificate Storage**: `data/certificates/` (sled database + snapshots)
-- **Private Key Storage**: `data/private_keys/` (sled database + snapshots)
+- **Certificate Storage**: `data/certificates/` (RocksDB database + snapshots)
+- **Private Key Storage**: `data/private_keys/` (RocksDB database + snapshots)
 - **Export Directory**: `exports/` (Root CA key exports)

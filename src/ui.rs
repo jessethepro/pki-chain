@@ -53,16 +53,15 @@ use anyhow::Result;
 use cursive::view::{Nameable, Resizable, Scrollable};
 use cursive::views::{Dialog, EditView, LinearLayout, Panel, ScrollView, SelectView, TextView};
 use cursive::{Cursive, CursiveExt};
-use pki_chain::generate_intermediate_ca::RsaIntermediateCABuilder;
-use pki_chain::storage::Storage;
+use pki_chain::protocol::{CertificateData, Protocol, Request, Response};
 use std::sync::Arc;
 
 /// Initialize and run the TUI application
-pub fn run_ui(storage: Arc<Storage>) {
+pub fn run_ui(protocol: Arc<Protocol>) {
     let mut siv = Cursive::default();
 
-    // Store storage in user data
-    siv.set_user_data(storage);
+    // Store protocol in user data
+    siv.set_user_data(protocol);
 
     // Build main menu
     build_main_menu(&mut siv);
@@ -75,15 +74,17 @@ fn build_main_menu(siv: &mut Cursive) {
     let mut select = SelectView::new();
 
     select.add_item("Create Intermediate Certificate", 1);
-    select.add_item("Validate Blockchain", 2);
-    select.add_item("View System Status", 3);
-    select.add_item("Exit", 4);
+    select.add_item("Create User Certificate", 2);
+    select.add_item("Validate Blockchain", 3);
+    select.add_item("View System Status", 4);
+    select.add_item("Exit", 5);
 
     select.set_on_submit(|s, item: &usize| match item {
         1 => show_create_intermediate_form(s),
-        2 => show_validation(s),
-        3 => show_system_status(s),
-        4 => s.quit(),
+        2 => show_create_user_form(s),
+        3 => show_validation(s),
+        4 => show_system_status(s),
+        5 => s.quit(),
         _ => {}
     });
 
@@ -98,15 +99,15 @@ fn build_main_menu(siv: &mut Cursive) {
 }
 
 fn show_validation(siv: &mut Cursive) {
-    let storage = match siv.user_data::<Arc<Storage>>() {
-        Some(s) => Arc::clone(s),
+    let protocol = match siv.user_data::<Arc<Protocol>>() {
+        Some(p) => Arc::clone(p),
         None => {
-            show_error(siv, "Failed to access storage");
+            show_error(siv, "Failed to access protocol");
             return;
         }
     };
 
-    let result = validate_blockchain(&storage);
+    let result = validate_blockchain(&protocol);
 
     match result {
         Ok(msg) => {
@@ -123,15 +124,15 @@ fn show_validation(siv: &mut Cursive) {
 }
 
 fn show_system_status(siv: &mut Cursive) {
-    let storage = match siv.user_data::<Arc<Storage>>() {
-        Some(s) => Arc::clone(s),
+    let protocol = match siv.user_data::<Arc<Protocol>>() {
+        Some(p) => Arc::clone(p),
         None => {
-            show_error(siv, "Failed to access storage");
+            show_error(siv, "Failed to access protocol");
             return;
         }
     };
 
-    match get_system_status(&storage) {
+    match get_system_status(&protocol) {
         Ok(status) => {
             siv.add_layer(
                 Dialog::around(ScrollView::new(TextView::new(status)))
@@ -249,11 +250,11 @@ fn handle_create_intermediate(siv: &mut Cursive) {
         }
     };
 
-    // Get storage
-    let storage = match siv.user_data::<Arc<Storage>>() {
-        Some(s) => Arc::clone(s),
+    // Get protocol
+    let protocol = match siv.user_data::<Arc<Protocol>>() {
+        Some(p) => Arc::clone(p),
         None => {
-            show_error(siv, "Failed to access storage");
+            show_error(siv, "Failed to access protocol");
             return;
         }
     };
@@ -263,7 +264,7 @@ fn handle_create_intermediate(siv: &mut Cursive) {
 
     // Create the certificate
     match create_intermediate_certificate(
-        &storage,
+        &protocol,
         cn.clone(),
         org,
         ou,
@@ -294,7 +295,7 @@ fn handle_create_intermediate(siv: &mut Cursive) {
 }
 
 fn create_intermediate_certificate(
-    storage: &Storage,
+    protocol: &Protocol,
     cn: String,
     org: String,
     ou: String,
@@ -303,74 +304,346 @@ fn create_intermediate_certificate(
     country: String,
     validity_days: u32,
 ) -> Result<u64> {
-    // Get Root CA from blockchain (height 0)
-    let root_block = storage.certificate_chain.get_block_by_height(0)?;
-    let root_cert = openssl::x509::X509::from_pem(&root_block.block_data)?;
+    let certificate_data = CertificateData {
+        subject_common_name: cn,
+        issuer_common_name: String::new(),
+        serial_number: String::new(),
+        organization: org,
+        organizational_unit: ou,
+        locality,
+        state,
+        country,
+        validity_days: Some(validity_days),
+        not_before: None,
+        not_after: None,
+        type_of_certificate: String::new(),
+        x509: None,
+    };
 
-    let root_key_block = storage.private_chain.get_block_by_height(0)?;
-    let root_key = openssl::pkey::PKey::private_key_from_der(&root_key_block.block_data)?;
+    let request = Request::CreateIntermediate { certificate_data };
 
-    // Generate intermediate certificate
-    let (int_key, int_cert) = RsaIntermediateCABuilder::new(root_key, root_cert)
-        .subject_common_name(cn)
-        .organization(org)
-        .organizational_unit(ou)
-        .locality(locality)
-        .state(state)
-        .country(country)
-        .validity_days(validity_days)
-        .build()?;
-
-    // Store in blockchain
-    let height = storage.store_key_certificate(&int_key, &int_cert)?;
-
-    Ok(height)
-}
-
-fn validate_blockchain(storage: &Storage) -> Result<String> {
-    if storage.is_empty()? {
-        return Ok("Blockchain is empty. No data to validate.".to_string());
-    }
-
-    if storage.validate()? {
-        let cert_count = storage.certificate_chain.block_count()?;
-        let key_count = storage.private_chain.block_count()?;
-        let subject_count = storage.subject_name_to_height.lock().unwrap().len();
-
-        Ok(format!(
-            "✓ Blockchain Validation Successful\n\n\
-             Total Certificates: {}\n\
-             Total Private Keys: {}\n\
-             Tracked Subject Names: {}\n\n\
-             All blocks verified and consistent.",
-            cert_count, key_count, subject_count
-        ))
-    } else {
-        Err(anyhow::anyhow!("Blockchain validation failed"))
+    match protocol.process_request(request)? {
+        Response::CreateIntermediate { height, .. } => Ok(height),
+        Response::Error { message } => Err(anyhow::anyhow!(message)),
+        _ => Err(anyhow::anyhow!("Unexpected response type")),
     }
 }
 
-fn get_system_status(storage: &Storage) -> Result<String> {
-    let cert_count = storage.certificate_chain.block_count()?;
-    let key_count = storage.private_chain.block_count()?;
-    let subject_count = storage.subject_name_to_height.lock().unwrap().len();
-    let is_empty = storage.is_empty()?;
-    let is_valid = if !is_empty { storage.validate()? } else { true };
+fn validate_blockchain(protocol: &Protocol) -> Result<String> {
+    let request = Request::PKIStatus;
 
-    Ok(format!(
-        "PKI Chain System Status\n\
-         ═══════════════════════\n\n\
-         Storage Status: {}\n\
-         Blockchain Valid: {}\n\n\
-         Certificates: {}\n\
-         Private Keys: {}\n\
-         Subject Names: {}\n\n\
-         Socket Server: Disabled\n\
-         Application Key: key/pki-chain-app.key",
-        if is_empty { "Empty" } else { "Initialized" },
-        if is_valid { "✓ Yes" } else { "✗ No" },
-        cert_count,
-        key_count,
-        subject_count
-    ))
+    match protocol.process_request(request)? {
+        Response::PKIStatus {
+            total_certificates,
+            total_keys,
+            tracked_subject_names,
+            pki_chain_in_sync,
+            ..
+        } => {
+            if pki_chain_in_sync {
+                Ok(format!(
+                    "✓ Blockchain Validation Successful\n\n\
+                     Total Certificates: {}\n\
+                     Total Private Keys: {}\n\
+                     Tracked Subject Names: {}\n\n\
+                     All blocks verified and consistent.",
+                    total_certificates, total_keys, tracked_subject_names
+                ))
+            } else {
+                Err(anyhow::anyhow!("Blockchain validation failed"))
+            }
+        }
+        Response::Error { message } => Err(anyhow::anyhow!(message)),
+        _ => Err(anyhow::anyhow!("Unexpected response type")),
+    }
+}
+
+fn get_system_status(protocol: &Protocol) -> Result<String> {
+    let request = Request::PKIStatus;
+
+    match protocol.process_request(request)? {
+        Response::PKIStatus {
+            total_certificates,
+            total_keys,
+            tracked_subject_names,
+            pki_chain_in_sync,
+            ..
+        } => {
+            let is_empty = total_certificates == 0;
+            Ok(format!(
+                "PKI Chain System Status\n\
+                 ═══════════════════════\n\n\
+                 Storage Status: {}\n\
+                 Blockchain Valid: {}\n\n\
+                 Certificates: {}\n\
+                 Private Keys: {}\n\
+                 Subject Names: {}\n\n\
+                 Socket Server: Disabled\n\
+                 Application Key: key/pki-chain-app.key",
+                if is_empty { "Empty" } else { "Initialized" },
+                if pki_chain_in_sync {
+                    "✓ Yes"
+                } else {
+                    "✗ No"
+                },
+                total_certificates,
+                total_keys,
+                tracked_subject_names
+            ))
+        }
+        Response::Error { message } => Err(anyhow::anyhow!(message)),
+        _ => Err(anyhow::anyhow!("Unexpected response type")),
+    }
+}
+
+fn show_create_user_form(siv: &mut Cursive) {
+    let protocol = match siv.user_data::<Arc<Protocol>>() {
+        Some(p) => Arc::clone(p),
+        None => {
+            show_error(siv, "Failed to access protocol");
+            return;
+        }
+    };
+
+    // Get list of intermediate CAs
+    let intermediates = match get_intermediate_certificates(&protocol) {
+        Ok(certs) => certs,
+        Err(e) => {
+            show_error(siv, &format!("Failed to list intermediate CAs: {}", e));
+            return;
+        }
+    };
+
+    if intermediates.is_empty() {
+        show_error(
+            siv,
+            "No intermediate CAs found. Please create an Intermediate CA first.",
+        );
+        return;
+    }
+
+    // Create SelectView for intermediate CAs
+    let mut issuer_select = SelectView::new();
+    for (cn, height) in intermediates {
+        issuer_select.add_item(format!("{} (Height: {})", cn, height), cn);
+    }
+
+    let form = LinearLayout::vertical()
+        .child(TextView::new("Enter User Certificate Details:"))
+        .child(TextView::new(""))
+        .child(TextView::new("Select Issuer (Intermediate CA):"))
+        .child(Panel::new(issuer_select.with_name("issuer").scrollable()).fixed_height(5))
+        .child(TextView::new(""))
+        .child(TextView::new("Common Name (CN):"))
+        .child(EditView::new().with_name("user_cn").fixed_width(40))
+        .child(TextView::new(""))
+        .child(TextView::new("Organization (O):"))
+        .child(EditView::new().with_name("user_org").fixed_width(40))
+        .child(TextView::new(""))
+        .child(TextView::new("Organizational Unit (OU):"))
+        .child(EditView::new().with_name("user_ou").fixed_width(40))
+        .child(TextView::new(""))
+        .child(TextView::new("Locality (L):"))
+        .child(EditView::new().with_name("user_locality").fixed_width(40))
+        .child(TextView::new(""))
+        .child(TextView::new("State/Province (ST):"))
+        .child(EditView::new().with_name("user_state").fixed_width(40))
+        .child(TextView::new(""))
+        .child(TextView::new("Country (C) - 2 letter code:"))
+        .child(EditView::new().with_name("user_country").fixed_width(40))
+        .child(TextView::new(""))
+        .child(TextView::new("Validity (days):"))
+        .child(
+            EditView::new()
+                .content("365")
+                .with_name("user_validity")
+                .fixed_width(40),
+        );
+
+    siv.add_layer(
+        Dialog::around(ScrollView::new(form))
+            .title("Create User Certificate")
+            .button("Create", |s| {
+                handle_create_user(s);
+            })
+            .button("Cancel", |s| {
+                s.pop_layer();
+            }),
+    );
+}
+
+fn get_intermediate_certificates(protocol: &Protocol) -> Result<Vec<(String, u64)>> {
+    let request = Request::ListCertificates {
+        filter: "Intermediate".to_string(),
+    };
+
+    match protocol.process_request(request)? {
+        Response::ListCertificates { certificates, .. } => {
+            // Get actual heights from the storage's subject_name_to_height map
+            let mut intermediates = Vec::new();
+            let height_map = protocol.storage.subject_name_to_height.lock().unwrap();
+
+            for cert_data in certificates {
+                if let Some(&height) = height_map.get(&cert_data.subject_common_name) {
+                    intermediates.push((cert_data.subject_common_name.clone(), height));
+                }
+            }
+
+            Ok(intermediates)
+        }
+        Response::Error { message } => Err(anyhow::anyhow!(message)),
+        _ => Err(anyhow::anyhow!("Unexpected response type")),
+    }
+}
+
+fn handle_create_user(siv: &mut Cursive) {
+    // Extract issuer selection
+    let issuer_cn = match siv.call_on_name(
+        "issuer",
+        |view: &mut SelectView<String>| -> Option<String> {
+            view.selection().map(|rc| (*rc).clone())
+        },
+    ) {
+        Some(Some(cn)) => cn,
+        _ => {
+            show_error(siv, "Please select an issuer CA");
+            return;
+        }
+    };
+
+    // Extract form values
+    let cn = siv
+        .call_on_name("user_cn", |view: &mut EditView| view.get_content())
+        .unwrap()
+        .to_string();
+    let org = siv
+        .call_on_name("user_org", |view: &mut EditView| view.get_content())
+        .unwrap()
+        .to_string();
+    let ou = siv
+        .call_on_name("user_ou", |view: &mut EditView| view.get_content())
+        .unwrap()
+        .to_string();
+    let locality = siv
+        .call_on_name("user_locality", |view: &mut EditView| view.get_content())
+        .unwrap()
+        .to_string();
+    let state = siv
+        .call_on_name("user_state", |view: &mut EditView| view.get_content())
+        .unwrap()
+        .to_string();
+    let country = siv
+        .call_on_name("user_country", |view: &mut EditView| view.get_content())
+        .unwrap()
+        .to_string();
+    let validity_str = siv
+        .call_on_name("user_validity", |view: &mut EditView| view.get_content())
+        .unwrap()
+        .to_string();
+
+    // Validate inputs
+    if cn.is_empty()
+        || org.is_empty()
+        || ou.is_empty()
+        || locality.is_empty()
+        || state.is_empty()
+        || country.is_empty()
+    {
+        show_error(siv, "All fields are required!");
+        return;
+    }
+
+    if country.len() != 2 {
+        show_error(siv, "Country code must be exactly 2 letters!");
+        return;
+    }
+
+    let validity_days = match validity_str.parse::<u32>() {
+        Ok(days) if days > 0 => days,
+        _ => {
+            show_error(siv, "Validity must be a positive number!");
+            return;
+        }
+    };
+
+    // Get protocol
+    let protocol = match siv.user_data::<Arc<Protocol>>() {
+        Some(p) => Arc::clone(p),
+        None => {
+            show_error(siv, "Failed to access protocol");
+            return;
+        }
+    };
+
+    // Close the form dialog
+    siv.pop_layer();
+
+    // Create the user certificate
+    match create_user_certificate(
+        &protocol,
+        issuer_cn.clone(),
+        cn.clone(),
+        org,
+        ou,
+        locality,
+        state,
+        country,
+        validity_days,
+    ) {
+        Ok(height) => {
+            siv.add_layer(
+                Dialog::text(format!(
+                    "✓ User Certificate Created Successfully!\n\n\
+                     Common Name: {}\n\
+                     Issuer: {}\n\
+                     Blockchain Height: {}\n\n\
+                     The certificate has been stored in the blockchain.",
+                    cn, issuer_cn, height
+                ))
+                .title("Success")
+                .button("OK", |s| {
+                    s.pop_layer();
+                }),
+            );
+        }
+        Err(e) => {
+            show_error(siv, &format!("Failed to create user certificate: {}", e));
+        }
+    }
+}
+
+fn create_user_certificate(
+    protocol: &Protocol,
+    issuer_cn: String,
+    cn: String,
+    org: String,
+    ou: String,
+    locality: String,
+    state: String,
+    country: String,
+    validity_days: u32,
+) -> Result<u64> {
+    let certificate_data = CertificateData {
+        subject_common_name: cn,
+        issuer_common_name: issuer_cn,
+        serial_number: String::new(),
+        organization: org,
+        organizational_unit: ou,
+        locality,
+        state,
+        country,
+        validity_days: Some(validity_days),
+        not_before: None,
+        not_after: None,
+        type_of_certificate: String::new(),
+        x509: None,
+    };
+
+    let request = Request::CreateUser { certificate_data };
+
+    match protocol.process_request(request)? {
+        Response::CreateUser { height, .. } => Ok(height),
+        Response::Error { message } => Err(anyhow::anyhow!(message)),
+        _ => Err(anyhow::anyhow!("Unexpected response type")),
+    }
 }

@@ -308,18 +308,12 @@
 //!     Ok(())
 //! }
 //! ```
-
-pub mod external_interface;
 pub mod generate_intermediate_ca;
 mod generate_root_ca;
-mod generate_user_keypair;
+pub mod generate_user_keypair;
 mod generate_webclient_tls;
 pub mod protocol;
 pub mod storage;
 
 // Public API - only expose Request/Response enums, socket path, and protocol functions
-pub use external_interface::SOCKET_PATH;
-pub use protocol::{
-    deserialize_request, deserialize_response, serialize_request, serialize_response, Request,
-    Response,
-};
+pub use protocol::{CertificateData, Request, Response};
