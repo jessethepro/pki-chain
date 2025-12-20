@@ -6,7 +6,7 @@
 use anyhow::{Context, Result};
 use openssl::stack::Stack;
 use openssl::x509::store::X509StoreBuilder;
-use openssl::x509::X509StoreContext;
+use openssl::x509::{X509StoreContext, X509VerifyResult};
 use serde::{Deserialize, Serialize};
 
 use crate::generate_intermediate_ca::RsaIntermediateCABuilder;
@@ -53,7 +53,7 @@ pub enum Request {
     },
     PKIStatus,
     ValidateCertificate {
-        subject_certficate_data: CertificateData,
+        subject_certificate_data: CertificateData,
         intermediate_certificate_data: CertificateData,
     },
 }
@@ -461,10 +461,10 @@ impl Protocol {
                 });
             }
             Request::ValidateCertificate {
-                subject_certficate_data,
+                subject_certificate_data,
                 intermediate_certificate_data,
             } => {
-                // Handle ValidateCertificateChain request
+                // Handle ValidateCertificate request - validate each certificate level separately
                 let root_cert = match self.get_key_certificate_by_height(0) {
                     Ok((_, c)) => c,
                     Err(e) => {
@@ -473,46 +473,67 @@ impl Protocol {
                         })
                     }
                 };
-                let mut store_builder =
-                    X509StoreBuilder::new().context("Failed to create X509 store builder")?;
-                store_builder
+
+                let intermediate_cert = intermediate_certificate_data
+                    .x509
+                    .as_ref()
+                    .context("Intermediate certificate X509 missing")?;
+                let subject_cert = subject_certificate_data
+                    .x509
+                    .as_ref()
+                    .context("Subject certificate X509 missing")?;
+
+                // Validate root certificate (self-signed, not expired)
+                let root_is_valid = root_cert.issued(&root_cert) == X509VerifyResult::OK
+                    && root_cert.not_after()
+                        > openssl::asn1::Asn1Time::days_from_now(0).unwrap().as_ref();
+
+                // Validate intermediate certificate against root
+                let mut store_builder_intermediate = X509StoreBuilder::new()
+                    .context("Failed to create X509 store builder for intermediate")?;
+                store_builder_intermediate
+                    .add_cert(root_cert.clone())
+                    .context("Failed to add Root CA to store")?;
+                let store_intermediate = store_builder_intermediate.build();
+                let empty_chain = Stack::new().context("Failed to create empty X509 stack")?;
+                let mut verify_context_intermediate = X509StoreContext::new()
+                    .context("Failed to create X509 store context for intermediate")?;
+                let intermediate_is_valid = verify_context_intermediate
+                    .init(&store_intermediate, intermediate_cert, &empty_chain, |c| {
+                        c.verify_cert()
+                    })
+                    .context("Failed to verify intermediate certificate")?;
+
+                // Validate subject certificate against full chain (intermediate + root)
+                let mut store_builder_leaf = X509StoreBuilder::new()
+                    .context("Failed to create X509 store builder for leaf")?;
+                store_builder_leaf
                     .add_cert(root_cert)
-                    .context("Failed to add Root CA to X509 store")?;
-                let store = store_builder.build();
-                let mut chain = Stack::new().context("Failed to create X509 stack")?;
+                    .context("Failed to add Root CA to leaf store")?;
+                let store_leaf = store_builder_leaf.build();
+                let mut chain = Stack::new().context("Failed to create X509 stack for leaf")?;
                 chain
-                    .push(
-                        intermediate_certificate_data
-                            .x509
-                            .context("Intermediate certificate X509 missing")?,
-                    )
+                    .push(intermediate_cert.clone())
                     .context("Failed to push intermediate certificate to chain")?;
-                let mut verify_context =
-                    X509StoreContext::new().context("Failed to create X509 store context")?;
-                let is_valid = verify_context
-                    .init(
-                        &store,
-                        subject_certficate_data
-                            .x509
-                            .as_ref()
-                            .context("Subject certificate X509 missing")?,
-                        &chain,
-                        |c| c.verify_cert(),
-                    )
-                    .context("Failed to initialize X509 store context")?;
-                if !is_valid {
-                    return Ok(Response::ValidateCertificate {
-                        message: "Certificate chain validation failed".to_string(),
-                        leaf_is_valid: false,
-                        intermediate_is_valid: false,
-                        root_is_valid: false,
-                    });
-                }
+                let mut verify_context_leaf = X509StoreContext::new()
+                    .context("Failed to create X509 store context for leaf")?;
+                let leaf_is_valid = verify_context_leaf
+                    .init(&store_leaf, subject_cert, &chain, |c| c.verify_cert())
+                    .context("Failed to verify subject certificate")?;
+
+                let all_valid = root_is_valid && intermediate_is_valid && leaf_is_valid;
                 return Ok(Response::ValidateCertificate {
-                    message: "Certificate chain validation completed".to_string(),
-                    leaf_is_valid: true,
-                    intermediate_is_valid: true,
-                    root_is_valid: true,
+                    message: if all_valid {
+                        "Certificate chain validation successful".to_string()
+                    } else {
+                        format!(
+                            "Certificate chain validation failed - Root: {}, Intermediate: {}, Leaf: {}",
+                            root_is_valid, intermediate_is_valid, leaf_is_valid
+                        )
+                    },
+                    leaf_is_valid,
+                    intermediate_is_valid,
+                    root_is_valid,
                 });
             }
         }
