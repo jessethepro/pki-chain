@@ -2,7 +2,7 @@
 
 **A production-ready blockchain-backed Public Key Infrastructure (PKI) certificate authority system with an interactive terminal UI.**
 
-Built in Rust with enterprise-grade cryptography, PKI Chain provides a complete three-tier CA hierarchy (Root CA → Intermediate CA → User Certificates) where all certificates and private keys are stored in tamper-proof blockchain storage powered by [libblockchain](https://github.com/jessethepro/libblockchain).
+Built in Rust with enterprise-grade cryptography, PKI Chain provides a complete three-tier CA hierarchy (Root CA → Intermediate CA → User Certificates) with hybrid storage: certificates in blockchain (DER format), private keys in AES-256-GCM encrypted files, and integrity hashes in blockchain via [libblockchain](https://github.com/jessethepro/libblockchain).
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Rust](https://img.shields.io/badge/rust-1.70%2B-orange.svg)](https://www.rust-lang.org/)
@@ -10,7 +10,7 @@ Built in Rust with enterprise-grade cryptography, PKI Chain provides a complete 
 ## Highlights
 
 ✨ **Interactive TUI** - Manage certificates through a modern terminal interface  
-🔐 **Blockchain Security** - Immutable storage with tamper detection  
+🔐 **Hybrid Storage** - Certificates in blockchain (DER), keys encrypted with AES-256-GCM  
 🏗️ **Complete PKI** - Root CA, Intermediate CAs, and User certificates  
 🔒 **RSA-4096** - Industry-standard cryptography with SHA-256 signatures  
 🎯 **Fast Lookups** - O(1) certificate retrieval with in-memory indexing
@@ -19,11 +19,14 @@ Built in Rust with enterprise-grade cryptography, PKI Chain provides a complete 
 
 - � **Terminal User Interface**: Modern cursive-based TUI for interactive certificate management
 - 📝 **Interactive Forms**: Create both Intermediate CA and User certificates with form-based input and validation
-- 🔐 **Blockchain Storage**: Dual blockchain instances ensure tamper-proof certificate and key storage
+- 🔐 **Hybrid Storage Architecture**: 
+  - Certificates stored as DER in blockchain
+  - Private keys encrypted with AES-256-GCM in filesystem (enables offline/cold storage)
+  - SHA-256 hashes and signatures in key blockchain
 - 🔗 **Three-Tier PKI Hierarchy**: Complete CA chain (Root → Intermediate → User)
 - 🔒 **Strong Cryptography**: 4096-bit RSA keys with SHA-256 signatures
 - 🔄 **Transactional Safety**: Automatic rollback on storage failures
-- ✅ **Certificate Validation**: OpenSSL X509Store-based chain validation with signature verification
+- ✅ **Certificate Validation**: OpenSSL X509Store-based chain validation with hash verification
 - 🎯 **Height-Based Indexing**: O(1) certificate lookups with thread-safe Mutex-protected HashMap
 - 🧵 **Thread Safety**: Arc-wrapped Protocol with concurrent access support
 - 📊 **Real-Time Status**: View blockchain statistics and certificate inventory
@@ -88,16 +91,24 @@ On first run, the application automatically initializes a complete 3-tier TLS ce
 │       │  - Mutex<subject→height map> │                         │
 │       └────────────┬─────────────────┘                         │
 │                    │                                           │
-│       ┌────────────┴────────────────┐                          │
-│       │                             │                          │
-│  ┌────▼────────┐          ┌─────────▼──────┐                  │
-│  │ Certificate │          │  Private Key   │                  │
-│  │ Blockchain  │          │  Blockchain    │                  │
-│  │ (PEM)       │          │  (DER)         │                  │
-│  │ RocksDB     │          │  RocksDB       │                  │
-│  └─────────────┘          └────────────────┘                  │
-│                                                                │
-│  Socket Server: Currently disabled (can be re-enabled)        │
+│       ┌────────────┴─────────────────────────────┐            │
+│       │                                          │            │
+│  ┌────▼────────┐          ┌──────────▼─────────┐            │
+│  │ Certificate │          │  Private Key       │            │
+│  │ Blockchain  │          │  Blockchain        │            │
+│  │ (DER)       │          │  (SHA-256 Hashes)  │            │
+│  │ RocksDB     │          │  + Signatures CF   │            │
+│  └─────────────┘          │  RocksDB           │            │
+│                           └────────────────────┘            │
+│                                                              │
+│  ┌──────────────────────────────────────────────┐          │
+│  │     Encrypted Key Store (Filesystem)          │          │
+│  │  exports/keystore/                            │          │
+│  │  - AES-256-GCM encrypted private keys         │          │
+│  │  - Format: [nonce(12)][tag(16)][ciphertext]  │          │
+│  └──────────────────────────────────────────────┘          │
+│                                                              │
+│  Socket Server: Currently disabled (can be re-enabled)      │
 └────────────────────────────────────────────────────────────────┘
 ```
 

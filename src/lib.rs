@@ -1,8 +1,8 @@
 //! PKI Chain - Blockchain-backed Certificate Authority Library
 //!
-//! A production-ready Public Key Infrastructure system that stores certificates and private keys
-//! in tamper-proof blockchain storage. This library provides the core functionality for building
-//! and managing a complete three-tier CA hierarchy.
+//! A production-ready Public Key Infrastructure system with hybrid storage: certificates in
+//! blockchain (DER format) and private keys in AES-256-GCM encrypted files. This library provides
+//! the core functionality for building and managing a complete three-tier CA hierarchy.
 //!
 //! # Overview
 //!
@@ -14,21 +14,25 @@
 //!       └── User Certificate (signed by Intermediate, CA=false)
 //! ```
 //!
-//! All certificates and private keys are stored in dual blockchain instances, providing:
-//! - **Tamper Detection**: Any modification to stored certificates is immediately detectable
+//! The hybrid storage architecture provides:
+//! - **Tamper Detection**: Certificates stored in blockchain, hashes validate key integrity
 //! - **Transactional Safety**: Failed operations automatically roll back
-//! - **Signature Verification**: Cross-validation between certificate and key storage
+//! - **Encrypted Private Keys**: AES-256-GCM encryption with random nonces
+//! - **Hash-Based Verification**: SHA-256 hashes stored in blockchain validate key files
 //! - **Height-Based Indexing**: O(1) lookups for certificates by blockchain height
 //!
 //! # Features
 //!
 //! - � **Terminal User Interface**: Cursive-based TUI for interactive certificate management
-//! - 🔐 **Blockchain Storage**: Dual blockchain instances for certificates and keys
+//! - 🔐 **Hybrid Storage**:
+//!   - Certificates in blockchain (DER format)
+//!   - Private keys in AES-256-GCM encrypted files (enables offline/cold storage)
+//!   - SHA-256 hashes and signatures in key blockchain
 //! - 🔗 **Three-Tier PKI**: Complete CA hierarchy implementation
 //! - 🔒 **Strong Cryptography**: 4096-bit RSA with SHA-256 signatures
 //! - 🔄 **Transactional Operations**: Automatic rollback on failures
-//! - ✅ **Integrity Validation**: Cross-chain signature verification
-//! - 🧵 **Thread Safety**: Arc-wrapped storage with concurrent access support
+//! - ✅ **Integrity Validation**: Hash-based verification of private keys
+//! - 🧵 **Thread Safety**: Arc-wrapped Protocol with concurrent access support
 //!
 //! # Quick Start
 //!
@@ -308,12 +312,10 @@
 //!     Ok(())
 //! }
 //! ```
-pub mod generate_intermediate_ca;
-mod generate_root_ca;
-pub mod generate_user_keypair;
-mod generate_webclient_tls;
+pub mod pki_generator;
+mod private_key_storage;
 pub mod protocol;
 pub mod storage;
-
 // Public API - only expose Request/Response enums, socket path, and protocol functions
-pub use protocol::{CertificateData, Request, Response};
+pub use pki_generator::{CertificateData, CertificateDataType};
+pub use protocol::{Request, Response};

@@ -53,7 +53,10 @@ use anyhow::Result;
 use cursive::view::{Nameable, Resizable, Scrollable};
 use cursive::views::{Dialog, EditView, LinearLayout, Panel, ScrollView, SelectView, TextView};
 use cursive::{Cursive, CursiveExt};
-use pki_chain::protocol::{CertificateData, Protocol, Request, Response};
+use openssl::nid::Nid;
+use pki_chain::pki_generator::{CertificateData, CertificateDataType};
+use pki_chain::protocol::{Protocol, Request, Response};
+use pki_chain::storage::ROOT_CA_SUBJECT_COMMON_NAME;
 use std::sync::Arc;
 
 /// Initialize and run the TUI application
@@ -306,18 +309,14 @@ fn create_intermediate_certificate(
 ) -> Result<u64> {
     let certificate_data = CertificateData {
         subject_common_name: cn,
-        issuer_common_name: String::new(),
-        serial_number: String::new(),
+        issuer_common_name: ROOT_CA_SUBJECT_COMMON_NAME.to_string(),
         organization: org,
         organizational_unit: ou,
         locality,
         state,
         country,
-        validity_days: Some(validity_days),
-        not_before: None,
-        not_after: None,
-        type_of_certificate: String::new(),
-        x509: None,
+        validity_days,
+        cert_type: CertificateDataType::IntermediateCA,
     };
 
     let request = Request::CreateIntermediate { certificate_data };
@@ -481,11 +480,23 @@ fn get_intermediate_certificates(protocol: &Protocol) -> Result<Vec<(String, u64
         Response::ListCertificates { certificates, .. } => {
             // Get actual heights from the storage's subject_name_to_height map
             let mut intermediates = Vec::new();
-            let height_map = protocol.storage.subject_name_to_height.lock().unwrap();
 
-            for cert_data in certificates {
-                if let Some(&height) = height_map.get(&cert_data.subject_common_name) {
-                    intermediates.push((cert_data.subject_common_name.clone(), height));
+            for cert in certificates {
+                let subject_common_name = cert
+                    .subject_name()
+                    .entries_by_nid(Nid::COMMONNAME)
+                    .next()
+                    .and_then(|entry| entry.data().as_utf8().ok())
+                    .map(|data| data.to_string())
+                    .unwrap_or_default();
+                if let Some(height) = protocol
+                    .storage
+                    .subject_name_to_height
+                    .lock()
+                    .unwrap()
+                    .get(&subject_common_name)
+                {
+                    intermediates.push((subject_common_name, *height));
                 }
             }
 
@@ -626,17 +637,13 @@ fn create_user_certificate(
     let certificate_data = CertificateData {
         subject_common_name: cn,
         issuer_common_name: issuer_cn,
-        serial_number: String::new(),
         organization: org,
         organizational_unit: ou,
         locality,
         state,
         country,
-        validity_days: Some(validity_days),
-        not_before: None,
-        not_after: None,
-        type_of_certificate: String::new(),
-        x509: None,
+        validity_days,
+        cert_type: CertificateDataType::UserCert,
     };
 
     let request = Request::CreateUser { certificate_data };

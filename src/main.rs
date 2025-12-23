@@ -1,19 +1,22 @@
 //! PKI Chain - Blockchain-backed Certificate Authority
 //!
-//! A production-ready Public Key Infrastructure system that stores certificates and private keys
-//! in tamper-proof blockchain storage. Provides a complete three-tier CA hierarchy:
-//! Root CA → Intermediate CA → User Certificates.
+//! A production-ready Public Key Infrastructure system that stores certificates in blockchain
+//! storage and private keys in AES-256-GCM encrypted files. Provides a complete three-tier
+//! CA hierarchy: Root CA → Intermediate CA → User Certificates.
 //!
 //! # Features
 //!
 //! - **Terminal User Interface**: Cursive-based TUI for certificate management
-//! - **Blockchain Storage**: Dual blockchain instances for certificates and private keys
-//! - **Interactive Certificate Creation**: Form-based Intermediate CA creation with validation
+//! - **Hybrid Storage Architecture**:
+//!   - Certificates stored as DER in blockchain
+//!   - Private keys encrypted with AES-256-GCM in filesystem (enables offline/cold storage)
+//!   - Key chain stores SHA-256 hashes and certificate signatures
+//! - **Interactive Certificate Creation**: Form-based Intermediate CA and User certificate creation with validation
 //! - **Three-Tier PKI**: Root CA, Intermediate CAs, and User certificates
 //! - **4096-bit RSA**: Strong cryptographic keys with SHA-256 signatures
 //! - **Transactional Safety**: Automatic rollback on storage failures
-//! - **Signature Verification**: Cross-validation between certificate and key chains
-//! - **Thread-Safe Operations**: Arc-wrapped storage with concurrent access support
+//! - **Integrity Verification**: Hash-based validation of private keys
+//! - **Thread-Safe Operations**: Arc-wrapped Protocol with concurrent access support
 //!
 //! # Quick Start
 //!
@@ -51,12 +54,19 @@
 //! 3. **View System Status**: Display blockchain statistics and tracked certificates
 //! 4. **Exit**: Shutdown application
 //!
-//! # Certificate Storage
+//! # Storage Architecture
 //!
-//! On first run, the application automatically initializes a 3-tier TLS hierarchy:
+//! On first run, the application automatically initializes a Root CA certificate and sets up
+//! the necessary storage structure. The storage layout is as follows:
 //! - Height 0: Root CA (self-signed, 5-year validity)
-//! - Height 1: Intermediate TLS CA (pathlen=0, 3-year validity)
-//! - Height 2: WebClient TLS Certificate (serverAuth, 1-year validity)
+//!
+//! ## Storage Layout
+//!
+//! - **Certificate Blockchain** (`data/certificates/`): Stores X.509 certificates in DER format
+//! - **Private Key Blockchain** (`data/private_keys/`): Stores SHA-256 hashes of private keys
+//!   - Signatures column family: Stores signatures of corresponding certificates
+//! - **Encrypted Key Store** (`exports/keystore/`): AES-256-GCM encrypted private keys
+//!   - Format: [nonce (12 bytes)][tag (16 bytes)][ciphertext]
 //!
 //! User-created certificates are stored at heights 3 and above.
 

@@ -3,33 +3,14 @@
 //! Defines the Request and Response enums for actions related to certificate management.
 //! Processes the actions and returns appropriate responses.
 
+use crate::pki_generator::{generate_key_pair, CertificateData};
+use crate::storage::Storage;
 use anyhow::{Context, Result};
+use openssl::nid::Nid;
 use openssl::stack::Stack;
 use openssl::x509::store::X509StoreBuilder;
-use openssl::x509::{X509StoreContext, X509VerifyResult};
+use openssl::x509::{X509StoreContext, X509VerifyResult, X509};
 use serde::{Deserialize, Serialize};
-
-use crate::generate_intermediate_ca::RsaIntermediateCABuilder;
-use crate::generate_user_keypair::RsaUserKeyPairBuilder;
-use crate::storage::Storage;
-
-/// Certificate data structure
-#[derive(Debug, Clone)]
-pub struct CertificateData {
-    pub subject_common_name: String,
-    pub issuer_common_name: String,
-    pub serial_number: String,
-    pub organization: String,
-    pub organizational_unit: String,
-    pub locality: String,
-    pub state: String,
-    pub country: String,
-    pub validity_days: Option<u32>,
-    pub not_before: Option<String>,
-    pub not_after: Option<String>,
-    pub type_of_certificate: String,
-    pub x509: Option<openssl::x509::X509>,
-}
 
 /// Filter options for listing certificates
 #[derive(Debug, Deserialize, Serialize)]
@@ -63,17 +44,17 @@ pub enum Request {
 pub enum Response {
     CreateIntermediate {
         message: String,
-        certificate_data: CertificateData,
+        certificate_data: X509,
         height: u64,
     },
     CreateUser {
         message: String,
-        certificate_data: CertificateData,
+        certificate_data: X509,
         height: u64,
     },
     ListCertificates {
         message: String,
-        certificates: Vec<CertificateData>,
+        certificates: Vec<X509>,
         count: usize,
     },
     PKIStatus {
@@ -106,40 +87,19 @@ impl Protocol {
         Self { storage }
     }
 
-    fn get_key_certificate_by_height(
-        &self,
-        height: u64,
-    ) -> Result<(
-        openssl::pkey::PKey<openssl::pkey::Private>,
-        openssl::x509::X509,
-    )> {
-        let cert_block = match self.storage.certificate_chain.get_block_by_height(height) {
-            Ok(block) => block,
-            Err(e) => return Err(e.into()),
-        };
-        let cert = match openssl::x509::X509::from_pem(&cert_block.block_data) {
-            Ok(c) => c,
-            Err(e) => return Err(e.into()),
-        };
-
-        let key_block = match self.storage.private_chain.get_block_by_height(height) {
-            Ok(block) => block,
-            Err(e) => return Err(e.into()),
-        };
-        let key = match openssl::pkey::PKey::private_key_from_der(&key_block.block_data) {
-            Ok(k) => k,
-            Err(e) => return Err(e.into()),
-        };
-
-        Ok((key, cert))
-    }
-
     pub fn process_request(&self, request: Request) -> Result<Response> {
         match request {
             Request::CreateIntermediate { certificate_data } => {
                 // Get Root CA from blockchain (height 0)
-                let (root_key, root_cert) = match self.get_key_certificate_by_height(0) {
-                    Ok((k, c)) => (k, c),
+                let root_key = match (|| -> Result<openssl::pkey::PKey<openssl::pkey::Private>> {
+                    let key = self
+                        .storage
+                        .encrypted_key_store
+                        .retrieve_key(0)
+                        .context("Failed to retrieve Root CA private key")?;
+                    Ok(key)
+                })() {
+                    Ok(k) => k,
                     Err(e) => {
                         return Ok(Response::Error {
                             message: format!("Failed to retrieve Root CA: {}", e),
@@ -147,17 +107,8 @@ impl Protocol {
                     }
                 };
                 // Generate intermediate certificate
-                let (int_key, int_cert) = match RsaIntermediateCABuilder::new(root_key, root_cert)
-                    .subject_common_name(certificate_data.subject_common_name.clone())
-                    .organization(certificate_data.organization.clone())
-                    .organizational_unit(certificate_data.organizational_unit.clone())
-                    .locality(certificate_data.locality.clone())
-                    .state(certificate_data.state.clone())
-                    .country(certificate_data.country.clone())
-                    .validity_days(certificate_data.validity_days.unwrap_or(1825))
-                    .build()
-                {
-                    Ok((key, cert)) => (key, cert),
+                let (int_key, int_cert) = match generate_key_pair(certificate_data, &root_key) {
+                    Ok((k, c)) => (k, c),
                     Err(e) => {
                         return Ok(Response::Error {
                             message: format!("Failed to generate intermediate CA: {}", e),
@@ -176,39 +127,7 @@ impl Protocol {
                 };
                 return Ok(Response::CreateIntermediate {
                     message: "Intermediate CA created successfully".to_string(),
-                    certificate_data: CertificateData {
-                        subject_common_name: certificate_data.subject_common_name,
-                        issuer_common_name: certificate_data.issuer_common_name,
-                        serial_number: int_cert
-                            .serial_number()
-                            .to_bn()
-                            .unwrap()
-                            .to_hex_str()
-                            .unwrap()
-                            .to_string(),
-                        organization: certificate_data.organization,
-                        organizational_unit: certificate_data.organizational_unit,
-                        locality: certificate_data.locality,
-                        state: certificate_data.state,
-                        country: certificate_data.country,
-                        validity_days: certificate_data.validity_days,
-                        not_before: Some(
-                            int_cert
-                                .not_before()
-                                .to_string()
-                                .trim_end_matches('\0')
-                                .to_string(),
-                        ),
-                        not_after: Some(
-                            int_cert
-                                .not_after()
-                                .to_string()
-                                .trim_end_matches('\0')
-                                .to_string(),
-                        ),
-                        type_of_certificate: "Intermediate".to_string(),
-                        x509: Some(int_cert.clone()),
-                    },
+                    certificate_data: int_cert.clone(),
                     height,
                 });
             }
@@ -231,36 +150,35 @@ impl Protocol {
                         })
                     }
                 };
-                let (issuer_key, issuer_cert) = match self
-                    .get_key_certificate_by_height(issuer_height)
-                {
-                    Ok((k, c)) => (k, c),
-                    Err(e) => {
-                        return Ok(Response::Error {
-                            message: format!("Failed to retrieve issuer intermediate CA: {}", e),
-                        })
-                    }
-                };
-
-                // Generate user keypair and certificate
-                let (user_key, user_cert) =
-                    match RsaUserKeyPairBuilder::new(issuer_key, issuer_cert)
-                        .subject_common_name(certificate_data.subject_common_name.clone())
-                        .organization(certificate_data.organization.clone())
-                        .organizational_unit(certificate_data.organizational_unit.clone())
-                        .locality(certificate_data.locality.clone())
-                        .state(certificate_data.state.clone())
-                        .country(certificate_data.country.clone())
-                        .validity_days(certificate_data.validity_days.unwrap_or(1095))
-                        .build()
-                    {
-                        Ok((key, cert)) => (key, cert),
+                let issuer_key =
+                    match (|| -> Result<openssl::pkey::PKey<openssl::pkey::Private>> {
+                        let key = self
+                            .storage
+                            .encrypted_key_store
+                            .retrieve_key(issuer_height)
+                            .context("Failed to retrieve issuer intermediate CA private key")?;
+                        Ok(key)
+                    })() {
+                        Ok(k) => k,
                         Err(e) => {
                             return Ok(Response::Error {
-                                message: format!("Failed to generate user keypair: {}", e),
+                                message: format!(
+                                    "Failed to retrieve issuer intermediate CA: {}",
+                                    e
+                                ),
                             })
                         }
                     };
+
+                // Generate user keypair and certificate
+                let (user_key, user_cert) = match generate_key_pair(certificate_data, &issuer_key) {
+                    Ok((k, c)) => (k, c),
+                    Err(e) => {
+                        return Ok(Response::Error {
+                            message: format!("Failed to generate user keypair: {}", e),
+                        })
+                    }
+                };
 
                 // Store in blockchain
                 let height = match self.storage.store_key_certificate(&user_key, &user_cert) {
@@ -274,39 +192,7 @@ impl Protocol {
 
                 return Ok(Response::CreateUser {
                     message: "User keypair created successfully".to_string(),
-                    certificate_data: CertificateData {
-                        subject_common_name: certificate_data.subject_common_name,
-                        issuer_common_name: certificate_data.issuer_common_name,
-                        serial_number: user_cert
-                            .serial_number()
-                            .to_bn()
-                            .unwrap()
-                            .to_hex_str()
-                            .unwrap()
-                            .to_string(),
-                        organization: certificate_data.organization,
-                        organizational_unit: certificate_data.organizational_unit,
-                        locality: certificate_data.locality,
-                        state: certificate_data.state,
-                        country: certificate_data.country,
-                        validity_days: certificate_data.validity_days,
-                        not_before: Some(
-                            user_cert
-                                .not_before()
-                                .to_string()
-                                .trim_end_matches('\0')
-                                .to_string(),
-                        ),
-                        not_after: Some(
-                            user_cert
-                                .not_after()
-                                .to_string()
-                                .trim_end_matches('\0')
-                                .to_string(),
-                        ),
-                        type_of_certificate: "User".to_string(),
-                        x509: Some(user_cert.clone()),
-                    },
+                    certificate_data: user_cert.clone(),
                     height,
                 });
             }
@@ -323,31 +209,28 @@ impl Protocol {
                     }
                 };
                 // Handle ListCertificates request
-                let (certs, count) = match (|| -> Result<(Vec<CertificateData>, usize)> {
+                let (certs, count) = match (|| -> Result<(Vec<X509>, usize)> {
                     let mut certificates = Vec::new();
                     let cert_iter = self.storage.certificate_chain.iter();
                     for block_result in cert_iter {
                         let block = block_result?;
-                        let cert = openssl::x509::X509::from_pem(&block.block_data)?;
-                        let subject_common_name = cert
-                            .subject_name()
-                            .entries_by_nid(openssl::nid::Nid::COMMONNAME)
-                            .next()
-                            .unwrap()
-                            .data()
-                            .as_utf8()?
-                            .to_string();
-                        let issuer_common_name = cert
-                            .issuer_name()
-                            .entries_by_nid(openssl::nid::Nid::COMMONNAME)
-                            .next()
-                            .unwrap()
-                            .data()
-                            .as_utf8()?
-                            .to_string();
-                        let serial_number = cert.serial_number().to_bn()?.to_hex_str()?.to_string();
+                        let cert = X509::from_der(&block.block_data)
+                            .context("Failed to parse certificate from PEM")?;
                         // Determine type of certificate
-                        let is_self_signed = subject_common_name == issuer_common_name;
+                        let is_self_signed = cert
+                            .subject_name()
+                            .entries_by_nid(Nid::COMMONNAME)
+                            .next()
+                            .and_then(|entry| entry.data().as_utf8().ok())
+                            .map(|s| s.to_string())
+                            .unwrap_or_default()
+                            == cert
+                                .issuer_name()
+                                .entries_by_nid(Nid::COMMONNAME)
+                                .next()
+                                .and_then(|entry| entry.data().as_utf8().ok())
+                                .map(|s| s.to_string())
+                                .unwrap_or_default();
 
                         // Check if certificate has CA basic constraints (pathlen indicates CA cert)
                         let pathlen = cert.pathlen();
@@ -374,32 +257,7 @@ impl Protocol {
                             Filter::Root if type_of_certificate != "Root" => continue,
                             _ => {}
                         }
-                        let certificate_data = CertificateData {
-                            subject_common_name,
-                            issuer_common_name,
-                            serial_number,
-                            organization: "".to_string(),
-                            organizational_unit: "".to_string(),
-                            locality: "".to_string(),
-                            state: "".to_string(),
-                            country: "".to_string(),
-                            validity_days: None,
-                            not_before: Some(
-                                cert.not_before()
-                                    .to_string()
-                                    .trim_end_matches('\0')
-                                    .to_string(),
-                            ),
-                            not_after: Some(
-                                cert.not_after()
-                                    .to_string()
-                                    .trim_end_matches('\0')
-                                    .to_string(),
-                            ),
-                            type_of_certificate,
-                            x509: Some(cert),
-                        };
-                        certificates.push(certificate_data);
+                        certificates.push(cert);
                     }
                     let count = certificates.len();
                     Ok((certificates, count))
@@ -411,11 +269,11 @@ impl Protocol {
                         })
                     }
                 };
-                Ok(Response::ListCertificates {
+                return Ok(Response::ListCertificates {
                     message: "Certificates listed successfully".to_string(),
                     certificates: certs,
                     count,
-                })
+                });
             }
             Request::PKIStatus => {
                 let total_certificates = match self.storage.certificate_chain.block_count() {
@@ -436,7 +294,7 @@ impl Protocol {
                 };
                 let tracked_subject_names =
                     self.storage.subject_name_to_height.lock().unwrap().len();
-                let pki_chain_in_sync = match self.storage.validate() {
+                let pki_chain_in_sync = match self.storage.validate_certificates() {
                     Ok(valid) => valid,
                     Err(e) => {
                         return Ok(Response::Error {
@@ -465,8 +323,17 @@ impl Protocol {
                 intermediate_certificate_data,
             } => {
                 // Handle ValidateCertificate request - validate each certificate level separately
-                let root_cert = match self.get_key_certificate_by_height(0) {
-                    Ok((_, c)) => c,
+                let root_cert = match (|| -> Result<X509> {
+                    let cert_block = self
+                        .storage
+                        .certificate_chain
+                        .get_block_by_height(0)
+                        .context("Failed to retrieve Root CA certificate block")?;
+                    let cert = X509::from_der(&cert_block.block_data)
+                        .context("Failed to parse Root CA certificate from PEM")?;
+                    Ok(cert)
+                })() {
+                    Ok(c) => c,
                     Err(e) => {
                         return Ok(Response::Error {
                             message: format!("Failed to retrieve Root CA: {}", e),
@@ -474,14 +341,56 @@ impl Protocol {
                     }
                 };
 
-                let intermediate_cert = intermediate_certificate_data
-                    .x509
-                    .as_ref()
-                    .context("Intermediate certificate X509 missing")?;
-                let subject_cert = subject_certificate_data
-                    .x509
-                    .as_ref()
-                    .context("Subject certificate X509 missing")?;
+                let intermediate_cert = match (|| -> Result<X509> {
+                    let cert_block = self
+                        .storage
+                        .certificate_chain
+                        .get_block_by_height(
+                            *self
+                                .storage
+                                .subject_name_to_height
+                                .lock()
+                                .unwrap()
+                                .get(&intermediate_certificate_data.subject_common_name)
+                                .context("Intermediate CA common name not found")?,
+                        )
+                        .context("Failed to retrieve Intermediate CA certificate block")?;
+                    let cert = X509::from_der(&cert_block.block_data)
+                        .context("Failed to parse Intermediate CA certificate from DER")?;
+                    Ok(cert)
+                })() {
+                    Ok(c) => c,
+                    Err(e) => {
+                        return Ok(Response::Error {
+                            message: format!("Failed to retrieve Intermediate CA: {}", e),
+                        })
+                    }
+                };
+                let subject_cert = match (|| -> Result<X509> {
+                    let cert_block = self
+                        .storage
+                        .certificate_chain
+                        .get_block_by_height(
+                            *self
+                                .storage
+                                .subject_name_to_height
+                                .lock()
+                                .unwrap()
+                                .get(&subject_certificate_data.subject_common_name)
+                                .context("Subject certificate common name not found")?,
+                        )
+                        .context("Failed to retrieve subject certificate block")?;
+                    let cert = X509::from_der(&cert_block.block_data)
+                        .context("Failed to parse subject certificate from DER")?;
+                    Ok(cert)
+                })() {
+                    Ok(c) => c,
+                    Err(e) => {
+                        return Ok(Response::Error {
+                            message: format!("Failed to retrieve subject certificate: {}", e),
+                        })
+                    }
+                };
 
                 // Validate root certificate (self-signed, not expired)
                 let root_is_valid = root_cert.issued(&root_cert) == X509VerifyResult::OK
@@ -499,7 +408,7 @@ impl Protocol {
                 let mut verify_context_intermediate = X509StoreContext::new()
                     .context("Failed to create X509 store context for intermediate")?;
                 let intermediate_is_valid = verify_context_intermediate
-                    .init(&store_intermediate, intermediate_cert, &empty_chain, |c| {
+                    .init(&store_intermediate, &intermediate_cert, &empty_chain, |c| {
                         c.verify_cert()
                     })
                     .context("Failed to verify intermediate certificate")?;
@@ -518,7 +427,7 @@ impl Protocol {
                 let mut verify_context_leaf = X509StoreContext::new()
                     .context("Failed to create X509 store context for leaf")?;
                 let leaf_is_valid = verify_context_leaf
-                    .init(&store_leaf, subject_cert, &chain, |c| c.verify_cert())
+                    .init(&store_leaf, &subject_cert, &chain, |c| c.verify_cert())
                     .context("Failed to verify subject certificate")?;
 
                 let all_valid = root_is_valid && intermediate_is_valid && leaf_is_valid;

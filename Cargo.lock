@@ -429,7 +429,7 @@ checksum = "bbd2bcb4c963f2ddae06a2efc7e9f3591312473c50c6685e1f298068316e66fe"
 [[package]]
 name = "libblockchain"
 version = "0.1.0"
-source = "git+https://github.com/jessethepro/libblockchain.git#06ad682b5c906483d9af7baf375a2bb65c1a0525"
+source = "git+https://github.com/jessethepro/libblockchain.git#1a8e7f1e78e6c7b427151c4f129901d3d855d392"
 dependencies = [
  "anyhow",
  "openssl",
@@ -720,6 +720,7 @@ dependencies = [
  "secrecy 0.8.0",
  "serde",
  "serde_json",
+ "zeroize",
 ]
 
 [[package]]

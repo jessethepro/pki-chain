@@ -4,16 +4,22 @@
 
 This is a blockchain-backed PKI (Public Key Infrastructure) certificate authority system written in Rust. It manages a complete certificate chain (Root CA → Intermediate CA → User Certificates) with all certificates and private keys stored in tamper-proof blockchain storage via the `libblockchain` dependency.
 
-**Key Dependencies**: `openssl` (4096-bit RSA, X.509 operations), `anyhow` (error chaining with `.context()`), `serde`/`serde_json` (socket protocol), `libblockchain` (GitHub: `jessethepro/libblockchain`)
+**Key Dependencies**: `openssl` (4096-bit RSA, X.509 operations), `anyhow` (error chaining with `.context()`), `serde`/`serde_json` (data serialization), `cursive` (TUI framework), `libblockchain` (GitHub: `jessethepro/libblockchain`)
 
 ## Architecture
 
 ### Core Components
 
-- **Terminal User Interface**: Cursive-based TUI (src/ui.rs) provides interactive certificate management with form-based input, validation, and real-time status displays. Primary interface for certificate operations.
-- **Dual Blockchain Storage**: Two separate `libblockchain::blockchain::BlockChain` instances stored in `data/certificates/` and `data/private_keys/`. These are encrypted RocksDB databases with blockchain validation.
+- **Terminal User Interface**: Cursive-based TUI ([src/ui.rs](src/ui.rs)) provides interactive certificate management with form-based input, validation, and real-time status displays. Primary interface for certificate operations. Interacts with Protocol layer via `Arc<Protocol>`.
+- **Protocol Layer**: Abstraction layer ([src/protocol.rs](src/protocol.rs)) that owns `Storage` and provides `process_request(&self, Request) -> Result<Response>` interface. All certificate operations flow through Protocol's request/response pattern. Enables clean separation between UI and storage logic. Created in main.rs as `Arc::new(Protocol::new(storage))`.
+- **PKI Generator**: Unified certificate generation module ([src/pki_generator.rs](src/pki_generator.rs)) containing `generate_root_ca()` and `generate_key_pair()` functions. Defines `CertificateData` struct and `CertificateDataType` enum. Handles all certificate types (Root CA, Intermediate CA, User, TLS) through a single code path with type-specific extensions.
+- **Hybrid Storage Architecture**: 
+  - **Certificate Blockchain** (`data/certificates/`): Stores X.509 certificates in DER format
+  - **Private Key Blockchain** (`data/private_keys/`): Stores SHA-256 hashes of private keys with signatures column family
+  - **Encrypted Key Store** (`exports/keystore/`): AES-256-GCM encrypted private keys in filesystem (enables offline/cold storage per industry best practices)
+  - Both blockchains are RocksDB databases with blockchain validation
+  - Owned by `Storage` struct, which is owned by `Protocol`
 - **Application Key**: `key/pki-chain-app.key` is the master key used to encrypt/decrypt both blockchain databases. Generated via `./generate_app_keypair.sh`.
-- **Unix Socket Server**: External IPC interface at `/tmp/pki_socket` for clients to request certificate operations without direct blockchain access. **Currently disabled** - socket server code is commented out in main.rs. TUI is the primary interface.
 - **Three-Tier Certificate Hierarchy**:
   - Root CA (self-signed, genesis block at height 0)
   - Intermediate CAs (signed by Root, pathlen=0)
@@ -21,46 +27,63 @@ This is a blockchain-backed PKI (Public Key Infrastructure) certificate authorit
 
 ### Critical Data Flow
 
-1. **Initialization** ([main.rs](src/main.rs), [storage.rs](src/storage.rs)): On first run, generates a complete 3-tier TLS hierarchy and stores as the first three blocks:
-   - Height 0: Root CA (self-signed, pathlen=1, 5-year validity)
-   - Height 1: Intermediate TLS CA (signed by Root, pathlen=0, 3-year validity, CN="webclient_intermediate_tls_ca")
-   - Height 2: WebClient TLS Certificate (signed by Intermediate, CA=false, 1-year validity, CN="webclient_cert.local")
+1. **Initialization** ([main.rs](src/main.rs), [storage.rs](src/storage.rs)): On first run, generates a complete 3-tier API/TLS hierarchy and stores as the first three blocks:
+   - Height 0: Root CA (self-signed, pathlen=1, 5-year validity, subject: "MenaceLabs Root CA")
+   - Height 1: Intermediate API CA (signed by Root, pathlen=0, 3-year validity, subject: "intermediate API CA")
+   - Height 2: API TLS Certificate (signed by Intermediate, CA=false, 1-year validity, subject: "api.menacelabs.com", includes SubjectAltName)
    
-   Validates stored certificates match generated ones. Exports Root CA private key to `exports/root_ca.key`. Subsequent runs skip generation if block_count() > 0. **User certificates created via TUI or socket API start at height 3+**.
+   Constants defined in storage.rs: `ROOT_CA_SUBJECT_COMMON_NAME`, `API_INTERMEDIATE_CA_COMMON_NAME`, `API_TLS_COMMON_NAME`. Validates stored certificates match generated ones. Subsequent runs skip generation if `storage.is_empty()` returns false. **User certificates created via TUI start at height 3+**. Main creates `Storage`, wraps it in `Arc::new(Protocol::new(storage))`, then passes Protocol to TUI via `ui::run_ui(protocol)`.
 
-2. **TUI Certificate Creation** ([ui.rs](src/ui.rs)): Users create Intermediate CAs through interactive forms with real-time validation. Form validates all DN fields (CN, O, OU, L, ST, C), country code format (exactly 2 letters), and validity period (positive integer). Uses `RsaIntermediateCABuilder` to generate certificates. Calls `Storage::store_key_certificate()` which atomically stores both certificate and private key with rollback on failure.
+2. **TUI Certificate Creation** ([ui.rs](src/ui.rs), [protocol.rs](src/protocol.rs)): Users create both Intermediate CAs and User certificates through interactive forms with real-time validation. Forms validate all DN fields (CN, O, OU, L, ST, C), country code format (exactly 2 letters), and validity period (positive integer). User certificate form includes dropdown to select issuing Intermediate CA. UI constructs `Request::CreateIntermediate` or `Request::CreateUser` with `CertificateData` struct and calls `protocol.process_request()`. Protocol retrieves signing key/cert from blockchain via `get_key_certificate_by_height()`, then calls `pki_generator::generate_key_pair()` which atomically generates the key pair and certificate based on `cert_type`.
 
-3. **Certificate Storage** ([storage.rs](src/storage.rs)): New certificates stored via `put_block()`. Blockchain automatically assigns UUIDs. On failure during private key storage, certificate is rolled back via `delete_latest_block()`. All operations are transactional.
+3. **Certificate Generation** ([pki_generator.rs](src/pki_generator.rs)): All certificate types use the unified `generate_key_pair(cert_data, signing_key)` function. For Root CAs, call `generate_root_ca()` which generates a new private key and passes it to `generate_key_pair()`. The function automatically handles different certificate types via `CertificateDataType` enum, applying appropriate extensions (BasicConstraints with pathlen, KeyUsage, ExtendedKeyUsage for TLS). Returns `Result<(PKey<Private>, CertificateData)>`.
 
-4. **State Management** ([storage.rs](src/storage.rs)): In-memory `subject_name_to_height` Mutex-wrapped HashMap inside `Storage` struct maps common names to block heights for fast certificate retrieval. Populated on startup by iterating entire certificate blockchain (called from main.rs via `populate_subject_name_index()`). Validates against duplicate subject common names before creation. Thread-safe access via `.lock().unwrap()`.
+4. **Certificate Storage** ([storage.rs](src/storage.rs)): New certificates stored as DER via `put_block()` on certificate blockchain. Private keys encrypted with AES-256-GCM and written to `exports/keystore/`, with SHA-256 hash and certificate signature stored in private key blockchain. Blockchain automatically assigns UUIDs. On failure during key storage, certificate is rolled back via `delete_latest_block()`. All operations are transactional. Encrypted key format: `[nonce (12 bytes)][tag (16 bytes)][ciphertext]`
 
-5. **Socket Protocol** ([protocol.rs](src/protocol.rs), [external_interface.rs](src/external_interface.rs)): **Currently disabled**. Length-prefixed JSON messages (4-byte LE length + JSON payload). Protocol module provides serialization/deserialization utilities (`serialize_request`, `deserialize_request`, `serialize_response`, `deserialize_response`). Server would spawn in background thread via `std::thread::spawn()`, listen on Unix socket, handle connections serially.
+5. **State Management** ([storage.rs](src/storage.rs)): In-memory `subject_name_to_height` Mutex-wrapped HashMap inside `Storage` struct maps common names to block heights for fast certificate retrieval. Populated on startup by iterating entire certificate blockchain (called from main.rs via `populate_subject_name_index()`). Validates against duplicate subject common names before creation. Thread-safe access via `.lock().unwrap()`. Protocol accesses via `protocol.storage.subject_name_to_height`.
 
 ## Key Conventions
 
-### Builder Pattern Usage
+### Unified Certificate Generation
 
-All certificate generation uses builder pattern with **mandatory field validation**. All 6 Distinguished Name (DN) fields are required: CN, O, OU, Locality, State, Country. Example from [generate_root_ca.rs](src/generate_root_ca.rs):
+All certificate types (Root CA, Intermediate CA, User, TLS) are generated through a unified code path in [pki_generator.rs](src/pki_generator.rs). The `CertificateData` struct contains all necessary fields including `cert_type: CertificateDataType` enum:
 
 ```rust
-RsaRootCABuilder::new()
-    .subject_common_name("PKI Chain Root CA".to_string())
-    .organization("MenaceLabs".to_string())
-    .organizational_unit("CY".to_string())
-    .country("BR".to_string())
-    .state("SP".to_string())
-    .locality("Sao Jose dos Campos".to_string())
-    .validity_days(365 * 5)
-    .build()  // Returns Result<(PKey<Private>, X509)>
+// For Root CA (self-signed)
+let cert_data = CertificateData {
+    subject_common_name: "PKI Chain Root CA".to_string(),
+    issuer_common_name: "PKI Chain Root CA".to_string(), // Self-signed
+    organization: "MenaceLabs".to_string(),
+    organizational_unit: "CY".to_string(),
+    locality: "Sao Jose dos Campos".to_string(),
+    state: "SP".to_string(),
+    country: "BR".to_string(),
+    validity_days: 365 * 5,
+    cert_type: CertificateDataType::RootCA,
+};
+let (private_key, cert_data) = generate_root_ca(cert_data)?;
+
+// For Intermediate/User certificates
+let (private_key, cert_data) = generate_key_pair(cert_data, signing_key)?;
 ```
 
-**Note**: Intermediate and User builders require signing key/cert via constructor: `RsaIntermediateCABuilder::new(root_key, root_cert)`. Missing any DN field causes a runtime error in `build()`.
+The function automatically applies appropriate X.509 extensions based on `cert_type`:
+- **RootCA**: `pathlen=1`, keyCertSign, cRLSign
+- **IntermediateCA**: `pathlen=0`, keyCertSign, cRLSign
+- **UserCert**: `CA=false`, digitalSignature, keyEncipherment
+- **TlsCert**: `serverAuth`, SubjectAltName with localhost/127.0.0.1/::1
 
-### Certificate Storage Format
+### Storage Format
 
-- **Certificates**: Stored as PEM in certificate blockchain (`to_pem()`)
-- **Private Keys**: Stored as DER in private key blockchain (`private_key_to_der()`)
-- **Retrieval**: Use `get_block_by_height(n)` or `get_block_by_uuid(&uuid)` from libblockchain
+- **Certificates**: Stored as DER in certificate blockchain (`to_der()`)
+- **Private Keys**: 
+  - Encrypted with AES-256-GCM in `exports/keystore/` filesystem directory
+  - File format: `[nonce (12)][tag (16)][ciphertext]`
+  - SHA-256 hash stored in private key blockchain main column family
+  - Certificate signature stored in private key blockchain signatures column family
+- **Retrieval**: 
+  - Certificates: `get_block_by_height(n)` or `get_block_by_uuid(&uuid)` from libblockchain, parse with `X509::from_der()`
+  - Private keys: `encrypted_key_store.retrieve_key(name)` decrypts from filesystem
 
 ### Error Handling
 
@@ -91,9 +114,10 @@ cargo build --release
 
 TUI menu options (cursive-based interface):
 1. **Create Intermediate Certificate** - Interactive form for creating Intermediate CA certificates with all DN fields (CN, O, OU, L, ST, C) and validity period. Includes real-time validation.
-2. **Validate Blockchain** - Runs `validate()` on both certificate and private key chains, displays block counts and validation status
-3. **View System Status** - Shows blockchain statistics, block heights, and tracked subject names
-4. **Exit** - Terminates application gracefully
+2. **Create User Certificate** - Interactive form for creating User certificates with DN fields and validity period. Includes dropdown to select issuing Intermediate CA from existing CAs. Includes real-time validation.
+3. **Validate Blockchain** - Runs `validate()` on both certificate and private key chains, displays block counts and validation status
+4. **View System Status** - Shows blockchain statistics, block heights, and tracked subject names
+5. **Exit** - Terminates application gracefully
 
 ### Testing PKI Operations
 
@@ -115,53 +139,6 @@ Three key scripts in project root:
 
 3. **`change_pfx_password.sh`**: Changes password on PFX files using application PFX for authentication. Usage: `./change_pfx_password.sh <app_pfx> <target_pfx>`
 
-## External Interface (Socket API)
-
-Clients communicate via Unix socket at `/tmp/pki_socket` with JSON requests:
-
-### Request Format
-
-All requests are length-prefixed: 4-byte little-endian length + JSON payload. The socket server validates against duplicate common names using the in-memory state HashMap. Serialization helpers available in [protocol.rs](src/protocol.rs): `serialize_request(&request)` returns `(u32, Vec<u8>)` tuple. Deserialization via `deserialize_request(&bytes)`. Read example in `handle_client()`: `read_exact(&mut len_buf)` then `read_exact(&mut buf)`.
-
-```json
-{
-  "type": "CreateIntermediate",
-  "subject_common_name": "Operations CA",
-  "organization": "ACME Corp",
-  "organizational_unit": "IT",
-  "locality": "Seattle",
-  "state": "WA",
-  "country": "US",
-  "validity_days": 1825
-}
-```
-
-**Supported request types**: 
-- `CreateIntermediate`: Create new Intermediate CA (signed by Root at height 0)
-- `CreateUser`: Create user certificate (requires `issuer_common_name` field to specify signing Intermediate CA)
-- `ListCertificates`: List certificates (filter: All/Intermediate/User/Root)
-- `PKIStatus`: Get system status (block counts, validation state, tracked subject names)
-- `SocketTest`: Connectivity test
-- `GetWebClientTLSCertificate`: Retrieve pre-generated TLS cert at height 2 with full chain (Intermediate at height 1, Root at height 0). Returns certificate PEM, private key PEM, and chain array for HTTPS server configuration.
-
-### Response Format
-
-All responses are length-prefixed and use tagged enums. Serialization via `serialize_response(&response)`, deserialization via `deserialize_response(&bytes)`. Example response structure:
-
-```json
-{
-  "type": "CreateIntermediateResponse",
-  "message": "Intermediate CA created successfully",
-  "common_name": "Operations CA",
-  "organization": "ACME Corp",
-  "organizational_unit": "IT",
-  "country": "US",
-  "height": 3
-}
-```
-
-**Note**: Response types are strongly typed enums (not generic status/data objects). Each request type has a corresponding response variant: `CreateIntermediateResponse`, `CreateUserResponse`, `ListCertificatesResponse`, `PKIStatusResponse`, `SocketTestResponse`, `GetWebClientTLSCertificateResponse`, and `Error`. See [protocol.rs](src/protocol.rs) for complete enum definitions.
-
 ## Integration Points
 
 ### libblockchain Dependency
@@ -181,31 +158,26 @@ All cryptographic operations use `openssl` crate:
 ## Common Pitfalls
 
 1. **Mutex Deadlocks**: The `subject_name_to_height` HashMap is protected by a Mutex in the `Storage` struct. Always release `lock()` before blockchain operations that may take time. Use scoped blocks `{ let lock = storage.subject_name_to_height.lock().unwrap(); ... }` to force drops, or extract values immediately: `let height = storage.subject_name_to_height.lock().unwrap().get(&name).cloned();`.
-2. **Block Height vs UUID**: First three blocks are reserved for WebClient TLS chain (Root=0, Intermediate TLS=1, WebClient=2). User-created certificates start at height 3+. All blocks have UUIDs but state HashMap maps subject→height for O(1) lookups.
-3. **Certificate Validation**: Intermediate CAs have `pathlen=0` (can't sign other CAs). Root CA has `pathlen=1` (can sign one level of CAs). Set via `BasicConstraints::new().ca().pathlen(n)`. WebClient TLS cert at height 2 has CA=false with `serverAuth` extended key usage.
-4. **Socket Message Protocol**: Must send 4-byte little-endian length prefix before JSON payload (`u32::from_le_bytes(len_buf)`). Missing length = connection hangs or deserialization failure.
-5. **State Initialization**: Socket server populates `storage.subject_name_to_height` on startup by iterating entire certificate blockchain (see `start_socket_server()`). O(n) operation - consider optimization for large chains.
-6. **Rollback Transactions**: On certificate creation failure, rollback via `storage.certificate_chain.delete_latest_block()` to maintain consistency between cert and key chains.
-7. **Thread Safety**: `Storage` struct uses `Arc<Storage>` for sharing across threads. The `subject_name_to_height` field is wrapped in `Mutex` for concurrent access from multiple socket connections.
+2. **Block Height vs UUID**: First three blocks are reserved for API/TLS chain (Root=0, Intermediate API CA=1, api.menacelabs.com=2). User-created certificates start at height 3+. All blocks have UUIDs but state HashMap maps subject→height for O(1) lookups.
+3. **Certificate Validation**: Intermediate CAs have `pathlen=0` (can't sign other CAs). Root CA has `pathlen=1` (can sign one level of CAs). Set via `BasicConstraints::new().ca().pathlen(n)`. TLS cert at height 2 has CA=false with `serverAuth` extended key usage and SubjectAltName extension.
+4. **Rollback Transactions**: On certificate creation failure, rollback via `storage.certificate_chain.delete_latest_block()` to maintain consistency between cert and key chains.
+5. **Thread Safety**: `Storage` struct is owned by `Protocol`, which is wrapped in `Arc<Protocol>` for sharing across threads. The `subject_name_to_height` field is wrapped in `Mutex` for concurrent access from multiple socket connections.
+6. **Protocol Ownership**: `Protocol` struct owns `Storage`, not the other way around. The flow is `UI → Protocol → Storage → Blockchain`. Access storage via `protocol.storage`, not directly.
 
 ## File Organization
 
-- [src/main.rs](src/main.rs): Entry point, blockchain initialization, launches TUI (~97 lines)
-- [src/ui.rs](src/ui.rs): Cursive-based terminal user interface - main menu, certificate creation forms with validation, blockchain validation view, system status dashboard (~331 lines)
-- [src/storage.rs](src/storage.rs): Storage abstraction with dual blockchain management, transactional operations, initialization of 3-tier TLS hierarchy (~557 lines)
-- [src/external_interface.rs](src/external_interface.rs): Socket server, request handlers, WebClient TLS certificate retrieval (currently disabled) (~820 lines)
-- [src/protocol.rs](src/protocol.rs): IPC protocol definitions - Request/Response enums, serialization/deserialization functions for length-prefixed JSON messages (~242 lines)
-- [src/generate_root_ca.rs](src/generate_root_ca.rs): Root CA builder (self-signed, pathlen=1)
-- [src/generate_intermediate_ca.rs](src/generate_intermediate_ca.rs): Intermediate CA builder (pathlen=0)
-- [src/generate_user_keypair.rs](src/generate_user_keypair.rs): User cert builder (CA=false)
-- [src/generate_webclient_tls.rs](src/generate_webclient_tls.rs): TLS server certificate builder with `serverAuth` extension, SubjectAltName (localhost, 127.0.0.1, ::1). Exports constants `WEBCLIENT_COMMON_NAME` and `WEBCLIENT_INTERMEDIATE_COMMON_NAME` (~398 lines)
-- [src/lib.rs](src/lib.rs): Library interface exposing public modules
+- [src/main.rs](src/main.rs): Entry point, blockchain initialization, launches TUI (~100 lines)
+- [src/ui.rs](src/ui.rs): Cursive-based terminal user interface - main menu, certificate creation forms with validation, blockchain validation view, system status dashboard (~649 lines)
+- [src/storage.rs](src/storage.rs): Storage abstraction with dual blockchain management, transactional operations, initialization of 3-tier TLS hierarchy (~741 lines)
+- [src/protocol.rs](src/protocol.rs): Protocol abstraction layer - Request/Response enums, `process_request()` implementation, certificate validation logic (~541 lines)
+- [src/pki_generator.rs](src/pki_generator.rs): Unified certificate generation with `CertificateData` struct, `CertificateDataType` enum, `generate_root_ca()` and `generate_key_pair()` functions for all certificate types (~283 lines)
+- [src/lib.rs](src/lib.rs): Library interface exposing public modules (~317 lines)
 - Shell scripts: Test utilities and key generation helpers
 
 ## Constants and Paths
 
-- **Application Key**: `key/pki-chain-app.key` (constant: `APP_KEY_PATH`)
-- **Unix Socket**: `/tmp/pki_socket` (constant: `SOCKET_PATH`)
-- **Certificate Storage**: `data/certificates/` (RocksDB database + snapshots)
-- **Private Key Storage**: `data/private_keys/` (RocksDB database + snapshots)
-- **Export Directory**: `exports/` (Root CA key exports)
+- **Application Key**: `key/pki-chain-app.key` (constant: `APP_KEY_PATH` in main.rs) - Used for deriving AES-256-GCM key for encrypted key store
+- **Certificate Blockchain**: `data/certificates/` (RocksDB database storing DER-encoded certificates)
+- **Private Key Blockchain**: `data/private_keys/` (RocksDB database storing SHA-256 hashes + signatures column family)
+- **Encrypted Key Store**: `exports/keystore/` (AES-256-GCM encrypted private keys, format: `[nonce(12)][tag(16)][ciphertext]`, constant: `KEYSTORE_DIR` in storage.rs)
+- **Initial Hierarchy Common Names**: `ROOT_CA_SUBJECT_COMMON_NAME` = "MenaceLabs Root CA", `API_INTERMEDIATE_CA_COMMON_NAME` = "intermediate API CA", `API_TLS_COMMON_NAME` = "api.menacelabs.com" (all in storage.rs)
