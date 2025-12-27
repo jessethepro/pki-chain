@@ -1,22 +1,23 @@
 //! PKI Chain - Blockchain-backed Certificate Authority
 //!
 //! A production-ready Public Key Infrastructure system that stores certificates in blockchain
-//! storage and private keys in AES-256-GCM encrypted files. Provides a complete three-tier
+//! storage and private keys in encrypted PKCS#8 format. Provides a complete three-tier
 //! CA hierarchy: Root CA → Intermediate CA → User Certificates.
 //!
 //! # Features
 //!
 //! - **Terminal User Interface**: Cursive-based TUI for certificate management
+//! - **Configuration System**: TOML-based configuration for paths and keyring settings
 //! - **Hybrid Storage Architecture**:
 //!   - Certificates stored as DER in blockchain
-//!   - Private keys encrypted with AES-256-GCM in filesystem (enables offline/cold storage)
+//!   - Private keys stored as encrypted PKCS#8 PEM files
 //!   - Key chain stores SHA-256 hashes and certificate signatures
+//! - **Keyring Integration**: Linux kernel keyring for secure key management
 //! - **Interactive Certificate Creation**: Form-based Intermediate CA and User certificate creation with validation
 //! - **Three-Tier PKI**: Root CA, Intermediate CAs, and User certificates
 //! - **4096-bit RSA**: Strong cryptographic keys with SHA-256 signatures
 //! - **Transactional Safety**: Automatic rollback on storage failures
-//! - **Integrity Verification**: Hash-based validation of private keys
-//! - **Thread-Safe Operations**: Arc-wrapped Protocol with concurrent access support
+//! - **Thread-Safe Operations**: Concurrent access support via Protocol layer
 //!
 //! # Quick Start
 //!
@@ -35,12 +36,10 @@
 //!
 //! - [`ui`]: Terminal user interface built with cursive for certificate management
 //! - [`storage`]: Blockchain storage abstraction for certificates and keys
-//! - [`protocol`]: IPC protocol definitions for socket communication
-//! - [`external_interface`]: Unix socket server for external certificate requests (currently disabled)
-//! - [`generate_root_ca`]: Self-signed Root CA certificate generation
-//! - [`generate_intermediate_ca`]: Intermediate CA generation (signed by Root)
-//! - [`generate_user_keypair`]: User certificate generation (signed by Intermediate)
-//! - [`generate_webclient_tls`]: TLS server certificate with SubjectAltName extensions
+//! - [`protocol`]: Protocol layer that handles certificate operations and validation
+//! - [`pki_generator`]: Certificate generation functions for all certificate types
+//! - [`private_key_storage`]: Encrypted key store for PKCS#8 private keys
+//! - [`configs`]: Configuration management for TOML settings
 //!
 //! # Example Usage
 //!
@@ -50,61 +49,52 @@
 //!    - All Distinguished Name fields (CN, O, OU, L, ST, C)
 //!    - Configurable validity period
 //!    - Real-time validation
-//! 2. **Validate Blockchain**: Verify integrity of certificate and key chains
-//! 3. **View System Status**: Display blockchain statistics and tracked certificates
-//! 4. **Exit**: Shutdown application
+//! 2. **Create User Certificate**: Interactive form for generating User certificates
+//!    - Select issuing Intermediate CA from dropdown
+//!    - All Distinguished Name fields with validation
+//! 3. **Validate Blockchain**: Verify integrity of certificate and key chains
+//! 4. **View System Status**: Display blockchain statistics and tracked certificates
+//! 5. **Exit**: Shutdown application
 //!
 //! # Storage Architecture
 //!
-//! On first run, the application automatically initializes a Root CA certificate and sets up
-//! the necessary storage structure. The storage layout is as follows:
-//! - Height 0: Root CA (self-signed, 5-year validity)
+//! On first run, the application automatically initializes the Root CA:
+//! - Height 0: Root CA (self-signed, 10-year validity, pathlen=1)
 //!
 //! ## Storage Layout
 //!
-//! - **Certificate Blockchain** (`data/certificates/`): Stores X.509 certificates in DER format
-//! - **Private Key Blockchain** (`data/private_keys/`): Stores SHA-256 hashes of private keys
-//!   - Signatures column family: Stores signatures of corresponding certificates
-//! - **Encrypted Key Store** (`exports/keystore/`): AES-256-GCM encrypted private keys
-//!   - Format: [nonce (12 bytes)][tag (16 bytes)][ciphertext]
+//! - **Certificate Blockchain** (configurable via config.toml, default: `data/certificates/`):
+//!   Stores X.509 certificates in DER format
+//! - **Private Key Blockchain** (configurable via config.toml, default: `data/private_keys/`):
+//!   Stores SHA-512 hashes of private keys with signatures column family
+//! - **Encrypted Key Store** (configurable via config.toml, default: `exports/keystore/`):
+//!   - Root CA private key: PKCS#8 PEM encrypted format with password protection
+//!   - Other private keys: RSA + AES-GCM-256 hybrid encryption format
+//!     - Format: `[AES Key Len (u64)][Encrypted AES Key][Nonce][Tag][Data Length (usize)][Encrypted Data]`
+//!     - AES session key encrypted with Root CA public key
+//!     - Private key data encrypted with AES-GCM-256
 //!
-//! User-created certificates are stored at heights 3 and above.
+//! User-created certificates (Intermediate CAs and User certificates) are stored at heights 1 and above.
 
 mod ui;
 
 use anyhow::{Context, Result};
-use pki_chain::protocol::Protocol;
 use pki_chain::storage::Storage;
-use std::sync::Arc;
-
-const APP_KEY_PATH: &str = "key/pki-chain-app.key";
 
 fn main() -> Result<()> {
+    let default_configs =
+        pki_chain::configs::AppConfig::load().context("Failed to load default configurations")?;
     // Initialize storage
-    let storage = Storage::new(APP_KEY_PATH).context("Failed to initialize storage")?;
+    let storage = Storage::new(default_configs.clone()).context("Failed to initialize storage")?;
 
     if storage.is_empty()? {
         storage
             .initialize()
             .context("Failed to initialize PKI storage")?;
     }
-    storage
-        .populate_subject_name_index()
-        .context("Failed to populate subject name index")?;
-
-    // Create protocol that owns storage
-    let protocol = Arc::new(Protocol::new(storage));
-
-    // Socket server disabled for now
-    // let protocol_clone = Arc::clone(&protocol);
-    // std::thread::spawn(move || {
-    //     if let Err(e) = pki_chain::external_interface::start_socket_server(protocol_clone) {
-    //         eprintln!("Socket server error: {}", e);
-    //     }
-    // });
 
     // Run the TUI
-    ui::run_ui(protocol);
+    ui::run_ui();
 
     Ok(())
 }

@@ -102,35 +102,29 @@
 //!
 //! # Public API
 //!
-//! This library exposes a minimal IPC-based API for interacting with the PKI Chain server:
+//! This library exposes a protocol-based API for PKI certificate management operations:
 //!
 //! ## [`Request`]
 //!
-//! Enum defining all supported certificate operations. Serializes to JSON for socket communication.
+//! Enum defining all supported certificate operations through the Protocol layer.
 //!
 //! Supported operations:
 //! - `CreateIntermediate` - Create a new Intermediate CA
 //! - `CreateUser` - Create a user certificate
 //! - `ListCertificates` - List certificates with filtering
-//! - `PKIStatus` - Get system status
-//! - `SocketTest` - Test connectivity
-//! - `GetWebClientTLSCertificate` - Retrieve pre-generated TLS certificate
+//! - `PKIStatus` - Get system status and validation results
+//! - `ValidateCertificate` - Validate certificate chain
 //!
 //! ## [`Response`]
 //!
 //! Enum containing type-safe responses for each request type:
 //!
-//! - `CreateIntermediateResponse` - Returns certificate details and blockchain height
-//! - `CreateUserResponse` - Returns certificate details and blockchain height
-//! - `ListCertificatesResponse` - Returns array of certificates
-//! - `PKIStatusResponse` - Returns system metrics and validation status
-//! - `SocketTestResponse` - Simple confirmation
-//! - `GetWebClientTLSCertificateResponse` - Returns certificate, key, and chain
+//! - `CreateIntermediate` - Returns certificate details and blockchain height
+//! - `CreateUser` - Returns certificate details and blockchain height
+//! - `ListCertificates` - Returns array of certificates
+//! - `PKIStatus` - Returns system metrics and validation status
+//! - `ValidateCertificate` - Returns validation results for certificate chain
 //! - `Error` - Error message
-//!
-//! ## [`SOCKET_PATH`]
-//!
-//! Unix socket path for IPC: `/tmp/pki_socket`
 //!
 //! # Architecture Details
 //!
@@ -312,6 +306,7 @@
 //!     Ok(())
 //! }
 //! ```
+pub mod configs;
 pub mod pki_generator;
 mod private_key_storage;
 pub mod protocol;

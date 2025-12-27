@@ -1,0 +1,13 @@
+# PKI Chain Configuration
+
+[blockchains]
+certificate_path = "data/certificates"
+private_key_path = "data/private_keys"
+
+[app_keyring]
+app_key_path = "key/pki-chain-app.key"
+app_key_name = "app-key"
+root_key_name = "root-key"
+
+[key_exports]
+directory = "exports/keystore"

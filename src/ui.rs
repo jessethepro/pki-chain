@@ -56,11 +56,20 @@ use cursive::{Cursive, CursiveExt};
 use openssl::nid::Nid;
 use pki_chain::pki_generator::{CertificateData, CertificateDataType};
 use pki_chain::protocol::{Protocol, Request, Response};
+use pki_chain::storage::Storage;
 use pki_chain::storage::ROOT_CA_SUBJECT_COMMON_NAME;
 use std::sync::Arc;
 
 /// Initialize and run the TUI application
-pub fn run_ui(protocol: Arc<Protocol>) {
+pub fn run_ui() {
+    let default_configs =
+        pki_chain::configs::AppConfig::load().expect("Failed to load default configurations");
+    let storage = Storage::new(default_configs.clone()).expect("Failed to initialize storage");
+    storage
+        .populate_subject_name_index()
+        .expect("Failed to populate subject name index");
+    let protocol = Protocol::new(storage);
+
     let mut siv = Cursive::default();
 
     // Store protocol in user data

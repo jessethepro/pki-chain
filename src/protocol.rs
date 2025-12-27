@@ -1,7 +1,65 @@
 //! Protocol Module
 //!
-//! Defines the Request and Response enums for actions related to certificate management.
-//! Processes the actions and returns appropriate responses.
+//! Provides a high-level abstraction layer for PKI certificate management operations.
+//! This module owns the Storage layer and processes certificate-related requests through
+//! a clean Request/Response pattern, enabling separation between UI logic and storage operations.
+//!
+//! # Architecture
+//!
+//! The Protocol layer:
+//! - Owns the [`Storage`] instance for blockchain and key management
+//! - Processes [`Request`] enums for certificate operations (Create, List, Validate, Status)
+//! - Returns [`Response`] enums with operation results or errors
+//! - Handles certificate chain validation and integrity checks
+//! - Retrieves private keys from encrypted storage for signing operations
+//!
+//! # Usage Pattern
+//!
+//! ```no_run
+//! use pki_chain::protocol::{Protocol, Request, Response};
+//! use pki_chain::storage::Storage;
+//! use pki_chain::configs::AppConfig;
+//! use pki_chain::pki_generator::{CertificateData, CertificateDataType};
+//!
+//! # fn example() -> anyhow::Result<()> {
+//! // Initialize storage and protocol
+//! let config = AppConfig::load()?;
+//! let storage = Storage::new(config)?;
+//! let protocol = Protocol::new(storage);
+//!
+//! // Create an intermediate CA
+//! let request = Request::CreateIntermediate {
+//!     certificate_data: CertificateData {
+//!         subject_common_name: "My Intermediate CA".to_string(),
+//!         issuer_common_name: "MenaceLabs Root CA".to_string(),
+//!         organization: "My Org".to_string(),
+//!         organizational_unit: "IT".to_string(),
+//!         locality: "City".to_string(),
+//!         state: "State".to_string(),
+//!         country: "US".to_string(),
+//!         validity_days: 365 * 3,
+//!         cert_type: CertificateDataType::IntermediateCA,
+//!     },
+//! };
+//!
+//! match protocol.process_request(request)? {
+//!     Response::CreateIntermediate { message, height, .. } => {
+//!         println!("{} at height {}", message, height);
+//!     },
+//!     Response::Error { message } => {
+//!         eprintln!("Error: {}", message);
+//!     },
+//!     _ => {}
+//! }
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! # Thread Safety
+//!
+//! Protocol instances are typically wrapped in `Arc<Protocol>` for sharing across threads
+//! (e.g., in TUI event handlers). The underlying Storage uses Mutex for thread-safe access
+//! to the subject name index.
 
 use crate::pki_generator::{generate_key_pair, CertificateData};
 use crate::storage::Storage;
@@ -12,51 +70,65 @@ use openssl::x509::store::X509StoreBuilder;
 use openssl::x509::{X509StoreContext, X509VerifyResult, X509};
 use serde::{Deserialize, Serialize};
 
-/// Filter options for listing certificates
+/// Filter options for listing certificates by type
 #[derive(Debug, Deserialize, Serialize)]
 pub(crate) enum Filter {
+    /// List all certificates
     All,
+    /// List only Intermediate CA certificates
     Intermediate,
+    /// List only User certificates
     User,
+    /// List only Root CA certificates
     Root,
 }
 
-/// Request types from external applications
+/// Request types for certificate management operations
+///
+/// All certificate operations flow through these request types, which are processed
+/// by [`Protocol::process_request()`] to perform the actual operations and return
+/// appropriate [`Response`] variants.
 pub enum Request {
-    CreateIntermediate {
-        certificate_data: CertificateData,
-    },
-    CreateUser {
-        certificate_data: CertificateData,
-    },
-    ListCertificates {
-        filter: String,
-    },
+    /// Create a new Intermediate CA certificate signed by the Root CA
+    CreateIntermediate { certificate_data: CertificateData },
+    /// Create a new User certificate signed by a specified Intermediate CA
+    CreateUser { certificate_data: CertificateData },
+    /// List certificates filtered by type
+    ListCertificates { filter: String },
+    /// Get current PKI system status and statistics
     PKIStatus,
+    /// Validate a certificate chain (leaf → intermediate → root)
     ValidateCertificate {
         subject_certificate_data: CertificateData,
         intermediate_certificate_data: CertificateData,
     },
 }
 
-/// Response types sent back to clients
+/// Response types returned from certificate operations
+///
+/// Each successful request returns a specific Response variant containing
+/// operation results. Errors are returned as `Response::Error` variants.
 #[derive(Debug, Clone)]
 pub enum Response {
+    /// Intermediate CA certificate created successfully
     CreateIntermediate {
         message: String,
         certificate_data: X509,
         height: u64,
     },
+    /// User certificate created successfully
     CreateUser {
         message: String,
         certificate_data: X509,
         height: u64,
     },
+    /// Certificate list retrieved successfully
     ListCertificates {
         message: String,
         certificates: Vec<X509>,
         count: usize,
     },
+    /// PKI system status and validation results
     PKIStatus {
         message: String,
         status: String,
@@ -67,26 +139,88 @@ pub enum Response {
         private_key_chain_valid: bool,
         pki_chain_in_sync: bool,
     },
+    /// Certificate chain validation results
     ValidateCertificate {
         message: String,
         leaf_is_valid: bool,
         intermediate_is_valid: bool,
         root_is_valid: bool,
     },
-    Error {
-        message: String,
-    },
+    /// Error occurred during request processing
+    Error { message: String },
 }
 
+/// Protocol layer for PKI certificate management
+///
+/// Owns the Storage instance and provides a high-level interface for certificate
+/// operations through the Request/Response pattern. Handles certificate generation,
+/// storage, retrieval, and validation operations.
+///
+/// # Thread Safety
+///
+/// Typically wrapped in `Arc<Protocol>` for sharing across threads in the TUI.
 pub struct Protocol {
+    /// Storage layer for blockchain and encrypted key management
     pub storage: Storage,
 }
 
 impl Protocol {
+    /// Creates a new Protocol instance that owns the given Storage
+    ///
+    /// # Arguments
+    ///
+    /// * `storage` - Initialized Storage instance with blockchain and encrypted key store
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use pki_chain::protocol::Protocol;
+    /// use pki_chain::storage::Storage;
+    /// use pki_chain::configs::AppConfig;
+    ///
+    /// # fn example() -> anyhow::Result<()> {
+    /// let config = AppConfig::load()?;
+    /// let storage = Storage::new(config)?;
+    /// let protocol = Protocol::new(storage);
+    /// # Ok(())
+    /// # }
+    /// ```
     pub fn new(storage: Storage) -> Self {
         Self { storage }
     }
 
+    /// Processes a certificate management request and returns the appropriate response
+    ///
+    /// This is the main entry point for all certificate operations. Handles:
+    /// - Creating Intermediate CA certificates (signed by Root CA)
+    /// - Creating User certificates (signed by specified Intermediate CA)
+    /// - Listing certificates with optional filtering
+    /// - Getting PKI system status and validation results
+    /// - Validating certificate chains
+    ///
+    /// # Arguments
+    ///
+    /// * `request` - The operation to perform
+    ///
+    /// # Returns
+    ///
+    /// * `Result<Response>` - The operation result or Response::Error on failure
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// # use pki_chain::protocol::{Protocol, Request, Response};
+    /// # fn example(protocol: &Protocol) -> anyhow::Result<()> {
+    /// let response = protocol.process_request(Request::PKIStatus)?;
+    /// match response {
+    ///     Response::PKIStatus { total_certificates, .. } => {
+    ///         println!("Total certificates: {}", total_certificates);
+    ///     },
+    ///     _ => {}
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
     pub fn process_request(&self, request: Request) -> Result<Response> {
         match request {
             Request::CreateIntermediate { certificate_data } => {
@@ -117,7 +251,10 @@ impl Protocol {
                 };
 
                 // Store in blockchain
-                let height = match self.storage.store_key_certificate(&int_key, &int_cert) {
+                let height = match self
+                    .storage
+                    .store_key_certificate(int_key, int_cert.clone())
+                {
                     Ok(h) => h,
                     Err(e) => {
                         return Ok(Response::Error {
@@ -181,7 +318,10 @@ impl Protocol {
                 };
 
                 // Store in blockchain
-                let height = match self.storage.store_key_certificate(&user_key, &user_cert) {
+                let height = match self
+                    .storage
+                    .store_key_certificate(user_key, user_cert.clone())
+                {
                     Ok(h) => h,
                     Err(e) => {
                         return Ok(Response::Error {
@@ -192,7 +332,7 @@ impl Protocol {
 
                 return Ok(Response::CreateUser {
                     message: "User keypair created successfully".to_string(),
-                    certificate_data: user_cert.clone(),
+                    certificate_data: user_cert,
                     height,
                 });
             }
