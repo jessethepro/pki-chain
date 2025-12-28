@@ -48,7 +48,7 @@ pub fn generate_key_pair(
     signing_key: &PKey<Private>,
 ) -> Result<(PKey<Private>, X509)> {
     let private_key = match cert_data.cert_type {
-        CertificateDataType::RootCA => signing_key.clone(),
+        CertificateDataType::RootCA => signing_key.clone(), // Self signed. Private key is the signing key
         _ => {
             // Generate RSA key pair
             let rsa = openssl::rsa::Rsa::generate(RSA_KEY_SIZE_DEFAULT)

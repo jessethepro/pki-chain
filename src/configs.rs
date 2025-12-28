@@ -6,7 +6,6 @@ use std::path::PathBuf;
 #[derive(Debug, Deserialize, Clone)]
 pub struct AppConfig {
     pub blockchains: Blockchains,
-    pub app_keyring: AppKeyring,
     pub key_exports: KeyExports,
 }
 
@@ -17,15 +16,10 @@ pub struct Blockchains {
 }
 
 #[derive(Debug, Deserialize, Clone)]
-pub struct AppKeyring {
-    pub app_key_path: PathBuf,
-    pub app_key_name: String,
-    pub root_key_name: String,
-}
-
-#[derive(Debug, Deserialize, Clone)]
 pub struct KeyExports {
-    pub directory: PathBuf,
+    pub key_export_directory_path: PathBuf,
+    pub app_key_path: PathBuf,
+    pub root_key_name: String,
 }
 
 impl AppConfig {

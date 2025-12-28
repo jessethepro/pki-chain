@@ -49,55 +49,11 @@
 //!
 //! ## As a Library
 //!
-//! **Note**: The Unix socket API is currently disabled in favor of the TUI interface.
-//! To re-enable socket communication, uncomment the socket server code in `src/main.rs`.
-//!
 //! Add to your `Cargo.toml`:
 //!
 //! ```toml
 //! [dependencies]
 //! pki-chain = { git = "https://github.com/jessethepro/pki-chain.git" }
-//! ```
-//!
-//! Use in your code (when socket server is enabled):
-//!
-//! ```no_run
-//! use pki_chain::{Request, Response, SOCKET_PATH};
-//! use std::os::unix::net::UnixStream;
-//! use std::io::{Read, Write};
-//!
-//! fn request_certificate() -> anyhow::Result<()> {
-//!     // Connect to PKI Chain socket
-//!     let mut stream = UnixStream::connect(SOCKET_PATH)?;
-//!     
-//!     // Create certificate request
-//!     let request = Request::CreateUser {
-//!         subject_common_name: "user@example.com".to_string(),
-//!         organization: "ACME Corp".to_string(),
-//!         organizational_unit: "Engineering".to_string(),
-//!         locality: "San Francisco".to_string(),
-//!         state: "CA".to_string(),
-//!         country: "US".to_string(),
-//!         validity_days: 365,
-//!         issuer_common_name: "Operations CA".to_string(),
-//!     };
-//!     
-//!     // Send request (4-byte length prefix + JSON)
-//!     let json = serde_json::to_string(&request)?;
-//!     stream.write_all(&(json.len() as u32).to_le_bytes())?;
-//!     stream.write_all(json.as_bytes())?;
-//!     
-//!     // Read response
-//!     let mut len_buf = [0u8; 4];
-//!     stream.read_exact(&mut len_buf)?;
-//!     let mut response_buf = vec![0u8; u32::from_le_bytes(len_buf) as usize];
-//!     stream.read_exact(&mut response_buf)?;
-//!     
-//!     let response: Response = serde_json::from_slice(&response_buf)?;
-//!     println!("Response: {:?}", response);
-//!     
-//!     Ok(())
-//! }
 //! ```
 //!
 //! # Public API
@@ -167,148 +123,9 @@
 //! - ⚠️ No network-based access control (Unix socket is local-only)
 //! - ⚠️ Application key compromise grants full database access
 //!
-//! # Examples
-//!
-//! ## Complete PKI Setup
-//!
-//! ```no_run
-//! use pki_chain::storage::Storage;
-//! use pki_chain::generate_root_ca::RsaRootCABuilder;
-//! use pki_chain::generate_intermediate_ca::RsaIntermediateCABuilder;
-//! use pki_chain::generate_user_keypair::RsaUserKeyPairBuilder;
-//! use anyhow::Result;
-//!
-//! fn setup_pki() -> Result<()> {
-//!     // Initialize storage
-//!     let storage = Storage::new("key/app.key")?;
-//!     
-//!     // Generate Root CA
-//!     let (root_key, root_cert) = RsaRootCABuilder::new()
-//!         .subject_common_name("Root CA".to_string())
-//!         .organization("ACME Corp".to_string())
-//!         .organizational_unit("Security".to_string())
-//!         .country("US".to_string())
-//!         .state("CA".to_string())
-//!         .locality("San Francisco".to_string())
-//!         .validity_days(3650)
-//!         .build()?;
-//!     storage.store_key_certificate(&root_key, &root_cert)?;
-//!     
-//!     // Generate Intermediate CA
-//!     let (int_key, int_cert) = RsaIntermediateCABuilder::new(root_key, root_cert)
-//!         .subject_common_name("Operations CA".to_string())
-//!         .organization("ACME Corp".to_string())
-//!         .organizational_unit("Operations".to_string())
-//!         .country("US".to_string())
-//!         .state("CA".to_string())
-//!         .locality("San Francisco".to_string())
-//!         .validity_days(1825)
-//!         .build()?;
-//!     storage.store_key_certificate(&int_key, &int_cert)?;
-//!     
-//!     // Generate User Certificate
-//!     let (user_key, user_cert) = RsaUserKeyPairBuilder::new(int_key, int_cert)
-//!         .subject_common_name("john.doe@acme.com".to_string())
-//!         .organization("ACME Corp".to_string())
-//!         .organizational_unit("Engineering".to_string())
-//!         .country("US".to_string())
-//!         .state("CA".to_string())
-//!         .locality("San Francisco".to_string())
-//!         .validity_days(365)
-//!         .build()?;
-//!     storage.store_key_certificate(&user_key, &user_cert)?;
-//!     
-//!     // Validate entire chain
-//!     assert!(storage.validate()?);
-//!     println!("PKI setup complete and validated");
-//!     
-//!     Ok(())
-//! }
-//! ```
-//!
-//! ## Request a User Certificate
-//!
-//! ```no_run
-//! use pki_chain::{Request, Response, SOCKET_PATH};
-//! use std::os::unix::net::UnixStream;
-//! use std::io::{Read, Write};
-//!
-//! fn create_user_cert() -> anyhow::Result<()> {
-//!     let mut stream = UnixStream::connect(SOCKET_PATH)?;
-//!     
-//!     let request = Request::CreateUser {
-//!         subject_common_name: "alice@example.com".to_string(),
-//!         organization: "ACME Corp".to_string(),
-//!         organizational_unit: "Engineering".to_string(),
-//!         locality: "San Francisco".to_string(),
-//!         state: "CA".to_string(),
-//!         country: "US".to_string(),
-//!         validity_days: 365,
-//!         issuer_common_name: "Operations CA".to_string(),
-//!     };
-//!     
-//!     // Send request
-//!     let json = serde_json::to_string(&request)?;
-//!     stream.write_all(&(json.len() as u32).to_le_bytes())?;
-//!     stream.write_all(json.as_bytes())?;
-//!     
-//!     // Read response
-//!     let mut len_buf = [0u8; 4];
-//!     stream.read_exact(&mut len_buf)?;
-//!     let mut buf = vec![0u8; u32::from_le_bytes(len_buf) as usize];
-//!     stream.read_exact(&mut buf)?;
-//!     
-//!     match serde_json::from_slice::<Response>(&buf)? {
-//!         Response::CreateUserResponse { message, height, .. } => {
-//!             println!("{} at height {}", message, height);
-//!         }
-//!         Response::Error { message } => {
-//!             eprintln!("Error: {}", message);
-//!         }
-//!         _ => {}
-//!     }
-//!     
-//!     Ok(())
-//! }
-//! ```
-//!
-//! ## Get PKI System Status
-//!
-//! ```no_run
-//! use pki_chain::{Request, Response, SOCKET_PATH};
-//! use std::os::unix::net::UnixStream;
-//! use std::io::{Read, Write};
-//!
-//! fn check_status() -> anyhow::Result<()> {
-//!     let mut stream = UnixStream::connect(SOCKET_PATH)?;
-//!     
-//!     let request = Request::PKIStatus;
-//!     let json = serde_json::to_string(&request)?;
-//!     stream.write_all(&(json.len() as u32).to_le_bytes())?;
-//!     stream.write_all(json.as_bytes())?;
-//!     
-//!     let mut len_buf = [0u8; 4];
-//!     stream.read_exact(&mut len_buf)?;
-//!     let mut buf = vec![0u8; u32::from_le_bytes(len_buf) as usize];
-//!     stream.read_exact(&mut buf)?;
-//!     
-//!     if let Response::PKIStatusResponse {
-//!         total_certificates,
-//!         total_keys,
-//!         certificate_chain_valid,
-//!         ..
-//!     } = serde_json::from_slice(&buf)?
-//!     {
-//!         println!("Certificates: {}, Keys: {}, Valid: {}",
-//!             total_certificates, total_keys, certificate_chain_valid);
-//!     }
-//!     
-//!     Ok(())
-//! }
-//! ```
 pub mod configs;
 pub mod pki_generator;
-mod private_key_storage;
+pub mod private_key_storage;
 pub mod protocol;
 pub mod storage;
 // Public API - only expose Request/Response enums, socket path, and protocol functions

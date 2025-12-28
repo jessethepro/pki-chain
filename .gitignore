@@ -10,3 +10,6 @@
 
 # Blockchain data
 /data
+
+# Encrypted key store (contains sensitive cryptographic material)
+/exports

@@ -2,7 +2,7 @@
 
 **A production-ready blockchain-backed Public Key Infrastructure (PKI) certificate authority system with an interactive terminal UI.**
 
-Built in Rust with enterprise-grade cryptography, PKI Chain provides a complete three-tier CA hierarchy (Root CA → Intermediate CA → User Certificates) with hybrid storage: certificates in blockchain (DER format), private keys in encrypted files (PKCS#8 for Root CA, RSA+AES-GCM-256 hybrid encryption for others), and SHA-512 integrity hashes in blockchain via [libblockchain](https://github.com/jessethepro/libblockchain). Features TOML-based configuration and Linux kernel keyring integration for secure key management.
+Built in Rust with enterprise-grade cryptography, PKI Chain provides a complete three-tier CA hierarchy (Root CA → Intermediate CA → User Certificates) with hybrid storage: certificates in blockchain (DER format), private keys in encrypted files (PKCS#8 for Root CA, RSA+AES-GCM-256 hybrid encryption for others), and SHA-512 integrity hashes in blockchain via [libblockchain](https://github.com/jessethepro/libblockchain). Features TOML-based configuration and in-memory key management.
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Rust](https://img.shields.io/badge/rust-1.70%2B-orange.svg)](https://www.rust-lang.org/)
@@ -19,21 +19,22 @@ Built in Rust with enterprise-grade cryptography, PKI Chain provides a complete 
 
 - � **Terminal User Interface**: Modern cursive-based TUI for interactive certificate management
 - 📝 **Interactive Forms**: Create both Intermediate CA and User certificates with form-based input and validation
-- ⚙️ **Configuration Management**: TOML-based configuration for paths and keyring settings
+- ⚙️ **Configuration Management**: TOML-based configuration for paths and storage settings
 - 🔐 **Hybrid Storage Architecture**: 
-  - Certificates stored as DER in blockchain
+  - Certificates stored as DER in blockchain (encrypted with app key)
   - Root CA: PKCS#8 PEM with password protection
-  - Other keys: RSA + AES-GCM-256 hybrid encryption (AES key encrypted with Root CA public key)
-  - SHA-512 hashes and signatures in key blockchain
-- 🔑 **Keyring Integration**: Linux kernel keyring for secure in-memory key management
+  - Other keys: RSA + AES-GCM-256 hybrid encryption (AES key encrypted with Root CA public key via RSA-OAEP)
+  - SHA-512 hashes and signatures in key blockchain (encrypted with app key)
+- 🔑 **In-Memory Key Management**: Secure runtime key storage with zeroize on drop
+- 🎯 **Single Storage Instance**: Created once in main, passed to UI layer to prevent database lock conflicts
 - 🔗 **Three-Tier PKI Hierarchy**: Complete CA chain (Root → Intermediate → User)
 - 🔒 **Strong Cryptography**: 4096-bit RSA keys with SHA-256 signatures
 - 🔄 **Transactional Safety**: Automatic rollback on storage failures
 - ✅ **Certificate Validation**: OpenSSL X509Store-based chain validation with hash verification
 - 🎯 **Height-Based Indexing**: O(1) certificate lookups with thread-safe Mutex-protected HashMap
-- 🧵 **Thread Safety**: Protocol layer with Storage ownership and concurrent access support
+- 🧵 **Clean Architecture**: Protocol layer wraps Storage with Request/Response pattern
 - 📊 **Real-Time Status**: View blockchain statistics and certificate inventory
-- 🏗️ **Protocol Layer**: All storage operations through Request/Response interface ensuring clean abstraction
+- 🏗️ **No Arc Overhead**: Direct Protocol ownership in UI, efficient borrow checking
 
 ## Quick Start
 
@@ -65,8 +66,18 @@ On first run, the application automatically initializes the Root CA (height 0) i
 ```
 ┌──────────────────────────────────────────────────────────────┐
 │                   PKI Chain Application                       │
-│                                                               │
+│                        main.rs                                │
 │  ┌────────────────────────────────────────────────────────┐  │
+│  │  1. Load config.toml                                   │  │
+│  │  2. Create Storage::new() - Single instance            │  │
+│  │     • Loads app key into memory                        │  │
+│  │     • Opens RocksDB blockchains (once)                 │  │
+│  │  3. Initialize Root CA if empty                        │  │
+│  │  4. Populate subject name index                        │  │
+│  │  5. Pass Storage to ui::run_ui()                       │  │
+│  └────────────────────┬───────────────────────────────────┘  │
+│                       │                                       │
+│  ┌────────────────────▼───────────────────────────────────┐  │
 │  │           Cursive Terminal UI (Main Thread)            │  │
 │  │  ┌──────────────────────────────────────────────────┐  │  │
 │  │  │  Main Menu                                       │  │  │
@@ -82,17 +93,17 @@ On first run, the application automatically initializes the Root CA (height 0) i
 │  └─────────────────────┬────────────────────────────────────┘  │
 │                        │                                       │
 │       ┌────────────────▼────────────────┐                      │
-│       │   Arc<Protocol> (Thread-Safe)   │                      │
-│       │  - Request/Response Interface   │                      │
-│       │  - Storage Ownership            │                      │
-│       │  - Certificate Validation       │                      │
+│       │     Protocol (Request/Response) │                      │
+│       │  - Wraps Storage instance       │                      │
+│       │  - Certificate validation logic │                      │
+│       │  - Thread-safe via &self        │                      │
 │       └────────────┬────────────────────┘                      │
 │                    │                                           │
 │       ┌────────────▼────────────────┐                          │
-│       │   Storage (Owned by Protocol)│                         │
-│       │  - Transactional Operations  │                         │
-│       │  - Signature Verification    │                         │
-│       │  - Mutex<subject→height map> │                         │
+│       │   Storage (Created Once)    │                          │
+│       │  - Transactional Operations │                          │
+│       │  - Signature Verification   │                          │
+│       │  - Mutex<subject→height map>│                          │
 │       └────────────┬─────────────────┘                         │
 │                    │                                           │
 │       ┌────────────┴─────────────────────────────┐            │
@@ -100,27 +111,32 @@ On first run, the application automatically initializes the Root CA (height 0) i
 │  ┌────▼────────┐          ┌──────────▼─────────┐            │
 │  │ Certificate │          │  Private Key       │            │
 │  │ Blockchain  │          │  Blockchain        │            │
-│  │ (DER)       │          │  (SHA-256 Hashes)  │            │
+│  │ (DER)       │          │  (SHA-512 Hashes)  │            │
 │  │ RocksDB     │          │  + Signatures CF   │            │
-│  └─────────────┘          │  RocksDB           │            │
-│                           └────────────────────┘            │
+│  │ Encrypted   │          │  RocksDB           │            │
+│  │ w/ App Key  │          │  Encrypted w/ App  │            │
+│  └─────────────┘          └────────────────────┘            │
 │                                                              │
 │  ┌──────────────────────────────────────────────┐          │
 │  │     Encrypted Key Store (Filesystem)          │          │
 │  │  exports/keystore/ (configurable)             │          │
 │  │  - Root (h=0): PKCS#8 PEM + password          │          │
 │  │  - Others: RSA + AES-GCM-256 hybrid           │          │
-│  │    Format: [AES Len][Enc AES Key][Nonce]     │          │
-│  │            [Tag][Data Len][Encrypted Data]   │          │
+│  │    Format: [AES Len(u32)][Enc AES Key]       │          │
+│  │            [Nonce(12)][Tag(16)][Data Len]    │          │
+│  │            [Encrypted Data]                   │          │
+│  │    AES key encrypted with Root CA pub key    │          │
 │  └──────────────────────────────────────────────┘          │
 │                                                              │
 │  ┌──────────────────────────────────────────────┐          │
-│  │  Linux Kernel Keyring (In-Memory Keys)        │          │
-│  │  - App key loaded from PKCS#8 file            │          │
-│  │  - Root key for encryption/decryption         │          │
+│  │  In-Memory Key Storage (Runtime)              │          │
+│  │  - App key: Encrypts blockchain databases     │          │
+│  │  - Root key: Encrypts other private keys      │          │
+│  │  - Loaded once at startup                     │          │
+│  │  - Zeroized on drop for security              │          │
 │  └──────────────────────────────────────────────┘          │
 │                                                              │
-│  Configuration: config.toml (paths, keyring settings)       │
+│  Configuration: config.toml (paths, storage settings)       │
 └──────────────────────────────────────────────────────────────┘
 ```
 
@@ -157,7 +173,7 @@ cargo build --release
 ./target/release/pki-chain
 ```
 
-**Important**: The `key/pki-chain-app.key` file is the master key loaded into the Linux kernel keyring for secure operations. The Root CA private key stored in the keyring is used to encrypt/decrypt other private keys. **Keep it secure and backed up**. Loss of this key means permanent loss of access to stored certificates.
+**Important**: The `key/pki-chain-app.key` file is the master key loaded into memory for encrypting blockchain databases. The Root CA private key (stored in memory after first decryption) is used to encrypt/decrypt other private keys. Both keys are zeroized on drop for security. **Keep the app key file secure and backed up**. Loss of the app key means permanent loss of access to blockchain data; loss of the Root CA key file means permanent loss of access to encrypted private keys.
 
 ## Usage
 
@@ -341,7 +357,7 @@ pki-chain/
 │   ├── main.rs                      # Application entry point
 │   ├── ui.rs                        # Terminal user interface (TUI)
 │   ├── protocol.rs                  # Protocol layer (owns Storage, Request/Response interface)
-│   ├── storage.rs                   # Blockchain storage abstraction with keyring integration
+│   ├── storage.rs                   # Blockchain storage abstraction with in-memory keys
 │   ├── pki_generator.rs             # Unified certificate generation for all types
 │   ├── private_key_storage.rs       # Encrypted key store (PKCS#8 + hybrid encryption)
 │   └── configs.rs                   # TOML configuration parsing
@@ -383,7 +399,7 @@ Key dependencies and their purposes:
 
 ### Best Practices
 
-1. **Protect the Application Key**: The `key/pki-chain-app.key` file is loaded into the kernel keyring. Store it securely and back it up.
+1. **Protect the Application Key**: The `key/pki-chain-app.key` file is loaded into memory and zeroized on drop. Store the file securely and back it up.
 
 2. **Root CA Private Key**: The Root CA private key is stored as password-protected PKCS#8 in `exports/keystore/root_private_key.pkcs8`. This password is required on every startup. Store the password securely (e.g., password manager).
 

@@ -50,9 +50,7 @@
 #![warn(clippy::unwrap_used)]
 #![warn(clippy::indexing_slicing)]
 
-use anyhow::anyhow;
 use anyhow::{Context, Result};
-use keyutils::Keyring;
 use libblockchain::blockchain::BlockChain;
 use openssl::pkey::PKey;
 use std::io::Write;
@@ -60,7 +58,7 @@ use std::io::Write;
 use crate::configs::AppConfig;
 use crate::pki_generator::{generate_root_ca, CertificateData};
 use crate::private_key_storage::EncryptedKeyStore;
-
+/// Default Common Name for the Root CA certificate
 pub const ROOT_CA_SUBJECT_COMMON_NAME: &str = "MenaceLabs Root CA";
 
 /// Storage abstraction for PKI certificate and private key blockchain management.
@@ -92,8 +90,6 @@ pub struct Storage {
     pub subject_name_to_height: std::sync::Mutex<std::collections::HashMap<String, u64>>,
     /// Encrypted key store for private keys
     pub encrypted_key_store: EncryptedKeyStore,
-    /// Keyring for private keys in use
-    pub process_keyring: Keyring,
 }
 
 impl Storage {
@@ -132,82 +128,59 @@ impl Storage {
     ///
     /// let config = AppConfig::load()?;
     /// let storage = Storage::new(config)?;
-    /// // Populate subject_name_to_height from blockchain
-    /// for (height, block_result) in storage.certificate_chain.iter().enumerate() {
-    ///     if let Ok(block) = block_result {
-    ///         if let Ok(cert) = openssl::x509::X509::from_der(&block.block_data) {
-    ///             let subject_name = /* extract from cert */;
-    ///             storage.subject_name_to_height.lock().unwrap().insert(subject_name, height as u64);
-    /// #           break; // for doc test
-    ///         }
-    ///     }
-    /// }
+    ///
+    /// // Populate the subject name index
+    /// storage.populate_subject_name_index()?;
     /// # Ok::<(), anyhow::Error>(())
     /// ```
     pub fn new(default_config: AppConfig) -> Result<Self> {
-        let mut proc_keyring = Keyring::attach(keyutils::SpecialKeyring::Process)
-            .map_err(|e| anyhow!("Keyring error: {}", e))?;
-        proc_keyring
-            .add_key::<keyutils::keytypes::User, _, _>(
-                default_config.app_keyring.app_key_name,
-                (|| -> Result<Vec<u8>> {
-                    let private_key = (|| -> Result<PKey<openssl::pkey::Private>> {
-                        let pem_data =
-                            std::fs::read(default_config.app_keyring.app_key_path.clone())
-                                .with_context(|| {
-                                    format!(
-                                        "Failed to read private key from {}",
-                                        default_config
-                                            .app_keyring
-                                            .app_key_path
-                                            .clone()
-                                            .to_str()
-                                            .unwrap_or("unknown path")
-                                    )
-                                })?;
-                        print!("Enter password for App Key (press Enter if none): ");
-                        std::io::stdout().flush()?;
-                        let pwd = rpassword::read_password()?;
+        let app_key = (|| -> Result<PKey<openssl::pkey::Private>> {
+            let pem_data = std::fs::read(&default_config.key_exports.app_key_path.clone())
+                .with_context(|| {
+                    format!(
+                        "Failed to read private key from {}",
+                        default_config
+                            .key_exports
+                            .app_key_path
+                            .clone()
+                            .to_str()
+                            .unwrap_or("unknown path")
+                    )
+                })?;
+            print!("Enter password for App Key (press Enter if none): ");
+            std::io::stdout().flush()?;
+            let pwd = rpassword::read_password()?;
 
-                        let key = if !pwd.is_empty() {
-                            PKey::private_key_from_pem_passphrase(&pem_data, pwd.as_bytes())
-                                .context("Failed to decrypt private key with password")?
-                        } else {
-                            PKey::private_key_from_pem(&pem_data)
-                                .context("Failed to parse private key PEM")?
-                        };
+            let key = if !pwd.is_empty() {
+                PKey::private_key_from_pem_passphrase(&pem_data, pwd.as_bytes())
+                    .context("Failed to decrypt private key with password")?
+            } else {
+                PKey::private_key_from_pem(&pem_data).context("Failed to parse private key PEM")?
+            };
 
-                        Ok(key)
-                    })()?;
-                    Ok(private_key.private_key_to_der()?)
-                })()?,
-            )
-            .map_err(|e| anyhow!("Failed to add app key to keyring: {}", e))?;
+            Ok(key)
+        })()?;
+
+        // Blockhains use the App Key from the process keyring
         let private_chain = BlockChain::new(
             default_config.blockchains.private_key_path.as_path(),
-            proc_keyring.clone(),
-            default_config.app_keyring.root_key_name.clone(),
+            app_key.clone(),
         )
         .context("Failed to initialize Private Key blockchain")?;
         let certificate_chain = BlockChain::new(
             default_config.blockchains.certificate_path.as_path(),
-            proc_keyring.clone(),
-            default_config.app_keyring.root_key_name.clone(),
+            app_key.clone(),
         )
         .context("Failed to initialize Certificate blockchain")?;
-        let encrypted_key_store = EncryptedKeyStore::new(
-            default_config.key_exports.directory.as_path().to_path_buf(),
-            proc_keyring.clone(),
-            default_config.app_keyring.root_key_name.clone(),
-        )
-        .context("Failed to initialize Encrypted Key Store")?;
+        // Private key encrypted store uses the Root CA key from the process keyring
+        let encrypted_key_store = EncryptedKeyStore::new(default_config.clone())
+            .context("Failed to initialize Encrypted Key Store")?;
         Ok(Storage {
             // Initialize blockchain storage for certificates and private keys
             certificate_chain,
             private_chain,
             subject_name_to_height: std::sync::Mutex::new(std::collections::HashMap::new()),
             encrypted_key_store,
-            process_keyring: proc_keyring,
         })
     }
 
@@ -380,8 +353,8 @@ impl Storage {
     /// # use openssl::rsa::Rsa;
     /// # use openssl::pkey::PKey;
     /// # use openssl::x509::X509;
-    /// # fn example(storage: &Storage, key: &PKey<openssl::pkey::Private>, cert: &X509) -> anyhow::Result<()> {
-    /// let height = storage.store_key_certificate(&key, &cert)?;
+    /// # fn example(storage: &Storage, key: PKey<openssl::pkey::Private>, cert: X509) -> anyhow::Result<()> {
+    /// let height = storage.store_key_certificate(key, cert)?;
     /// println!("Stored at height: {}", height);
     /// # Ok(())
     /// # }
@@ -569,7 +542,7 @@ impl Storage {
     /// ```no_run
     /// # use pki_chain::storage::Storage;
     /// # fn example(storage: &Storage) -> anyhow::Result<()> {
-    /// if storage.validate()? {
+    /// if storage.validate_certificates()? {
     ///     println!("Blockchain integrity verified");
     /// } else {
     ///     println!("Validation failed - possible tampering detected");

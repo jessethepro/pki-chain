@@ -7,17 +7,18 @@
 //! # Features
 //!
 //! - **Terminal User Interface**: Cursive-based TUI for certificate management
-//! - **Configuration System**: TOML-based configuration for paths and keyring settings
+//! - **Configuration System**: TOML-based configuration for paths and storage settings
 //! - **Hybrid Storage Architecture**:
 //!   - Certificates stored as DER in blockchain
-//!   - Private keys stored as encrypted PKCS#8 PEM files
-//!   - Key chain stores SHA-256 hashes and certificate signatures
-//! - **Keyring Integration**: Linux kernel keyring for secure key management
+//!   - Private keys encrypted with RSA + AES-GCM-256 hybrid encryption
+//!   - Key chain stores SHA-512 hashes and certificate signatures
+//! - **In-Memory Key Storage**: Secure runtime key management with zeroize on drop
+//! - **Single Storage Instance**: Storage created once in main and passed to UI layer
 //! - **Interactive Certificate Creation**: Form-based Intermediate CA and User certificate creation with validation
 //! - **Three-Tier PKI**: Root CA, Intermediate CAs, and User certificates
 //! - **4096-bit RSA**: Strong cryptographic keys with SHA-256 signatures
 //! - **Transactional Safety**: Automatic rollback on storage failures
-//! - **Thread-Safe Operations**: Concurrent access support via Protocol layer
+//! - **Protocol Layer**: Clean abstraction with Request/Response pattern
 //!
 //! # Quick Start
 //!
@@ -64,17 +65,25 @@
 //! ## Storage Layout
 //!
 //! - **Certificate Blockchain** (configurable via config.toml, default: `data/certificates/`):
-//!   Stores X.509 certificates in DER format
+//!   Stores X.509 certificates in DER format, encrypted with app key from memory
 //! - **Private Key Blockchain** (configurable via config.toml, default: `data/private_keys/`):
-//!   Stores SHA-512 hashes of private keys with signatures column family
+//!   Stores SHA-512 hashes of private keys with signatures column family, encrypted with app key
 //! - **Encrypted Key Store** (configurable via config.toml, default: `exports/keystore/`):
 //!   - Root CA private key: PKCS#8 PEM encrypted format with password protection
 //!   - Other private keys: RSA + AES-GCM-256 hybrid encryption format
-//!     - Format: `[AES Key Len (u64)][Encrypted AES Key][Nonce][Tag][Data Length (usize)][Encrypted Data]`
-//!     - AES session key encrypted with Root CA public key
+//!     - Format: `[AES Key Len (u32)][Encrypted AES Key][Nonce(12)][Tag(16)][Data Len (u32)][Encrypted Data]`
+//!     - AES session key encrypted with Root CA public key (RSA-OAEP)
 //!     - Private key data encrypted with AES-GCM-256
 //!
 //! User-created certificates (Intermediate CAs and User certificates) are stored at heights 1 and above.
+//!
+//! ## Initialization Flow
+//!
+//! 1. Load configuration from config.toml
+//! 2. Create single Storage instance (prompts for app key password)
+//! 3. Initialize Root CA if storage is empty
+//! 4. Populate subject name index from blockchain
+//! 5. Pass Storage to UI layer (no duplication)
 
 mod ui;
 
@@ -93,8 +102,12 @@ fn main() -> Result<()> {
             .context("Failed to initialize PKI storage")?;
     }
 
+    storage
+        .populate_subject_name_index()
+        .context("Failed to populate subject name index")?;
+
     // Run the TUI
-    ui::run_ui();
+    ui::run_ui(storage);
 
     Ok(())
 }

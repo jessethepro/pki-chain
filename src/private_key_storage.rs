@@ -58,10 +58,10 @@
 //! # }
 //! ```
 
+use crate::configs::AppConfig;
 use anyhow::anyhow;
 use anyhow::Context;
 use anyhow::Result;
-use keyutils::Keyring;
 use openssl::pkey::{PKey, Private};
 use openssl::rsa::Padding;
 use openssl::symm::Cipher;
@@ -92,9 +92,7 @@ pub const DATA_LEN_SIZE: usize = 4; // u32 for block length
 /// * `proc_keyring` - Linux kernel keyring for secure in-memory key access
 /// * `root_key_name` - Name of the root key in the keyring (used for encryption/decryption)
 pub struct EncryptedKeyStore {
-    directory: PathBuf,
-    proc_keyring: Keyring,
-    root_key_name: String,
+    app_configs: AppConfig,
 }
 
 impl EncryptedKeyStore {
@@ -129,15 +127,12 @@ impl EncryptedKeyStore {
     /// # Ok(())
     /// # }
     /// ```
-    pub fn new(export_path: PathBuf, proc_keyring: Keyring, root_key_name: String) -> Result<Self> {
+    pub fn new(app_configs: AppConfig) -> Result<Self> {
         // Create directory
-        fs::create_dir_all(&export_path).context("Failed to create key store directory")?;
+        fs::create_dir_all(&app_configs.key_exports.key_export_directory_path)
+            .context("Failed to create key store directory")?;
 
-        Ok(Self {
-            directory: export_path,
-            proc_keyring,
-            root_key_name,
-        })
+        Ok(Self { app_configs })
     }
 
     /// Store a private key with encryption appropriate for its height
@@ -227,8 +222,12 @@ impl EncryptedKeyStore {
                             anyhow!("Failed to convert private key to encrypted PKCS#8: {}", e)
                         })?
                 };
-                let filename = "root_private_key.pkcs8".to_string();
-                let path = self.directory.join(&filename);
+                let filename = self.app_configs.key_exports.root_key_name.clone();
+                let path = self
+                    .app_configs
+                    .key_exports
+                    .key_export_directory_path
+                    .join(&filename);
                 fs::write(&path, &pkcs8_bytes).context("Failed to write Root Key PKCS#8 file")?;
                 return Ok(path);
             }
@@ -291,7 +290,11 @@ impl EncryptedKeyStore {
             "{}.key.enc",
             key_height.to_string().replace("/", "_").replace(" ", "_")
         );
-        let path = self.directory.join(&filename);
+        let path = self
+            .app_configs
+            .key_exports
+            .key_export_directory_path
+            .join(&filename);
 
         // Remove existing file if it exists
         if path.exists() {
@@ -367,11 +370,54 @@ impl EncryptedKeyStore {
     /// # }
     /// ```
     pub fn retrieve_key(&self, key_height: u64) -> Result<PKey<Private>> {
+        match key_height {
+            0 => {
+                let filename = self.app_configs.key_exports.root_key_name.clone();
+                let path = self
+                    .app_configs
+                    .key_exports
+                    .key_export_directory_path
+                    .join(&filename);
+                let encrypted_root_key = fs::read(&path).with_context(|| {
+                    format!(
+                        "Failed to read Root CA private key from {}",
+                        path.to_str().unwrap_or("<invalid path>")
+                    )
+                })?;
+                print!("Enter password for Root CA private key (press Enter if none): ");
+                std::io::stdout().flush()?;
+                let passwd = rpassword::read_password()?;
+                let root_key = if passwd.is_empty() {
+                    PKey::private_key_from_pkcs8(&encrypted_root_key).map_err(|e| {
+                        anyhow!(
+                            "Failed to parse Root CA private key PEM from {}: {}",
+                            path.to_str().unwrap_or("<invalid path>"),
+                            e
+                        )
+                    })?
+                } else {
+                    PKey::private_key_from_pkcs8_passphrase(&encrypted_root_key, passwd.as_bytes())
+                        .map_err(|e| {
+                            anyhow!(
+                                "Failed to decrypt Root CA private key from {}: {}",
+                                path.to_str().unwrap_or("<invalid path>"),
+                                e
+                            )
+                        })?
+                };
+                return Ok(root_key);
+            }
+            _ => {}
+        }
         let filename = format!(
             "{}.key.enc",
             key_height.to_string().replace("/", "_").replace(" ", "_")
         );
-        let path = self.directory.join(&filename);
+        let path = self
+            .app_configs
+            .key_exports
+            .key_export_directory_path
+            .join(&filename);
 
         let encrypted_file_data = fs::read(&path).context("Failed to read encrypted key")?;
 
@@ -412,16 +458,51 @@ impl EncryptedKeyStore {
         let decrypted_file_data = {
             // Decrypt AES key with RSA-OAEP
             let aes_key = (|| -> Result<Vec<u8>> {
-                let root_key = self
-                    .proc_keyring
-                    .search_for_key::<keyutils::keytypes::user::User, _, _>(
-                        self.root_key_name.as_str(),
-                        None,
-                    )
-                    .map_err(|e| anyhow!("Failed to find private key in keyring: {}", e))?;
-                let root_key_der = root_key
-                    .read()
-                    .map_err(|e| anyhow!("Failed to read private key data: {}", e))?;
+                let root_key_der = (|| -> Result<Vec<u8>> {
+                    let root_path = self
+                        .app_configs
+                        .key_exports
+                        .key_export_directory_path
+                        .join(&self.app_configs.key_exports.root_key_name);
+                    let encrypted_pem_data = fs::read(&root_path).with_context(|| {
+                        format!(
+                            "Failed to read Root CA private key from {}",
+                            root_path.to_str().unwrap_or("<invalid path>")
+                        )
+                    })?;
+                    let passwd = rpassword::prompt_password(
+                        "Enter password for Root CA private key (press Enter if none): ",
+                    )?;
+                    let pem_data = if passwd.is_empty() {
+                        encrypted_pem_data
+                    } else {
+                        PKey::private_key_from_pkcs8_passphrase(
+                            &encrypted_pem_data,
+                            passwd.as_bytes(),
+                        )
+                        .map_err(|e| {
+                            anyhow!(
+                                "Failed to decrypt Root CA private key from {}: {}",
+                                root_path.to_str().unwrap_or("<invalid path>"),
+                                e
+                            )
+                        })?
+                        .private_key_to_der()
+                        .map_err(|e| {
+                            anyhow!("Failed to convert Root CA private key to PEM: {}", e)
+                        })?
+                    };
+                    let root_key = PKey::private_key_from_pem(&pem_data).map_err(|e| {
+                        anyhow!(
+                            "Failed to parse Root CA private key PEM from {}: {}",
+                            root_path.to_str().unwrap_or("<invalid path>"),
+                            e
+                        )
+                    })?;
+                    Ok(root_key.private_key_to_der().map_err(|e| {
+                        anyhow!("Failed to convert Root CA private key to DER: {}", e)
+                    })?)
+                })()?;
                 let root_private_key = PKey::private_key_from_der(root_key_der.as_slice())
                     .map_err(|e| anyhow!("Failed to parse private key DER: {}", e))?;
                 let rsa = root_private_key
@@ -494,7 +575,11 @@ impl EncryptedKeyStore {
             "{}.key.enc",
             key_height.to_string().replace("/", "_").replace(" ", "_")
         );
-        let path = self.directory.join(&filename);
+        let path = self
+            .app_configs
+            .key_exports
+            .key_export_directory_path
+            .join(&filename);
         fs::remove_file(&path).context("Failed to delete key")?;
         Ok(())
     }
@@ -529,7 +614,7 @@ impl EncryptedKeyStore {
     /// ```
     pub fn list_keys(&self) -> Result<Vec<String>> {
         let mut keys = Vec::new();
-        for entry in fs::read_dir(&self.directory)? {
+        for entry in fs::read_dir(&self.app_configs.key_exports.key_export_directory_path)? {
             let entry = entry?;
             let path = entry.path();
             if let Some(name) = path.file_name() {

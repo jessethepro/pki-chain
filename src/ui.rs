@@ -58,16 +58,9 @@ use pki_chain::pki_generator::{CertificateData, CertificateDataType};
 use pki_chain::protocol::{Protocol, Request, Response};
 use pki_chain::storage::Storage;
 use pki_chain::storage::ROOT_CA_SUBJECT_COMMON_NAME;
-use std::sync::Arc;
 
 /// Initialize and run the TUI application
-pub fn run_ui() {
-    let default_configs =
-        pki_chain::configs::AppConfig::load().expect("Failed to load default configurations");
-    let storage = Storage::new(default_configs.clone()).expect("Failed to initialize storage");
-    storage
-        .populate_subject_name_index()
-        .expect("Failed to populate subject name index");
+pub fn run_ui(storage: Storage) {
     let protocol = Protocol::new(storage);
 
     let mut siv = Cursive::default();
@@ -111,8 +104,8 @@ fn build_main_menu(siv: &mut Cursive) {
 }
 
 fn show_validation(siv: &mut Cursive) {
-    let protocol = match siv.user_data::<Arc<Protocol>>() {
-        Some(p) => Arc::clone(p),
+    let protocol = match siv.user_data::<Protocol>() {
+        Some(p) => p,
         None => {
             show_error(siv, "Failed to access protocol");
             return;
@@ -136,8 +129,8 @@ fn show_validation(siv: &mut Cursive) {
 }
 
 fn show_system_status(siv: &mut Cursive) {
-    let protocol = match siv.user_data::<Arc<Protocol>>() {
-        Some(p) => Arc::clone(p),
+    let protocol = match siv.user_data::<Protocol>() {
+        Some(p) => p,
         None => {
             show_error(siv, "Failed to access protocol");
             return;
@@ -262,30 +255,36 @@ fn handle_create_intermediate(siv: &mut Cursive) {
         }
     };
 
-    // Get protocol
-    let protocol = match siv.user_data::<Arc<Protocol>>() {
-        Some(p) => Arc::clone(p),
-        None => {
-            show_error(siv, "Failed to access protocol");
-            return;
-        }
-    };
+    // Get protocol and clone data before mutably borrowing siv
+    let (cn_copy, org_copy, ou_copy, locality_copy, state_copy, country_copy) = (
+        cn.clone(),
+        org.clone(),
+        ou.clone(),
+        locality.clone(),
+        state.clone(),
+        country.clone(),
+    );
+
+    let result = siv.user_data::<Protocol>().and_then(|protocol| {
+        create_intermediate_certificate(
+            protocol,
+            cn_copy,
+            org_copy,
+            ou_copy,
+            locality_copy,
+            state_copy,
+            country_copy,
+            validity_days,
+        )
+        .ok()
+    });
 
     // Close the form dialog
     siv.pop_layer();
 
-    // Create the certificate
-    match create_intermediate_certificate(
-        &protocol,
-        cn.clone(),
-        org,
-        ou,
-        locality,
-        state,
-        country,
-        validity_days,
-    ) {
-        Ok(height) => {
+    // Show result
+    match result {
+        Some(height) => {
             siv.add_layer(
                 Dialog::text(format!(
                     "✓ Intermediate CA Created Successfully!\n\n\
@@ -300,8 +299,8 @@ fn handle_create_intermediate(siv: &mut Cursive) {
                 }),
             );
         }
-        Err(e) => {
-            show_error(siv, &format!("Failed to create certificate: {}", e));
+        None => {
+            show_error(siv, "Failed to create certificate or access protocol");
         }
     }
 }
@@ -405,8 +404,8 @@ fn get_system_status(protocol: &Protocol) -> Result<String> {
 }
 
 fn show_create_user_form(siv: &mut Cursive) {
-    let protocol = match siv.user_data::<Arc<Protocol>>() {
-        Some(p) => Arc::clone(p),
+    let protocol = match siv.user_data::<Protocol>() {
+        Some(p) => p,
         None => {
             show_error(siv, "Failed to access protocol");
             return;
@@ -586,31 +585,38 @@ fn handle_create_user(siv: &mut Cursive) {
         }
     };
 
-    // Get protocol
-    let protocol = match siv.user_data::<Arc<Protocol>>() {
-        Some(p) => Arc::clone(p),
-        None => {
-            show_error(siv, "Failed to access protocol");
-            return;
-        }
-    };
+    // Get protocol and clone data before mutably borrowing siv
+    let (issuer_cn_copy, cn_copy, org_copy, ou_copy, locality_copy, state_copy, country_copy) = (
+        issuer_cn.clone(),
+        cn.clone(),
+        org.clone(),
+        ou.clone(),
+        locality.clone(),
+        state.clone(),
+        country.clone(),
+    );
+
+    let result = siv.user_data::<Protocol>().and_then(|protocol| {
+        create_user_certificate(
+            protocol,
+            issuer_cn_copy.clone(),
+            cn_copy,
+            org_copy,
+            ou_copy,
+            locality_copy,
+            state_copy,
+            country_copy,
+            validity_days,
+        )
+        .ok()
+    });
 
     // Close the form dialog
     siv.pop_layer();
 
-    // Create the user certificate
-    match create_user_certificate(
-        &protocol,
-        issuer_cn.clone(),
-        cn.clone(),
-        org,
-        ou,
-        locality,
-        state,
-        country,
-        validity_days,
-    ) {
-        Ok(height) => {
+    // Show result
+    match result {
+        Some(height) => {
             siv.add_layer(
                 Dialog::text(format!(
                     "✓ User Certificate Created Successfully!\n\n\
@@ -626,8 +632,8 @@ fn handle_create_user(siv: &mut Cursive) {
                 }),
             );
         }
-        Err(e) => {
-            show_error(siv, &format!("Failed to create user certificate: {}", e));
+        None => {
+            show_error(siv, "Failed to create user certificate or access protocol");
         }
     }
 }
