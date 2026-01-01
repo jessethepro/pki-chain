@@ -6,14 +6,13 @@
 //!
 //! # Features
 //!
-//! - **Terminal User Interface**: Cursive-based TUI for certificate management
 //! - **Configuration System**: TOML-based configuration for paths and storage settings
 //! - **Hybrid Storage Architecture**:
 //!   - Certificates stored as DER in blockchain
 //!   - Private keys encrypted with RSA + AES-GCM-256 hybrid encryption
 //!   - Key chain stores SHA-512 hashes and certificate signatures
 //! - **In-Memory Key Storage**: Secure runtime key management with zeroize on drop
-//! - **Single Storage Instance**: Storage created once in main and passed to UI layer
+//! - **Single Storage Instance**: Storage created once in main and passed to webserver
 //! - **Interactive Certificate Creation**: Form-based Intermediate CA and User certificate creation with validation
 //! - **Three-Tier PKI**: Root CA, Intermediate CAs, and User certificates
 //! - **4096-bit RSA**: Strong cryptographic keys with SHA-256 signatures
@@ -35,7 +34,6 @@
 //!
 //! The system consists of several key modules:
 //!
-//! - [`ui`]: Terminal user interface built with cursive for certificate management
 //! - [`storage`]: Blockchain storage abstraction for certificates and keys
 //! - [`protocol`]: Protocol layer that handles certificate operations and validation
 //! - [`pki_generator`]: Certificate generation functions for all certificate types
@@ -83,12 +81,11 @@
 //! 2. Create single Storage instance (prompts for app key password)
 //! 3. Initialize Root CA if storage is empty
 //! 4. Populate subject name index from blockchain
-//! 5. Pass Storage to UI layer (no duplication)
-
-mod ui;
+//! 5. Start webserver with Storage instance
 
 use anyhow::{Context, Result};
 use pki_chain::storage::Storage;
+use pki_chain::webserver;
 
 fn main() -> Result<()> {
     let default_configs =
@@ -106,8 +103,9 @@ fn main() -> Result<()> {
         .populate_subject_name_index()
         .context("Failed to populate subject name index")?;
 
-    // Run the TUI
-    ui::run_ui(storage);
+    // Start the Web Server (this will block)
+    println!("Starting PKI Chain web server...\n");
+    webserver::start_webserver(default_configs, storage);
 
     Ok(())
 }

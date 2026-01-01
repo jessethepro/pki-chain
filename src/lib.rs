@@ -23,7 +23,7 @@
 //!
 //! # Features
 //!
-//! - � **Terminal User Interface**: Cursive-based TUI for interactive certificate management
+//! - 🌐 **HTTPS Web Server**: Secure web interface with REST API (Axum + Tokio)
 //! - 🔐 **Hybrid Storage**:
 //!   - Certificates in blockchain (DER format)
 //!   - Private keys in AES-256-GCM encrypted files (enables offline/cold storage)
@@ -42,9 +42,15 @@
 //! # Generate application key (first run)
 //! ./generate_app_keypair.sh
 //!
+//! # Generate TLS certificates for web server (first run)
+//! ./generate-certs.sh
+//!
 //! # Build and run
 //! cargo build --release
 //! ./target/release/pki-chain
+//!
+//! # Access web interface at https://localhost:3000
+//! # REST API endpoint: GET /api/status
 //! ```
 //!
 //! ## As a Library
@@ -111,23 +117,56 @@
 //!
 //! ## Key Management
 //!
-//! - **Application Key**: Master encryption key for blockchain databases. Must be kept secure.
-//! - **Root CA Key**: Should be moved to offline/air-gapped storage after generation.
-//! - **Intermediate CA Keys**: Can remain online for certificate issuance.
+//! - **Application Key**: Password-protected PKCS#8 file for blockchain database encryption. Stored at `key/pki-chain-app.key`.
+//! - **Root CA Key**: Password-protected PKCS#8 file for encrypting other private keys. Stored at `exports/keystore/root_private_key.pkcs8`.
+//! - **Other Private Keys**: Encrypted with RSA+AES-GCM-256 hybrid encryption using Root CA public key. Stored in `exports/keystore/{height}.key.enc`.
 //!
 //! ## Threat Model
+//!
+//! ### Application Key Compromise
+//!
+//! **Exposure**: Application key compromise grants access to:
+//! - ✅ **Public certificates** (X.509 certificates in DER format)
+//! - ✅ **Certificate chain structure** (blockchain heights and relationships)
+//! - ✅ **Private key hashes** (SHA-512 hashes for integrity verification)
+//! - ✅ **Certificate signatures** (used for pairing verification)
+//!
+//! **Protection**: Private keys remain encrypted by Root CA private key:
+//! - ❌ **Private keys are NOT exposed** - encrypted with Root CA public key (RSA-OAEP + AES-GCM-256)
+//! - 🔒 Private keys stored in `exports/keystore/` are double-encrypted
+//! - 🔐 Root CA key compromise is required to decrypt private keys
+//!
+//! ### Read-Only Mode
+//!
+//! When private key generation is not required, the encrypted keystore can be unloaded from the system:
+//! - **Available**: Certificate verification, chain validation, blockchain queries
+//! - **Unavailable**: Certificate generation, key pair creation
+//! - **Use Case**: Auditing, verification-only deployments, cold storage scenarios
+//!
+//! ### Key Protection Strategy
+//!
+//! Both App Key and Root Key are password-protected PKCS#8 files:
+//! - 🔑 **App Key**: Protects blockchain data (certificates, hashes, signatures)
+//! - 🔑 **Root Key**: Protects private key material (actual cryptographic keys)
+//! - 🔐 **Defense in Depth**: Compromise of one key does not expose private keys
+//! - 💾 **Offline Storage**: Root CA key can be kept on air-gapped media after initial setup
+//! - 🔄 **Key Rotation**: Blockchain immutability means app key cannot be rotated without migration
+//!
+//! ### Additional Protections
 //!
 //! - ✅ Tamper detection through blockchain validation
 //! - ✅ Rollback protection via transactional operations
 //! - ✅ Signature verification between certificate and key pairs
-//! - ⚠️ No network-based access control (Unix socket is local-only)
-//! - ⚠️ Application key compromise grants full database access
+//! - ✅ In-memory keys zeroized on drop (secrecy + zeroize crates)
+//! - ⚠️ No network-based access control (local filesystem access only)
 //!
 pub mod configs;
+pub mod key_archive;
 pub mod pki_generator;
 pub mod private_key_storage;
 pub mod protocol;
 pub mod storage;
+pub mod webserver;
 // Public API - only expose Request/Response enums, socket path, and protocol functions
 pub use pki_generator::{CertificateData, CertificateDataType};
 pub use protocol::{Request, Response};

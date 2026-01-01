@@ -1,6 +1,6 @@
 # PKI Chain
 
-**A production-ready blockchain-backed Public Key Infrastructure (PKI) certificate authority system with an interactive terminal UI.**
+**A production-ready blockchain-backed Public Key Infrastructure (PKI) certificate authority system with HTTPS web interface.**
 
 Built in Rust with enterprise-grade cryptography, PKI Chain provides a complete three-tier CA hierarchy (Root CA → Intermediate CA → User Certificates) with hybrid storage: certificates in blockchain (DER format), private keys in encrypted files (PKCS#8 for Root CA, RSA+AES-GCM-256 hybrid encryption for others), and SHA-512 integrity hashes in blockchain via [libblockchain](https://github.com/jessethepro/libblockchain). Features TOML-based configuration and in-memory key management.
 
@@ -9,7 +9,7 @@ Built in Rust with enterprise-grade cryptography, PKI Chain provides a complete 
 
 ## Highlights
 
-✨ **Interactive TUI** - Manage certificates through a modern terminal interface  
+✨ **HTTPS Web Interface** - Manage certificates through secure web interface  
 🔐 **Hybrid Storage** - Certificates in blockchain (DER), keys encrypted with AES-256-GCM  
 🏗️ **Complete PKI** - Root CA, Intermediate CAs, and User certificates  
 🔒 **RSA-4096** - Industry-standard cryptography with SHA-256 signatures  
@@ -17,8 +17,7 @@ Built in Rust with enterprise-grade cryptography, PKI Chain provides a complete 
 
 ## Features
 
-- � **Terminal User Interface**: Modern cursive-based TUI for interactive certificate management
-- 📝 **Interactive Forms**: Create both Intermediate CA and User certificates with form-based input and validation
+- 🌐 **HTTPS Web Server**: Secure web interface for certificate management with REST API
 - ⚙️ **Configuration Management**: TOML-based configuration for paths and storage settings
 - 🔐 **Hybrid Storage Architecture**: 
   - Certificates stored as DER in blockchain (encrypted with app key)
@@ -26,7 +25,6 @@ Built in Rust with enterprise-grade cryptography, PKI Chain provides a complete 
   - Other keys: RSA + AES-GCM-256 hybrid encryption (AES key encrypted with Root CA public key via RSA-OAEP)
   - SHA-512 hashes and signatures in key blockchain (encrypted with app key)
 - 🔑 **In-Memory Key Management**: Secure runtime key storage with zeroize on drop
-- 🎯 **Single Storage Instance**: Created once in main, passed to UI layer to prevent database lock conflicts
 - 🔗 **Three-Tier PKI Hierarchy**: Complete CA chain (Root → Intermediate → User)
 - 🔒 **Strong Cryptography**: 4096-bit RSA keys with SHA-256 signatures
 - 🔄 **Transactional Safety**: Automatic rollback on storage failures
@@ -34,7 +32,7 @@ Built in Rust with enterprise-grade cryptography, PKI Chain provides a complete 
 - 🎯 **Height-Based Indexing**: O(1) certificate lookups with thread-safe Mutex-protected HashMap
 - 🧵 **Clean Architecture**: Protocol layer wraps Storage with Request/Response pattern
 - 📊 **Real-Time Status**: View blockchain statistics and certificate inventory
-- 🏗️ **No Arc Overhead**: Direct Protocol ownership in UI, efficient borrow checking
+
 
 ## Quick Start
 
@@ -49,15 +47,16 @@ cd pki-chain
 # 3. Build the application
 cargo build --release
 
-# 4. Run the TUI
+# 4. Generate TLS certificates for web server
+./generate-certs.sh
+
+# 5. Run the web server
 ./target/release/pki-chain
 ```
 
-On first run, the application automatically initializes the Root CA (height 0) in the blockchain. Use the interactive menu to:
-- Create new Intermediate CA certificates (height 1+)
-- Create User certificates signed by any Intermediate CA
-- Validate blockchain integrity
-- View system status and statistics
+On first run, the application automatically initializes the Root CA (height 0) in the blockchain. Access the web interface at `https://localhost:3000` to:
+- View PKI system status and statistics
+- Manage certificates via REST API
 
 ## Architecture
 
@@ -74,22 +73,19 @@ On first run, the application automatically initializes the Root CA (height 0) i
 │  │     • Opens RocksDB blockchains (once)                 │  │
 │  │  3. Initialize Root CA if empty                        │  │
 │  │  4. Populate subject name index                        │  │
-│  │  5. Pass Storage to ui::run_ui()                       │  │
+│  │  5. Start webserver::start_webserver()                │  │
 │  └────────────────────┬───────────────────────────────────┘  │
 │                       │                                       │
 │  ┌────────────────────▼───────────────────────────────────┐  │
-│  │           Cursive Terminal UI (Main Thread)            │  │
+│  │          HTTPS Web Server (Axum + Tokio)               │  │
 │  │  ┌──────────────────────────────────────────────────┐  │  │
-│  │  │  Main Menu                                       │  │  │
-│  │  │  1. Create Intermediate Certificate              │  │  │
-│  │  │  2. Create User Certificate                      │  │  │
-│  │  │  3. Validate Blockchain                          │  │  │
-│  │  │  4. View System Status                           │  │  │
-│  │  │  5. Exit                                         │  │  │
+│  │  │  Static Files: web_root/                        │  │  │
+│  │  │  REST API: /api/status                           │  │  │
+│  │  │  TLS: web_certs/server/                          │  │  │
+│  │  │  Port: 3000                                      │  │  │
 │  │  └──────────────────────────────────────────────────┘  │  │
 │  │                                                          │  │
-│  │  Forms: EditView, SelectView, LinearLayout, Dialog      │  │
-│  │  Validation: Required fields, Country code, Duplicates  │  │
+│  │  Arc<Protocol> for async handler sharing                │  │
 │  └─────────────────────┬────────────────────────────────────┘  │
 │                        │                                       │
 │       ┌────────────────▼────────────────┐                      │
@@ -166,10 +162,13 @@ cd pki-chain
 # Generate application encryption key (FIRST RUN ONLY)
 ./generate_app_keypair.sh
 
+# Generate TLS certificates for web server (FIRST RUN ONLY)
+./generate-certs.sh
+
 # Build the project
 cargo build --release
 
-# Run the application
+# Run the web server
 ./target/release/pki-chain
 ```
 
@@ -177,96 +176,46 @@ cargo build --release
 
 ## Usage
 
-### Terminal User Interface
+### Web Interface
 
-Run the application to launch the interactive TUI:
+Run the application to launch the HTTPS web server:
 
 ```bash
 ./target/release/pki-chain
 ```
 
-**TUI Features:**
+Access the web interface at `https://localhost:3000`
 
-1. **Create Intermediate Certificate**
-   - Interactive form with all Distinguished Name fields
-   - Fields: Common Name (CN), Organization (O), Organizational Unit (OU), Locality (L), State (ST), Country (C)
-   - Configurable validity period (default: 1825 days / 5 years)
-   - Real-time validation:
-     - All fields required
-     - Country code must be exactly 2 letters
-     - Validity must be positive
-     - Duplicate subject name detection
-   - Automatic blockchain storage with transactional safety
+**Web Interface Features:**
 
-2. **Create User Certificate**
-   - Interactive form with all Distinguished Name fields
-   - Dropdown menu to select issuing Intermediate CA
-   - Fields: Common Name (CN), Organization (O), Organizational Unit (OU), Locality (L), State (ST), Country (C), Issuer CA
-   - Configurable validity period (default: 365 days / 1 year)
-   - Real-time validation:
-     - All fields required
-     - Country code must be exactly 2 letters
-     - Validity must be positive
-     - Duplicate subject name detection
-   - Automatic blockchain storage with transactional safety
+- **PKI Status Dashboard**: View blockchain statistics and certificate inventory
+- **REST API**: JSON endpoints for programmatic access
+  - `GET /api/status` - System status and statistics
+- **Static Web Interface**: HTML/CSS/JS interface in `web_root/` directory
 
-3. **Validate Blockchain**
-   - Runs `validate()` on both certificate and private key chains
-   - Displays block counts and validation status
-   - Ensures signature consistency between chains
-
-4. **View System Status**
-   - Certificate blockchain statistics
-   - Private key blockchain statistics
-   - List of all tracked subject names
-   - Block heights and validation state
-
-5. **Exit**
-   - Gracefully shutdown application
+**Note**: Browser will show security warning due to self-signed TLS certificate (expected for local development).
 
 ### Typical Workflow
 
 ```
 1. First Run:
    $ ./generate_app_keypair.sh        # Create master encryption key
-   $ ./target/release/pki-chain       # Initialize with 3-tier TLS hierarchy
+   $ ./generate-certs.sh              # Generate TLS certificates
+   $ ./target/release/pki-chain       # Start HTTPS server (initializes Root CA)
 
-2. Create Intermediate CA:
-   - Select "Create Intermediate Certificate"
-   - Fill form fields:
-     CN: "Operations CA"
-     O: "ACME Corp"
-     OU: "IT Department"
-     L: "Seattle"
-     ST: "Washington"
-     C: "US"
-     Validity: 1825 (days)
-   - Press OK to generate and store
-   - Blockchain automatically assigns height (e.g., height 3)
+2. Access Web Interface:
+   Navigate to https://localhost:3000
+   - View PKI status dashboard
+   - Access REST API at /api/status
 
-3. Create User Certificate:
-   - Select "Create User Certificate"
-   - Choose issuing CA from dropdown (e.g., "Operations CA")
-   - Fill form fields:
-     CN: "john.doe@example.com"
-     O: "ACME Corp"
-     OU: "Engineering"
-     L: "Seattle"
-     ST: "Washington"
-     C: "US"
-     Validity: 365 (days)
-   - Press OK to generate and store
-   - Blockchain automatically assigns height (e.g., height 4)
+3. Verify Storage:
+   Check GET /api/status response for:
+   - Certificate count
+   - Blockchain validation status
+   - Tracked subject names
 
-4. Verify Storage:
-   - Select "View System Status"
-   - Check certificate count increased
-   - Verify new subject names in tracked list
-
-5. Validate Integrity:
-   - Select "Validate Blockchain"
-   - Confirms both chains are valid
-   - Shows total block count
+4. Integration via API:
+   Use REST endpoints for programmatic certificate management
 ```
 
 ## Testing
@@ -355,7 +304,7 @@ pki-chain/
 ├── src/
 │   ├── lib.rs                       # Library interface with comprehensive API docs
 │   ├── main.rs                      # Application entry point
-│   ├── ui.rs                        # Terminal user interface (TUI)
+│   ├── webserver.rs                 # HTTPS web server (Axum + Tokio)
 │   ├── protocol.rs                  # Protocol layer (owns Storage, Request/Response interface)
 │   ├── storage.rs                   # Blockchain storage abstraction with in-memory keys
 │   ├── pki_generator.rs             # Unified certificate generation for all types
@@ -382,7 +331,9 @@ cargo doc --open
 Key dependencies and their purposes:
 - [`libblockchain`](https://github.com/jessethepro/libblockchain) - Custom blockchain storage engine with RocksDB backend
 - `openssl` (0.10) - RSA-4096 key generation, X.509 certificate operations, SHA-256/SHA-512 hashing
-- `cursive` (0.21) - Terminal user interface framework for interactive forms and menus
+- `axum` (0.8) - Web framework for HTTPS server and REST API
+- `tokio` (1.48) - Async runtime for web server
+- `axum-server` (0.8) - TLS/HTTPS support
 - `keyutils` (0.4) - Linux kernel keyring integration for secure key management
 - `anyhow` (1.0) - Ergonomic error handling with context chains
 - `serde`/`serde_json` (1.0) - Data serialization

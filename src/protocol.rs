@@ -2,7 +2,7 @@
 //!
 //! Provides a high-level abstraction layer for PKI certificate management operations.
 //! This module owns the Storage layer and processes certificate-related requests through
-//! a clean Request/Response pattern, enabling separation between UI logic and storage operations.
+//! a clean Request/Response pattern, enabling separation between web/API logic and storage operations.
 //!
 //! # Architecture
 //!
