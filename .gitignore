@@ -28,7 +28,7 @@ Cargo.lock
 /exports/
 /exports/keystore/
 
-# TLS certificates for web server (regenerate with generate-certs.sh)
+# TLS certificates for web server (regenerate with generate-webserver-certs.sh)
 /web_certs/
 /web_certs/root/
 /web_certs/intermediate/
