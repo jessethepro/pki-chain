@@ -83,29 +83,13 @@
 //! 4. Populate subject name index from blockchain
 //! 5. Start webserver with Storage instance
 
-use anyhow::{Context, Result};
-use pki_chain::storage::Storage;
+use anyhow::Result;
 use pki_chain::webserver;
 
 fn main() -> Result<()> {
-    let default_configs =
-        pki_chain::configs::AppConfig::load().context("Failed to load default configurations")?;
-    // Initialize storage
-    let storage = Storage::new(default_configs.clone()).context("Failed to initialize storage")?;
-
-    if storage.is_empty()? {
-        storage
-            .initialize()
-            .context("Failed to initialize PKI storage")?;
-    }
-
-    storage
-        .populate_subject_name_index()
-        .context("Failed to populate subject name index")?;
-
     // Start the Web Server (this will block)
     println!("Starting PKI Chain web server...\n");
-    webserver::start_webserver(default_configs, storage);
+    webserver::start_webserver();
 
     Ok(())
 }

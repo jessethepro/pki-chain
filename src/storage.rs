@@ -1,568 +1,783 @@
-//! Storage Module
+//! Storage Layer for PKI Certificate Authority
 //!
-//! Provides a unified abstraction over dual blockchain storage for PKI certificate management.
-//! This module manages the storage and retrieval of X.509 certificates and their associated
-//! private keys using a hybrid storage architecture combining blockchain and encrypted filesystem storage.
+//! This module implements the storage layer for managing X.509 certificates,
+//! private keys, and Certificate Revocation Lists (CRLs) using blockchain technology.
 //!
 //! # Architecture
 //!
-//! The storage layer uses multiple components:
-//! - **Certificate Blockchain**: Stores X.509 certificates in DER format
-//! - **Private Key Blockchain**: Stores SHA-512 hashes of private keys
-//! - **Encrypted Key Store**: Stores actual private keys in encrypted format
-//!   - Root CA: PKCS#8 PEM with password protection
-//!   - Other keys: Hybrid RSA + AES-GCM-256 encryption
-//! - **Process Keyring**: Linux kernel keyring for secure key management
-//! - **Subject Name Index**: In-memory HashMap for fast certificate lookups by common name
+//! The storage layer uses three separate blockchains:
+//! - **Certificates**: Stores X.509 certificates (encrypted with app.crt public key)
+//! - **Private Keys**: Stores private key hashes and signatures (encrypted with Root CA public key)
+//! - **CRL**: Stores Certificate Revocation Lists (encrypted with app.crt public key)
 //!
-//! All components are kept in sync through:
-//! 1. Height-based indexing (certificates at height N correspond to keys at height N)
-//! 2. Signature verification (each block pair has matching signatures signed by the certificate's private key)
-//! 3. Transactional rollback (failed key storage rolls back certificate storage)
+//! # State Machine
 //!
-//! # Example
+//! Storage follows a typestate pattern with three states:
+//! - `NoExist`: Fresh installation, no blockchains exist
+//! - `Initialized`: Blockchains exist, Root CA created at height 0
+//! - `Ready`: First admin user + intermediate CA created (heights 1, 2)
 //!
-//! ```no_run
-//! use pki_chain::storage::Storage;
-//! use pki_chain::configs::AppConfig;
-//! use anyhow::Result;
+//! # Modes
 //!
-//! fn example() -> Result<()> {
-//!     let config = AppConfig::load()?;
-//!     let storage = Storage::new(config)?;
-//!     
-//!     if storage.is_empty()? {
-//!         storage.initialize()?;
-//!         println!("Initialized Root CA");
-//!     }
-//!     
-//!     storage.populate_subject_name_index()?;
-//!     
-//!     if storage.validate_certificates()? {
-//!         println!("Blockchain validation successful");
-//!     }
-//!     
-//!     Ok(())
-//! }
-//! ```
+//! - **API Mode**: Read-only access to certificates and CRL (no private keys)
+//! - **Admin Mode**: Full access including private key blockchain
 //!
+//! # Encryption
+//!
+//! - Certificate/CRL blockchain: Encrypted with app.crt public key
+//! - Private key blockchain: Encrypted with Root CA public key
+//! - Root CA private key: PKCS#8 password-protected in genesis block
 
 #![warn(clippy::unwrap_used)]
 #![warn(clippy::indexing_slicing)]
 
-use anyhow::{Context, Result};
-use libblockchain::blockchain::BlockChain;
-use openssl::pkey::PKey;
-use std::io::Write;
-
 use crate::configs::AppConfig;
-use crate::pki_generator::{generate_root_ca, CertificateData};
-use crate::private_key_storage::EncryptedKeyStore;
-/// Default Common Name for the Root CA certificate
-pub const ROOT_CA_SUBJECT_COMMON_NAME: &str = "MenaceLabs Root CA";
+use crate::encryption::{deserialize_encrypted_data, EncryptedData};
+use crate::pki_generator::{
+    generate_key_pair, generate_root_ca, CertificateData, CertificateDataType,
+};
+use anyhow::{anyhow, Context, Result};
+use libblockchain::blockchain::{
+    open_read_only_chain, open_read_write_chain, BlockChain, ReadOnly, ReadWrite,
+};
+use openssl::pkey::{PKey, Public};
+use openssl::symm::Cipher;
+use openssl::x509::X509;
+use std::collections::HashMap;
+use std::fs;
 
-/// Storage abstraction for PKI certificate and private key blockchain management.
-///
-/// Manages dual blockchain instances plus encrypted filesystem storage for a complete PKI system.
-/// Certificates are stored in blockchain for tamper detection, while private keys use hybrid
-/// storage: SHA-512 hashes in blockchain for integrity verification, and encrypted files for
-/// actual key material.
-///
-/// # Fields
-///
-/// * `certificate_chain` - Blockchain storing X.509 certificates in DER format
-/// * `private_chain` - Blockchain storing SHA-512 hashes of private keys with signature verification
-/// * `subject_name_to_height` - Thread-safe HashMap mapping certificate common names to blockchain heights
-/// * `encrypted_key_store` - Filesystem storage for encrypted private keys (PKCS#8 for Root, RSA+AES-GCM-256 for others)
-/// * `process_keyring` - Linux kernel keyring for secure in-memory key management
-///
-/// # Thread Safety
-///
-/// The `subject_name_to_height` field uses `Mutex` for concurrent access protection when multiple
-/// threads need to query or update the mapping. Storage is owned by Protocol, which is wrapped
-/// in Arc for sharing across threads.
-pub struct Storage {
-    /// Blockchain storing X.509 certificates in PEM format
-    pub certificate_chain: BlockChain,
-    /// Blockchain storing RSA private keys in DER format
-    pub private_chain: BlockChain,
-    /// Thread-safe HashMap mapping certificate common names to blockchain heights
-    pub subject_name_to_height: std::sync::Mutex<std::collections::HashMap<String, u64>>,
-    /// Encrypted key store for private keys
-    pub encrypted_key_store: EncryptedKeyStore,
+/// Represents the current state of the storage system
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StorageState {
+    /// Blockchains do not exist or are empty
+    NoExist,
+    /// Blockchains exist with Root CA at height 0
+    Initialized,
+    /// First admin user and intermediate CA have been created
+    Ready,
 }
 
-impl Storage {
-    /// Creates a new Storage instance with blockchain and encrypted key store initialization.
-    ///
-    /// Initializes all storage components:
-    /// - Two blockchain instances for certificates and private key hashes
-    /// - Encrypted key store for actual private key material
-    /// - Process keyring with application key loaded from PKCS#8 PEM file
-    /// - Subject name index (empty, call `populate_subject_name_index()` to populate)
-    ///
-    /// Prompts for application key password during initialization.
-    ///
-    /// # Arguments
-    ///
-    /// * `default_config` - Configuration from config.toml containing paths and keyring settings
-    ///
-    /// # Returns
-    ///
-    /// * `Result<Self>` - Storage instance or error if initialization fails
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if:
-    /// - The application key file cannot be read or decrypted
-    /// - Keyring attachment or key addition fails
-    /// - Blockchain directories cannot be created
-    /// - Database initialization fails
-    /// - Encrypted key store initialization fails
-    ///
-    /// # Example
-    ///
-    /// ```no_run
-    /// use pki_chain::storage::Storage;
-    /// use pki_chain::configs::AppConfig;
-    ///
-    /// let config = AppConfig::load()?;
-    /// let storage = Storage::new(config)?;
-    ///
-    /// // Populate the subject name index
-    /// storage.populate_subject_name_index()?;
-    /// # Ok::<(), anyhow::Error>(())
-    /// ```
-    pub fn new(default_config: AppConfig) -> Result<Self> {
-        let app_key = (|| -> Result<PKey<openssl::pkey::Private>> {
-            let pem_data = std::fs::read(&default_config.key_exports.app_key_path.clone())
-                .with_context(|| {
-                    format!(
-                        "Failed to read private key from {}",
-                        default_config
-                            .key_exports
-                            .app_key_path
-                            .clone()
-                            .to_str()
-                            .unwrap_or("unknown path")
-                    )
-                })?;
-            print!("Enter password for App Key (press Enter if none): ");
-            std::io::stdout().flush()?;
-            let pwd = rpassword::read_password()?;
+/// State: CA system does not exist yet (fresh installation)
+pub struct NoExist {
+    config: AppConfig,
+}
 
-            let key = if !pwd.is_empty() {
-                PKey::private_key_from_pem_passphrase(&pem_data, pwd.as_bytes())
-                    .context("Failed to decrypt private key with password")?
-            } else {
-                PKey::private_key_from_pem(&pem_data).context("Failed to parse private key PEM")?
-            };
+/// State: Blockchains exist and Root CA has been created
+pub struct Initialized {
+    certificate_chain: BlockChain<ReadWrite>,
+    private_key_chain: BlockChain<ReadWrite>,
+    crl_chain: BlockChain<ReadWrite>,
+    app_public_key: PKey<Public>,
+    root_ca_cert: X509,
+    subject_name_to_height: HashMap<String, u64>,
+}
 
-            Ok(key)
-        })()?;
+/// State: First admin user and intermediate CA have been created
+pub struct Ready {
+    certificate_chain: BlockChain<ReadWrite>,
+    private_key_chain: BlockChain<ReadWrite>,
+    crl_chain: BlockChain<ReadWrite>,
+    app_public_key: PKey<Public>,
+    root_ca_cert: X509,
+    admin_intermediate_height: u64,
+    admin_user_height: u64,
+    subject_name_to_height: HashMap<String, u64>,
+}
 
-        // Blockhains use the App Key from the process keyring
-        let private_chain = BlockChain::new(
-            default_config.blockchains.private_key_path.as_path(),
-            app_key.clone(),
-        )
-        .context("Failed to initialize Private Key blockchain")?;
-        let certificate_chain = BlockChain::new(
-            default_config.blockchains.certificate_path.as_path(),
-            app_key.clone(),
-        )
-        .context("Failed to initialize Certificate blockchain")?;
-        // Private key encrypted store uses the Root CA key from the process keyring
-        let encrypted_key_store = EncryptedKeyStore::new(default_config.clone())
-            .context("Failed to initialize Encrypted Key Store")?;
+/// Main storage container with typestate pattern
+pub struct Storage<State> {
+    state: State,
+}
+
+// ============================================================================
+// Storage<NoExist> - Initial state, check if blockchains exist
+// ============================================================================
+
+impl Storage<NoExist> {
+    /// Create a new storage instance in NoExist state
+    ///
+    /// Checks if blockchains exist on disk. Does not create them.
+    pub fn new() -> Result<Self> {
+        let config = AppConfig::load().context("Failed to load configuration")?;
+
         Ok(Storage {
-            // Initialize blockchain storage for certificates and private keys
-            certificate_chain,
-            private_chain,
-            subject_name_to_height: std::sync::Mutex::new(std::collections::HashMap::new()),
-            encrypted_key_store,
+            state: NoExist { config },
         })
     }
 
-    /// Checks if both blockchains are empty.
-    ///
-    /// # Returns
-    ///
-    /// * `Result<bool>` - True if both chains have zero blocks, false otherwise
-    ///
-    /// # Example
-    ///
-    /// ```no_run
-    /// # use pki_chain::storage::Storage;
-    /// # fn example(storage: &Storage) -> anyhow::Result<()> {
-    /// if storage.is_empty()? {
-    ///     println!("No certificates stored yet");
-    /// }
-    /// # Ok(())
-    /// # }
-    /// ```
-    pub fn is_empty(&self) -> Result<bool> {
-        Ok(self.certificate_chain.block_count()? == 0 && self.private_chain.block_count()? == 0)
+    /// Check if blockchains already exist on disk
+    pub fn blockchains_exist(&self) -> bool {
+        let cert_exists = self.state.config.blockchains.certificate_path.exists();
+        let key_exists = self.state.config.blockchains.private_key_path.exists();
+        let crl_exists = self.state.config.blockchains.crl_path.exists();
+
+        cert_exists && key_exists && crl_exists
     }
 
-    pub fn initialize(&self) -> Result<()> {
-        // Initialize Root CA
-        let (root_private_key, root_certificate) = generate_root_ca(CertificateData {
-            subject_common_name: ROOT_CA_SUBJECT_COMMON_NAME.to_string(),
-            issuer_common_name: ROOT_CA_SUBJECT_COMMON_NAME.to_string(),
-            organization: "MenaceLabs".to_string(),
-            organizational_unit: "CY".to_string(),
-            country: "BR".to_string(),
-            state: "SP".to_string(),
-            locality: "Sao Jose dos Campos".to_string(),
-            cert_type: crate::pki_generator::CertificateDataType::RootCA,
-            validity_days: 365 * 10, // 10 years
-        })
-        .context("Failed to generate Root CA")?;
-        println!("✓ Root CA generated");
-        // Save Root certificate to certificate blockchain
-        let certificate_height = self
-            .certificate_chain
-            .put_block(root_certificate.to_der()?)
-            .context("Failed to store Root CA certificate in blockchain")?;
-        // Generate signature for Root CA certificate
-        let root_cert_signature = (|| -> Result<Vec<u8>> {
-            let mut signer = openssl::sign::Signer::new(
-                openssl::hash::MessageDigest::sha256(),
-                &root_private_key,
-            )
-            .context("Failed to create signer for Root CA certificate")?;
-            let signature = signer
-                .sign_oneshot_to_vec(&root_certificate.to_der()?)
-                .context("Failed to sign Root CA certificate block data")?;
-            Ok(signature)
-        })()?;
-        // Store Root CA certificate signature
-        let cert_signature_height = self
-            .certificate_chain
-            .put_signature(certificate_height, root_cert_signature.clone())?;
-        assert_eq!(
-            certificate_height, 0,
-            "Root CA certificate should be at height 0"
-        );
-        // Caclulate private key hash
-        let private_key_hash = openssl::hash::hash(
-            openssl::hash::MessageDigest::sha512(),
-            &root_private_key.private_key_to_der()?,
-        )?;
-        // Save private key hash to private key blockchain
-        let key_height = self
-            .private_chain
-            .put_block(private_key_hash.to_vec())
-            .context("Failed to store Root CA private key hash in blockchain")?;
-        // Store Root CA private key signature
-        let key_signature_height = self
-            .private_chain
-            .put_signature(key_height, root_cert_signature.clone())?;
-        // Ensure both blockchains are in sync
-        assert_eq!(
-            cert_signature_height, key_signature_height,
-            "Root CA certificate and private key signatures should be at the same height"
-        );
-        assert_eq!(
-            certificate_height, key_height,
-            "Root CA certificate and private key should be at the same height"
-        );
-        // Store Root Private Key in encrypted key store
-        let key_file_path = self
-            .encrypted_key_store
-            .store_key(
-                key_height,
-                root_certificate
-                    .public_key()
-                    .context("Failed to extract public key from Root CA certificate")?,
-                root_private_key.clone(),
-            )
-            .context("Failed to store Root CA private key in encrypted key store")?;
-
-        // Verify storage
-        if self.verify_stored_key_certificate_pair(
-            root_private_key,
-            root_certificate,
-            key_height,
-        )? {
-            println!("✓ Stored Root CA key-certificate pair verified successfully");
-        } else {
-            println!("✗ Verification of stored Root CA key-certificate pair failed");
-            return Err(anyhow::anyhow!(
-                "Stored Root CA key-certificate pair verification failed"
-            ));
-        }
-        println!(
-            "✓ Root CA private key stored securely at: {}",
-            key_file_path.to_str().unwrap_or("unknown path")
-        );
-        Ok(())
-    }
-
-    pub fn populate_subject_name_index(&self) -> Result<usize> {
-        let mut map = self.subject_name_to_height.lock().unwrap();
-        map.clear();
-        let cert_iter = self.certificate_chain.iter();
-        for block_result in cert_iter {
-            let block = block_result?;
-            let height = block.block_header.height;
-            let certificate = openssl::x509::X509::from_der(&block.block_data)
-                .context("Failed to parse stored certificate")?;
-            let subject_name = certificate
-                .subject_name()
-                .entries_by_nid(openssl::nid::Nid::COMMONNAME)
-                .next()
-                .and_then(|entry| entry.data().as_utf8().ok())
-                .map(|data| data.to_string())
-                .context("Certificate missing Common Name")?;
-            map.insert(subject_name, height);
-        }
-        Ok(map.len())
-    }
-
-    /// Stores a certificate and private key pair in their respective blockchains.
-    ///
-    /// This method performs a transactional operation:
-    /// 1. Stores the certificate in the certificate blockchain
-    /// 2. Stores the private key in the private key blockchain
-    /// 3. Creates matching signatures for both blocks
-    /// 4. Rolls back certificate storage if private key storage fails
+    /// Initialize the CA system: create blockchains and Root CA
     ///
     /// # Arguments
     ///
-    /// * `private_key` - The RSA private key to store
-    /// * `certificate` - The X.509 certificate to store
+    /// * `root_ca_password` - Password to protect Root CA private key (PKCS#8)
     ///
-    /// # Returns
+    /// # State Transition
     ///
-    /// * `Result<u64>` - The blockchain height where the pair was stored
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if:
-    /// - Certificate PEM conversion fails
-    /// - Private key DER conversion fails
-    /// - Blockchain storage operations fail
-    /// - Signature generation or storage fails
-    ///
-    /// # Example
-    ///
-    /// ```no_run
-    /// # use pki_chain::storage::Storage;
-    /// # use openssl::rsa::Rsa;
-    /// # use openssl::pkey::PKey;
-    /// # use openssl::x509::X509;
-    /// # fn example(storage: &Storage, key: PKey<openssl::pkey::Private>, cert: X509) -> anyhow::Result<()> {
-    /// let height = storage.store_key_certificate(key, cert)?;
-    /// println!("Stored at height: {}", height);
-    /// # Ok(())
-    /// # }
-    /// ```
-    pub fn store_key_certificate(
-        &self,
-        private_key: openssl::pkey::PKey<openssl::pkey::Private>,
-        certificate: openssl::x509::X509,
-    ) -> Result<u64> {
-        // Check blockchains are in sync
-        let cert_block_count = self.certificate_chain.block_count()?;
-        let key_block_count = self.private_chain.block_count()?;
-        if cert_block_count != key_block_count {
-            return Err(anyhow::anyhow!(
-                "Certificate and Private Key blockchains are out of sync: certs={}, keys={}",
-                cert_block_count,
-                key_block_count
+    /// NoExist -> Initialized
+    pub fn initialize(self, root_ca_password: String) -> Result<Storage<Initialized>> {
+        let config = &self.state.config;
+
+        println!("🔧 Initializing PKI Certificate Authority...");
+
+        // Load application public key for encrypting certificate/CRL data
+        let app_public_key = Self::load_app_public_key(config)?;
+        println!("✓ Application public key loaded");
+
+        // Create blockchain directories if they don't exist
+        fs::create_dir_all(&config.blockchains.certificate_path)
+            .context("Failed to create certificate blockchain directory")?;
+        fs::create_dir_all(&config.blockchains.private_key_path)
+            .context("Failed to create private key blockchain directory")?;
+
+        fs::create_dir_all(&config.blockchains.crl_path)
+            .context("Failed to create CRL blockchain directory")?;
+
+        // Open blockchains in read-write mode
+        let certificate_chain = open_read_write_chain(config.blockchains.certificate_path.clone())
+            .context("Failed to open certificate blockchain")?;
+        println!("✓ Certificate blockchain opened");
+
+        let private_key_chain = open_read_write_chain(config.blockchains.private_key_path.clone())
+            .context("Failed to open private key blockchain")?;
+        println!("✓ Private key blockchain opened");
+
+        let crl_chain = open_read_write_chain(config.blockchains.crl_path.clone())
+            .context("Failed to open CRL blockchain")?;
+        println!("✓ CRL blockchain opened");
+
+        // Check if Root CA already exists
+        if certificate_chain.block_count()? > 0 {
+            return Err(anyhow!(
+                "Blockchains already contain data. Use open() instead."
             ));
         }
-        // Sign certificate der bytes with private key
-        // to create matching signatures for both blockchains
-        // This ensures that the certificate and private key
-        // correspond to each other at the same height
-        let certificate_der = certificate.to_der()?;
-        let private_key_sig_of_cert = (|| -> Result<Vec<u8>> {
-            let mut signer =
-                openssl::sign::Signer::new(openssl::hash::MessageDigest::sha256(), &private_key)
-                    .context("Failed to create signer for certificate signature")?;
-            let signature = signer
-                .sign_oneshot_to_vec(&certificate_der)
-                .context("Failed to sign certificate block data")?;
-            Ok(signature)
-        })()?;
-        // Save certificate to blockchain as der bytes
-        let certificate_height = self
-            .certificate_chain
-            .put_block(certificate_der)
-            .context("Failed to store Root CA certificate in blockchain")?;
-        // Store certificate signature
-        let cert_signature_height = self
-            .certificate_chain
-            .put_signature(certificate_height, private_key_sig_of_cert.clone())?;
 
-        // Store private key with rollback on failure
-        let private_key_hash = openssl::hash::hash(
-            openssl::hash::MessageDigest::sha512(),
-            &private_key.private_key_to_der()?,
-        )
-        .expect("SHA-512 hashing failed")
-        .to_vec();
+        // Generate Root CA
+        println!("🔐 Generating Root CA...");
+        let (root_private_key, root_ca_cert) = generate_root_ca(CertificateData {
+            subject_common_name: config.root_ca_defaults.root_ca_common_name.clone(),
+            issuer_common_name: config.root_ca_defaults.root_ca_common_name.clone(),
+            organization: config.root_ca_defaults.root_ca_organization.clone(),
+            organizational_unit: config.root_ca_defaults.root_ca_organizational_unit.clone(),
+            country: config.root_ca_defaults.root_ca_country.clone(),
+            state: config.root_ca_defaults.root_ca_state.clone(),
+            locality: config.root_ca_defaults.root_ca_locality.clone(),
+            cert_type: CertificateDataType::RootCA,
+            validity_days: config.root_ca_defaults.root_ca_validity_days,
+        })?;
+        println!("✓ Root CA generated");
 
-        let private_key_height = self
-            .private_chain
-            .put_block(private_key_hash)
-            .or_else(|e| {
-                // Rollback certificate block if private key storage fails
-                let _ = self.certificate_chain.delete_latest_block();
-                Err(e)
-            })?;
-        // Store private key signature
-        let key_signature_height = self
-            .private_chain
-            .put_signature(private_key_height, private_key_sig_of_cert.clone())?;
-        assert_eq!(
-            self.certificate_chain
-                .get_signature_by_height(cert_signature_height)?,
-            self.private_chain
-                .get_signature_by_height(key_signature_height)?,
-            "Stored signatures do not match"
-        );
-        // Get the Root CA public key from the blockchain
-        let root_public_key = (|| -> Result<PKey<openssl::pkey::Public>> {
-            let root_cert_block = self.certificate_chain.get_block_by_height(0)?;
-            let root_cert = openssl::x509::X509::from_der(&root_cert_block.block_data)
-                .context("Failed to parse Root CA certificate from blockchain")?;
-            let pub_key = root_cert
-                .public_key()
-                .context("Failed to extract public key from Root CA certificate")?;
-            Ok(pub_key)
-        })()?;
-        // Store the private key in the encrypted key store
-        self.encrypted_key_store
-            .store_key(private_key_height, root_public_key, private_key)
-            .context("Failed to store private key in encrypted key store")?;
+        // Encrypt Root CA certificate with app public key
+        let encrypted_cert =
+            EncryptedData::encrypt_data(root_ca_cert.to_der()?, app_public_key.clone())?;
 
-        // Update subject name to height mapping
-        let subject_name = certificate
+        // Store Root CA certificate at height 0
+        let cert_height = certificate_chain.put_block(encrypted_cert.serialize_encrypted_data())?;
+        assert_eq!(cert_height, 0, "Root CA certificate must be at height 0");
+        println!("✓ Root CA certificate stored at height 0");
+
+        // Encrypt Root CA private key with password (PKCS#8)
+        let encrypted_root_key = root_private_key.private_key_to_pem_pkcs8_passphrase(
+            Cipher::aes_256_cbc(),
+            root_ca_password.as_bytes(),
+        )?;
+
+        // Store encrypted Root CA private key at height 0
+        let key_height = private_key_chain.put_block(encrypted_root_key)?;
+        assert_eq!(key_height, 0, "Root CA private key must be at height 0");
+        println!("✓ Root CA private key stored at height 0 (PKCS#8 encrypted)");
+
+        // Initialize empty CRL blockchain (no genesis block needed)
+        println!("✓ CRL blockchain initialized (empty)");
+
+        // Build subject name index
+        let mut subject_name_to_height = HashMap::new();
+        let root_subject = root_ca_cert
             .subject_name()
             .entries_by_nid(openssl::nid::Nid::COMMONNAME)
             .next()
             .and_then(|entry| entry.data().as_utf8().ok())
             .map(|data| data.to_string())
-            .context("Certificate missing Common Name")?;
-        self.subject_name_to_height
-            .lock()
-            .unwrap()
-            .insert(subject_name, certificate_height);
-        Ok(certificate_height)
+            .context("Root CA missing Common Name")?;
+        subject_name_to_height.insert(root_subject, 0);
+
+        println!("✅ PKI Certificate Authority initialized successfully!");
+
+        Ok(Storage {
+            state: Initialized {
+                certificate_chain,
+                private_key_chain,
+                crl_chain,
+                app_public_key,
+                root_ca_cert,
+                subject_name_to_height,
+            },
+        })
     }
 
-    /// Verifies that a private key matches the one stored at the specified height.
-    ///
-    /// # Arguments
-    ///
-    /// * `private_key` - The private key to verify
-    /// * `height` - The blockchain height to check
-    ///
-    /// # Returns
-    ///
-    /// * `Result<bool>` - True if keys match, false otherwise
-    pub(crate) fn verify_stored_key(
-        &self,
-        private_key: openssl::pkey::PKey<openssl::pkey::Private>,
-        height: u64,
-    ) -> Result<bool> {
-        let stored_key = self.encrypted_key_store.retrieve_key(height)?;
-        Ok(stored_key.private_key_to_der()? == private_key.private_key_to_der()?)
-    }
+    /// Load application public key from certificate file
+    fn load_app_public_key(config: &AppConfig) -> Result<PKey<Public>> {
+        let cert_pem = fs::read(&config.key_exports.app_cert_path).with_context(|| {
+            format!(
+                "Failed to read application certificate from {}",
+                config.key_exports.app_cert_path.display()
+            )
+        })?;
 
-    /// Verifies that a certificate matches the one stored at the specified height.
-    ///
-    /// # Arguments
-    ///
-    /// * `certificate` - The certificate to verify
-    /// * `height` - The blockchain height to check
-    ///
-    /// # Returns
-    ///
-    /// * `Result<bool>` - True if certificates match, false otherwise
-    pub(crate) fn verify_stored_certificate(
-        &self,
-        certificate: openssl::x509::X509,
-        height: u64,
-    ) -> Result<bool> {
-        let stored_cert = {
-            let block = self.certificate_chain.get_block_by_height(height)?;
-            openssl::x509::X509::from_der(&block.block_data)
-                .context("Failed to parse stored Root CA certificate")?
-        };
-        Ok(stored_cert.to_pem()? == certificate.to_pem()?)
-    }
+        let cert = X509::from_pem(&cert_pem).context("Failed to parse application certificate")?;
 
-    /// Verifies that both a certificate and private key match those stored at the specified height.
-    ///
-    /// This is a convenience method that calls both `verify_stored_key` and
-    /// `verify_stored_certificate`.
-    ///
-    /// # Arguments
-    ///
-    /// * `private_key` - The private key to verify
-    /// * `certificate` - The certificate to verify
-    /// * `height` - The blockchain height to check
-    ///
-    /// # Returns
-    ///
-    /// * `Result<bool>` - True if both match, false otherwise
-    pub(crate) fn verify_stored_key_certificate_pair(
-        &self,
-        private_key: openssl::pkey::PKey<openssl::pkey::Private>,
-        certificate: openssl::x509::X509,
-        height: u64,
-    ) -> Result<bool> {
-        let key_matches = self.verify_stored_key(private_key, height)?;
-        let cert_matches = self.verify_stored_certificate(certificate, height)?;
-        Ok(key_matches && cert_matches)
-    }
+        let public_key = cert
+            .public_key()
+            .context("Failed to extract public key from certificate")?;
 
-    /// Validates the integrity of both blockchains.
+        Ok(public_key)
+    }
+}
+
+// ============================================================================
+// Storage<Initialized> - Root CA exists, can create admin user
+// ============================================================================
+
+impl Storage<Initialized> {
+    /// Open existing blockchains in Initialized state
     ///
-    /// Performs comprehensive validation:
-    /// 1. Verifies that certificate and key signatures match at each height
-    /// 2. Validates blockchain integrity (hashes, timestamps, etc.)
-    /// 3. Ensures both chains have consistent state
-    ///
-    /// # Returns
-    ///
-    /// * `Result<bool>` - True if validation succeeds, false if integrity check fails
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if blockchain operations fail during validation.
-    ///
-    /// # Example
-    ///
-    /// ```no_run
-    /// # use pki_chain::storage::Storage;
-    /// # fn example(storage: &Storage) -> anyhow::Result<()> {
-    /// if storage.validate_certificates()? {
-    ///     println!("Blockchain integrity verified");
-    /// } else {
-    ///     println!("Validation failed - possible tampering detected");
-    /// }
-    /// # Ok(())
-    /// # }
-    /// ```
-    pub fn validate_certificates(&self) -> Result<bool> {
-        let cert_iter = self.certificate_chain.iter();
-        for cert_block in cert_iter {
-            let cert_block = cert_block?;
-            let height = cert_block.block_header.height;
-            let cert_signature = self.certificate_chain.get_signature_by_height(height)?;
-            let key_signature = self.private_chain.get_signature_by_height(height)?;
-            if cert_signature != key_signature {
-                return Ok(false);
-            }
+    /// Verifies Root CA exists at height 0 in all required blockchains.
+    pub fn open() -> Result<Self> {
+        let config = AppConfig::load().context("Failed to load configuration")?;
+
+        // Load application public key
+        let app_public_key = Storage::<NoExist>::load_app_public_key(&config)?;
+
+        // Open blockchains
+        let certificate_chain = open_read_write_chain(config.blockchains.certificate_path.clone())
+            .context("Failed to open certificate blockchain")?;
+
+        let private_key_chain = open_read_write_chain(config.blockchains.private_key_path.clone())
+            .context("Failed to open private key blockchain")?;
+
+        let crl_chain = open_read_write_chain(config.blockchains.crl_path.clone())
+            .context("Failed to open CRL blockchain")?;
+
+        // Verify Root CA exists at height 0
+        if certificate_chain.block_count()? < 1 {
+            return Err(anyhow!("Certificate blockchain is empty - Root CA missing"));
         }
-        self.certificate_chain.validate()?;
-        self.private_chain.validate()?;
-        Ok(true)
+
+        if private_key_chain.block_count()? < 1 {
+            return Err(anyhow!(
+                "Private key blockchain is empty - Root CA key missing"
+            ));
+        }
+
+        // Load and decrypt Root CA certificate
+        let root_ca_block = certificate_chain.get_block_by_height(0)?;
+        let encrypted_cert_data = deserialize_encrypted_data(&root_ca_block.block_data())?;
+
+        // Load app private key to decrypt
+        let app_private_key_pem = fs::read(&config.key_exports.app_key_path)
+            .context("Failed to read application private key")?;
+        let app_private_key = PKey::private_key_from_pem(&app_private_key_pem)
+            .context("Failed to parse application private key")?;
+
+        let root_cert_der = encrypted_cert_data.decrypt_data(app_private_key)?;
+        let root_ca_cert =
+            X509::from_der(&root_cert_der).context("Failed to parse Root CA certificate")?;
+
+        // Build subject name index
+        let mut subject_name_to_height = HashMap::new();
+        let root_subject = root_ca_cert
+            .subject_name()
+            .entries_by_nid(openssl::nid::Nid::COMMONNAME)
+            .next()
+            .and_then(|entry| entry.data().as_utf8().ok())
+            .map(|data| data.to_string())
+            .context("Root CA missing Common Name")?;
+        subject_name_to_height.insert(root_subject, 0);
+
+        Ok(Storage {
+            state: Initialized {
+                certificate_chain,
+                private_key_chain,
+                crl_chain,
+                app_public_key,
+                root_ca_cert,
+                subject_name_to_height,
+            },
+        })
     }
+
+    /// Create first admin user with intermediate CA
+    ///
+    /// # Arguments
+    ///
+    /// * `admin_data` - Certificate data for admin user
+    /// * `root_ca_password` - Password to unlock Root CA private key
+    ///
+    /// # Returns
+    ///
+    /// Tuple of (Storage<Ready>, admin_cert_pem, admin_key_pem)
+    ///
+    /// # State Transition
+    ///
+    /// Initialized -> Ready
+    pub fn create_admin(
+        self,
+        admin_data: CertificateData,
+        root_ca_password: String,
+    ) -> Result<(Storage<Ready>, Vec<u8>, Vec<u8>)> {
+        println!("👤 Creating first admin user...");
+
+        // Load Root CA private key
+        let root_key_block = self.state.private_key_chain.get_block_by_height(0)?;
+        let root_private_key = PKey::private_key_from_pem_passphrase(
+            &root_key_block.block_data(),
+            root_ca_password.as_bytes(),
+        )
+        .context("Failed to decrypt Root CA private key - invalid password?")?;
+        println!("✓ Root CA private key unlocked");
+
+        // Generate admin intermediate CA
+        let (admin_intermediate_key, admin_intermediate_cert) = generate_key_pair(
+            CertificateData {
+                subject_common_name: format!(
+                    "{} - Intermediate CA",
+                    admin_data.subject_common_name
+                ),
+                issuer_common_name: self
+                    .state
+                    .root_ca_cert
+                    .subject_name()
+                    .entries_by_nid(openssl::nid::Nid::COMMONNAME)
+                    .next()
+                    .and_then(|e| e.data().as_utf8().ok())
+                    .map(|d| d.to_string())
+                    .context("Root CA missing CN")?,
+                organization: admin_data.organization.clone(),
+                organizational_unit: admin_data.organizational_unit.clone(),
+                country: admin_data.country.clone(),
+                state: admin_data.state.clone(),
+                locality: admin_data.locality.clone(),
+                cert_type: CertificateDataType::IntermediateCA,
+                validity_days: 365 * 5, // 5 years
+            },
+            &root_private_key,
+        )?;
+        println!("✓ Admin intermediate CA generated");
+
+        // Encrypt and store intermediate CA certificate
+        let encrypted_intermediate_cert = EncryptedData::encrypt_data(
+            admin_intermediate_cert.to_der()?,
+            self.state.app_public_key.clone(),
+        )?;
+        let admin_intermediate_height = self
+            .state
+            .certificate_chain
+            .put_block(encrypted_intermediate_cert.serialize_encrypted_data())?;
+        println!(
+            "✓ Admin intermediate CA stored at height {}",
+            admin_intermediate_height
+        );
+
+        // Encrypt and store intermediate CA private key (with Root CA public key)
+        let root_public_key = self.state.root_ca_cert.public_key()?;
+        let encrypted_intermediate_key = EncryptedData::encrypt_data(
+            admin_intermediate_key.private_key_to_der()?,
+            root_public_key.clone(),
+        )?;
+        self.state
+            .private_key_chain
+            .put_block(encrypted_intermediate_key.serialize_encrypted_data())?;
+        println!("✓ Admin intermediate CA private key stored");
+
+        // Generate admin user certificate
+        let (admin_user_key, admin_user_cert) =
+            generate_key_pair(admin_data, &admin_intermediate_key)?;
+        println!("✓ Admin user certificate generated");
+
+        // Encrypt and store admin user certificate
+        let encrypted_user_cert = EncryptedData::encrypt_data(
+            admin_user_cert.to_der()?,
+            self.state.app_public_key.clone(),
+        )?;
+        let admin_user_height = self
+            .state
+            .certificate_chain
+            .put_block(encrypted_user_cert.serialize_encrypted_data())?;
+        println!(
+            "✓ Admin user certificate stored at height {}",
+            admin_user_height
+        );
+
+        // Encrypt and store admin user private key (with Root CA public key)
+        let encrypted_user_key =
+            EncryptedData::encrypt_data(admin_user_key.private_key_to_der()?, root_public_key)?;
+        self.state
+            .private_key_chain
+            .put_block(encrypted_user_key.serialize_encrypted_data())?;
+        println!("✓ Admin user private key stored");
+
+        // Update subject name index
+        let mut subject_name_to_height = self.state.subject_name_to_height;
+
+        let intermediate_subject = admin_intermediate_cert
+            .subject_name()
+            .entries_by_nid(openssl::nid::Nid::COMMONNAME)
+            .next()
+            .and_then(|e| e.data().as_utf8().ok())
+            .map(|d| d.to_string())
+            .context("Intermediate CA missing CN")?;
+        subject_name_to_height.insert(intermediate_subject, admin_intermediate_height);
+
+        let user_subject = admin_user_cert
+            .subject_name()
+            .entries_by_nid(openssl::nid::Nid::COMMONNAME)
+            .next()
+            .and_then(|e| e.data().as_utf8().ok())
+            .map(|d| d.to_string())
+            .context("User cert missing CN")?;
+        subject_name_to_height.insert(user_subject, admin_user_height);
+
+        println!("✅ First admin user created successfully!");
+
+        // Export certificate and private key as PEM for download
+        let admin_cert_pem = admin_user_cert.to_pem()?;
+        let admin_key_pem = admin_user_key.private_key_to_pem_pkcs8()?;
+
+        Ok((
+            Storage {
+                state: Ready {
+                    certificate_chain: self.state.certificate_chain,
+                    private_key_chain: self.state.private_key_chain,
+                    crl_chain: self.state.crl_chain,
+                    app_public_key: self.state.app_public_key,
+                    root_ca_cert: self.state.root_ca_cert,
+                    admin_intermediate_height,
+                    admin_user_height,
+                    subject_name_to_height,
+                },
+            },
+            admin_cert_pem,
+            admin_key_pem,
+        ))
+    }
+}
+
+// ============================================================================
+// Storage<Ready> - Admin exists, system ready for operations
+// ============================================================================
+
+impl Storage<Ready> {
+    /// Open existing blockchains in Ready state
+    ///
+    /// Verifies Root CA and admin user exist in blockchains.
+    pub fn open() -> Result<Self> {
+        let config = AppConfig::load().context("Failed to load configuration")?;
+
+        // Load application keys
+        let app_public_key = Storage::<NoExist>::load_app_public_key(&config)?;
+        let app_private_key_pem = fs::read(&config.key_exports.app_key_path)
+            .context("Failed to read application private key")?;
+        let app_private_key = PKey::private_key_from_pem(&app_private_key_pem)
+            .context("Failed to parse application private key")?;
+
+        // Open blockchains
+        let certificate_chain = open_read_write_chain(config.blockchains.certificate_path.clone())
+            .context("Failed to open certificate blockchain")?;
+
+        let private_key_chain = open_read_write_chain(config.blockchains.private_key_path.clone())
+            .context("Failed to open private key blockchain")?;
+
+        let crl_chain = open_read_write_chain(config.blockchains.crl_path.clone())
+            .context("Failed to open CRL blockchain")?;
+
+        // Verify minimum blocks exist (Root CA + Intermediate + User = 3)
+        let cert_count = certificate_chain.block_count()?;
+        if cert_count < 3 {
+            return Err(anyhow!("Certificate blockchain has {} blocks, need at least 3 (Root + Intermediate + User)", cert_count));
+        }
+
+        // Load Root CA certificate
+        let root_ca_block = certificate_chain.get_block_by_height(0)?;
+        let encrypted_cert_data = deserialize_encrypted_data(&root_ca_block.block_data())?;
+        let root_cert_der = encrypted_cert_data.decrypt_data(app_private_key.clone())?;
+        let root_ca_cert =
+            X509::from_der(&root_cert_der).context("Failed to parse Root CA certificate")?;
+
+        // Admin is typically at heights 1 (intermediate) and 2 (user)
+        let admin_intermediate_height = 1;
+        let admin_user_height = 2;
+
+        // Build subject name index by iterating through all certificates
+        let mut subject_name_to_height = HashMap::new();
+        let cert_count = certificate_chain.block_count()?;
+
+        for height in 0..cert_count {
+            let block = certificate_chain.get_block_by_height(height)?;
+            let encrypted_cert_data = deserialize_encrypted_data(&block.block_data())?;
+            let cert_der = encrypted_cert_data.decrypt_data(app_private_key.clone())?;
+            let cert = X509::from_der(&cert_der).context("Failed to parse certificate")?;
+
+            let subject_cn = cert
+                .subject_name()
+                .entries_by_nid(openssl::nid::Nid::COMMONNAME)
+                .next()
+                .and_then(|e| e.data().as_utf8().ok())
+                .map(|d| d.to_string())
+                .context("Certificate missing CN")?;
+
+            subject_name_to_height.insert(subject_cn, height);
+        }
+
+        Ok(Storage {
+            state: Ready {
+                certificate_chain,
+                private_key_chain,
+                crl_chain,
+                app_public_key,
+                root_ca_cert,
+                admin_intermediate_height,
+                admin_user_height,
+                subject_name_to_height,
+            },
+        })
+    }
+
+    /// Get certificate count
+    pub fn certificate_count(&self) -> Result<u64> {
+        self.state.certificate_chain.block_count()
+    }
+
+    /// Get CRL count
+    pub fn crl_count(&self) -> Result<u64> {
+        self.state.crl_chain.block_count()
+    }
+
+    /// Get certificate by subject common name
+    pub fn get_certificate_by_subject(&self, subject_cn: &str) -> Result<Option<X509>> {
+        if let Some(&height) = self.state.subject_name_to_height.get(subject_cn) {
+            let block = self.state.certificate_chain.get_block_by_height(height)?;
+
+            // Load app private key to decrypt
+            let config = AppConfig::load().context("Failed to load config")?;
+            let app_private_key_pem = fs::read(&config.key_exports.app_key_path)
+                .context("Failed to read application private key")?;
+            let app_private_key = PKey::private_key_from_pem(&app_private_key_pem)
+                .context("Failed to parse application private key")?;
+
+            // Decrypt certificate
+            let encrypted_cert_data = deserialize_encrypted_data(&block.block_data())?;
+            let cert_der = encrypted_cert_data.decrypt_data(app_private_key)?;
+            let cert = X509::from_der(&cert_der).context("Failed to parse certificate")?;
+
+            Ok(Some(cert))
+        } else {
+            Ok(None)
+        }
+    }
+}
+
+// ============================================================================
+// API Mode - Read-only access to certificates and CRL
+// ============================================================================
+
+/// API Mode: Read-only access to certificates and CRL (no private keys)
+pub struct APIStorage {
+    certificate_chain: BlockChain<ReadOnly>,
+    crl_chain: BlockChain<ReadOnly>,
+    subject_name_to_height: HashMap<String, u64>,
+}
+
+impl APIStorage {
+    /// Open blockchains in read-only API mode
+    pub fn open() -> Result<Self> {
+        let config = AppConfig::load().context("Failed to load configuration")?;
+
+        // Open blockchains in read-only mode
+        let certificate_chain = open_read_only_chain(config.blockchains.certificate_path.clone())
+            .context("Failed to open certificate blockchain")?;
+
+        let crl_chain = open_read_only_chain(config.blockchains.crl_path.clone())
+            .context("Failed to open CRL blockchain")?;
+
+        // Build subject name index (requires decryption - TODO)
+        let subject_name_to_height = HashMap::new();
+
+        Ok(APIStorage {
+            certificate_chain,
+            crl_chain,
+            subject_name_to_height,
+        })
+    }
+
+    /// Get certificate count
+    pub fn certificate_count(&self) -> Result<u64> {
+        self.certificate_chain.block_count()
+    }
+
+    /// Get CRL count
+    pub fn crl_count(&self) -> Result<u64> {
+        self.crl_chain.block_count()
+    }
+}
+
+// ============================================================================
+// Admin Mode - Full access including private keys
+// ============================================================================
+
+/// Admin Mode: Full access to all blockchains including private keys
+pub struct AdminStorage {
+    certificate_chain: BlockChain<ReadWrite>,
+    private_key_chain: BlockChain<ReadWrite>,
+    crl_chain: BlockChain<ReadWrite>,
+    app_public_key: PKey<Public>,
+    root_ca_cert: X509,
+    subject_name_to_height: HashMap<String, u64>,
+}
+
+impl AdminStorage {
+    /// Open blockchains in admin mode
+    pub fn open() -> Result<Self> {
+        // For now, delegate to Storage<Ready>::open() and convert
+        let ready = Storage::<Ready>::open()?;
+
+        Ok(AdminStorage {
+            certificate_chain: ready.state.certificate_chain,
+            private_key_chain: ready.state.private_key_chain,
+            crl_chain: ready.state.crl_chain,
+            app_public_key: ready.state.app_public_key,
+            root_ca_cert: ready.state.root_ca_cert,
+            subject_name_to_height: ready.state.subject_name_to_height,
+        })
+    }
+
+    /// Get certificate count
+    pub fn certificate_count(&self) -> Result<u64> {
+        self.certificate_chain.block_count()
+    }
+
+    /// Get private key count
+    pub fn private_key_count(&self) -> Result<u64> {
+        self.private_key_chain.block_count()
+    }
+
+    /// Get CRL count
+    pub fn crl_count(&self) -> Result<u64> {
+        self.crl_chain.block_count()
+    }
+}
+
+// ============================================================================
+// Utility Functions
+// ============================================================================
+
+/// Determine the current state of storage without fully opening it
+///
+/// This function checks if blockchains exist and inspects their contents
+/// to determine whether the system is uninitialized, initialized with Root CA,
+/// or ready with admin user.
+///
+/// # Returns
+///
+/// * `StorageState::NoExist` - Blockchains don't exist or are empty
+/// * `StorageState::Initialized` - Root CA exists at height 0
+/// * `StorageState::Ready` - Admin intermediate CA and user cert exist (heights 1, 2)
+///
+/// # Errors
+///
+/// Returns an error if:
+/// - Configuration cannot be loaded
+/// - Blockchains exist but cannot be opened
+/// - Storage is in an inconsistent state (mismatched block counts)
+///
+/// # Example
+///
+/// ```no_run
+/// # use pki_chain::storage::{check_storage_state, StorageState};
+/// match check_storage_state()? {
+///     StorageState::NoExist => println!("Need to initialize"),
+///     StorageState::Initialized => println!("Need to create admin"),
+///     StorageState::Ready => println!("System ready"),
+/// }
+/// # Ok::<(), anyhow::Error>(())
+/// ```
+pub fn check_storage_state() -> Result<StorageState> {
+    let config = AppConfig::load().context("Failed to load configuration")?;
+
+    // Check if blockchains exist on disk
+    let cert_exists = config.blockchains.certificate_path.exists();
+    let key_exists = config.blockchains.private_key_path.exists();
+    let crl_exists = config.blockchains.crl_path.exists();
+
+    if !cert_exists || !key_exists || !crl_exists {
+        return Ok(StorageState::NoExist);
+    }
+
+    // Open blockchains in read-only mode to check contents
+    let cert_chain = open_read_only_chain(config.blockchains.certificate_path.clone())
+        .context("Failed to open certificate blockchain for state check")?;
+    let key_chain = open_read_only_chain(config.blockchains.private_key_path.clone())
+        .context("Failed to open private key blockchain for state check")?;
+
+    let cert_count = cert_chain.block_count()?;
+    let key_count = key_chain.block_count()?;
+
+    // Verify blockchains are in sync
+    if cert_count != key_count {
+        return Err(anyhow!(
+            "Storage in inconsistent state: {} certificates, {} keys",
+            cert_count,
+            key_count
+        ));
+    }
+
+    // Determine state based on block count
+    match cert_count {
+        0 => Ok(StorageState::NoExist),
+        1 => Ok(StorageState::Initialized),
+        n if n >= 3 => Ok(StorageState::Ready),
+        _ => Err(anyhow!(
+            "Storage in inconsistent state: expected 0, 1, or 3+ blocks, found {}",
+            cert_count
+        )),
+    }
+}
+
+/// Clear all storage (destructive operation)
+pub fn clear_storage() -> Result<()> {
+    let config = AppConfig::load().context("Failed to load configuration")?;
+
+    println!("⚠️  Clearing all storage...");
+
+    // Remove certificate blockchain
+    if config.blockchains.certificate_path.exists() {
+        fs::remove_dir_all(&config.blockchains.certificate_path)
+            .context("Failed to remove certificate blockchain")?;
+        println!("✓ Certificate blockchain removed");
+    }
+
+    // Remove private key blockchain
+    if config.blockchains.private_key_path.exists() {
+        fs::remove_dir_all(&config.blockchains.private_key_path)
+            .context("Failed to remove private key blockchain")?;
+        println!("✓ Private key blockchain removed");
+    }
+
+    // Remove CRL blockchain
+    if config.blockchains.crl_path.exists() {
+        fs::remove_dir_all(&config.blockchains.crl_path)
+            .context("Failed to remove CRL blockchain")?;
+        println!("✓ CRL blockchain removed");
+    }
+
+    println!("✅ Storage cleared successfully");
+    Ok(())
 }

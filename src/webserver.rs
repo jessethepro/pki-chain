@@ -1,117 +1,651 @@
 use crate::configs::AppConfig;
-use crate::protocol::{Protocol, Request, Response};
-use crate::storage::Storage;
-use axum::{routing::get, Json, Router};
+use crate::pki_generator::CertificateData;
+use crate::storage::{check_storage_state, clear_storage, Storage, StorageState};
+use crate::templates;
+use axum::{
+    extract::{Multipart, State},
+    response::{Html, IntoResponse, Redirect},
+    routing::{get, post},
+    Form, Router,
+};
 use axum_server::tls_rustls::RustlsConfig;
-use serde::{Deserialize, Serialize};
+use base64::Engine;
+use openssl::hash::MessageDigest;
+use openssl::pkey::{PKey, Private, Public};
+use openssl::sign::Verifier;
+use openssl::x509::X509;
+use secrecy::{ExposeSecret, SecretString};
+use serde::Deserialize;
+use std::fs;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use tower_http::services::fs::ServeDir;
+use tokio::sync::Mutex;
+use tracing::{error, info, warn};
+use tracing_appender::rolling::{RollingFileAppender, Rotation};
+use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
-#[derive(Serialize)]
-struct PKIStatusResponse {
-    message: String,
-    status: String,
-    total_certificates: u64,
-    total_keys: u64,
-    tracked_subject_names: usize,
-    certificate_chain_valid: bool,
-    private_key_chain_valid: bool,
-    pki_chain_in_sync: bool,
+/// CA Server State
+#[derive(Clone)]
+enum CAServerState {
+    NoExist,
+    Initialized {
+        root_ca_password: SecretString,
+    },
+    CreateAdmin {
+        root_ca_password: SecretString,
+    },
+    Ready,
+    Authenticated {
+        root_ca_password: SecretString,
+        user_cert_cn: String,
+    },
+}
+
+/// Shared application state
+type AppState = Arc<Mutex<CAServerState>>;
+
+#[derive(Deserialize)]
+struct InitializeForm {
+    root_ca_password: String,
 }
 
 #[derive(Deserialize)]
-struct CertRequest {
-    subject_cn: String,
-    issuer_cn: String,
+struct CreateAdminForm {
+    common_name: String,
     organization: String,
-    organizational_unit: Option<String>,
-    locality: Option<String>,
-    state: Option<String>,
-    country: Option<String>,
-    validity_days: u32,
+    organizational_unit: String,
+    locality: String,
+    state: String,
+    country: String,
 }
 
-#[derive(Serialize)]
-struct CertResponse {
-    success: bool,
-    message: String,
-    certificate: Option<String>,
-    subject_dn: String,
-    issuer_dn: String,
-}
+// Login uses Multipart for file uploads
 
-pub fn start_webserver(_default_configs: AppConfig, storage: Storage) {
-    let protocol = Arc::new(Protocol::new(storage));
-    let rt = tokio::runtime::Runtime::new().expect("Failed to create Tokio runtime");
+pub fn start_webserver() {
+    // Create logs directory if it doesn't exist
+    if let Err(e) = fs::create_dir_all("logs") {
+        eprintln!("Failed to create logs directory: {}", e);
+        std::process::exit(1);
+    }
+
+    // Set up logging to file and console
+    let file_appender = RollingFileAppender::new(Rotation::DAILY, "logs", "webserver.log");
+    let (non_blocking, _guard) = tracing_appender::non_blocking(file_appender);
+
+    tracing_subscriber::registry()
+        .with(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| "pki_chain=info,axum=info,tower_http=info".into()),
+        )
+        .with(tracing_subscriber::fmt::layer().with_writer(non_blocking))
+        .with(tracing_subscriber::fmt::layer().with_writer(std::io::stdout))
+        .init();
+
+    info!("Starting PKI Chain Certificate Authority web server");
+
+    let rt = match tokio::runtime::Runtime::new() {
+        Ok(runtime) => runtime,
+        Err(e) => {
+            error!("Failed to create Tokio runtime: {}", e);
+            eprintln!("Failed to create Tokio runtime: {}", e);
+            std::process::exit(1);
+        }
+    };
+
     rt.block_on(async {
-        let protocol_clone = Arc::clone(&protocol);
-        let app = Router::new()
-            .route(
-                "/api/status",
-                get(move || get_pki_status(Arc::clone(&protocol_clone))),
-            )
-            .fallback_service(ServeDir::new("web_root"));
+        // Load application configuration
+        let app_config = match AppConfig::load() {
+            Ok(config) => config,
+            Err(e) => {
+                error!("Failed to load config.toml: {}", e);
+                eprintln!(
+                    "Failed to load config.toml. Ensure config.toml exists in the project root."
+                );
+                eprintln!("Error: {}", e);
+                std::process::exit(1);
+            }
+        };
 
-        // Configure TLS with generated certificates
-        let config = RustlsConfig::from_pem_file(
-            "web_certs/server/chain.pem",
-            "web_certs/server/server.key",
+        // Check initial storage state
+        let initial_state = match check_storage_state() {
+            Ok(state) => match state {
+                StorageState::NoExist => {
+                    info!("Storage state: NoExist (fresh installation)");
+                    CAServerState::NoExist
+                }
+                StorageState::Initialized => {
+                    info!("Storage state: Initialized (Root CA exists)");
+                    CAServerState::Initialized {
+                        root_ca_password: SecretString::new(String::new().into()),
+                    }
+                }
+                StorageState::Ready => {
+                    info!("Storage state: Ready (admin exists)");
+                    CAServerState::Ready
+                }
+            },
+            Err(e) => {
+                warn!(
+                    "Failed to check storage state: {}. Defaulting to NoExist.",
+                    e
+                );
+                CAServerState::NoExist
+            }
+        };
+
+        let app_state = Arc::new(Mutex::new(initial_state));
+
+        let app = Router::new()
+            .route("/", get(index))
+            .route("/initialize", post(initialize))
+            .route("/create-admin", post(create_admin))
+            .route("/login", post(login))
+            .route("/admin/dashboard", get(admin_dashboard))
+            .route("/admin/create-user", get(admin_create_user))
+            .route("/admin/create-intermediate", get(admin_create_intermediate))
+            .route("/admin/status", get(admin_status))
+            .route("/logout", post(logout))
+            .with_state(app_state);
+
+        // Configure TLS with certificates from config
+        let tls_config = match RustlsConfig::from_pem_file(
+            &app_config.server.tls_cert_path,
+            &app_config.server.tls_key_path,
         )
         .await
-        .expect("Failed to load TLS certificates. Run ./generate-certs.sh first.");
+        {
+            Ok(config) => config,
+            Err(e) => {
+                error!("Failed to load TLS certificates: {}", e);
+                eprintln!("Failed to load TLS certificates. Run ./generate-certs.sh first.");
+                eprintln!("Error: {}", e);
+                std::process::exit(1);
+            }
+        };
 
-        let addr = SocketAddr::from(([0, 0, 0, 0], 3000));
+        // Parse server address from config
+        let addr: SocketAddr =
+            match format!("{}:{}", app_config.server.host, app_config.server.port).parse() {
+                Ok(addr) => addr,
+                Err(e) => {
+                    error!("Failed to parse server address from config: {}", e);
+                    eprintln!("Failed to parse server address from config: {}", e);
+                    std::process::exit(1);
+                }
+            };
 
-        println!("🔒 HTTPS Server starting...");
-        println!("   Address: https://localhost:3000");
-        println!("   Serving static files from web_root/");
-        println!("   API endpoint: POST /api/generate-cert");
-        println!("\n📜 Using certificates:");
-        println!("   Certificate chain: certs/server/chain.pem");
-        println!("   Private key: certs/server/server.key");
-        println!("\n⚠️  Make sure you've installed the root CA:");
-        println!("   - System: Already done if you ran the script");
-        println!("   - Firefox: See instructions from generate-certs.sh");
+        info!("🔒 PKI Chain Certificate Authority");
+        info!(
+            "   HTTPS: https://{}:{}",
+            app_config.server.host, app_config.server.port
+        );
+        info!("   TLS Cert: {}", app_config.server.tls_cert_path.display());
+        info!("   TLS Key: {}", app_config.server.tls_key_path.display());
+        info!("   Web Root: {}", app_config.server.web_root.display());
+        info!("   Log Directory: logs/");
+        info!("✅ Server ready!");
+
+        println!("🔒 PKI Chain Certificate Authority");
+        println!(
+            "   HTTPS: https://{}:{}",
+            app_config.server.host, app_config.server.port
+        );
+        println!("   TLS Cert: {}", app_config.server.tls_cert_path.display());
+        println!("   TLS Key: {}", app_config.server.tls_key_path.display());
+        println!("   Web Root: {}", app_config.server.web_root.display());
+        println!("   Log Directory: logs/");
         println!("\n✅ Server ready!\n");
 
-        axum_server::bind_rustls(addr, config)
+        if let Err(e) = axum_server::bind_rustls(addr, tls_config)
             .serve(app.into_make_service())
             .await
-            .unwrap();
+        {
+            error!("Server error: {}", e);
+            eprintln!("Server error: {}", e);
+            std::process::exit(1);
+        }
     });
 }
 
-async fn get_pki_status(protocol: Arc<Protocol>) -> Json<PKIStatusResponse> {
-    match protocol.process_request(Request::PKIStatus) {
-        Ok(Response::PKIStatus {
-            message,
-            status,
-            total_certificates,
-            total_keys,
-            tracked_subject_names,
-            certificate_chain_valid,
-            private_key_chain_valid,
-            pki_chain_in_sync,
-        }) => Json(PKIStatusResponse {
-            message,
-            status,
-            total_certificates,
-            total_keys,
-            tracked_subject_names,
-            certificate_chain_valid,
-            private_key_chain_valid,
-            pki_chain_in_sync,
-        }),
-        _ => Json(PKIStatusResponse {
-            message: "Failed to get PKI status".to_string(),
-            status: "Error".to_string(),
-            total_certificates: 0,
-            total_keys: 0,
-            tracked_subject_names: 0,
-            certificate_chain_valid: false,
-            private_key_chain_valid: false,
-            pki_chain_in_sync: false,
-        }),
+// ============================================================================
+// Route Handlers
+// ============================================================================
+
+async fn index(State(ca_state): State<AppState>) -> Html<String> {
+    let ca_state = ca_state.lock().await;
+
+    let markup = match &*ca_state {
+        CAServerState::NoExist => templates::render_initialize_page(),
+        CAServerState::Initialized { .. } | CAServerState::CreateAdmin { .. } => {
+            templates::render_create_admin_page()
+        }
+        CAServerState::Ready => templates::render_login_page(),
+        CAServerState::Authenticated { .. } => {
+            drop(ca_state);
+            return Html(
+                "<meta http-equiv='refresh' content='0;url=/admin/dashboard'>".to_string(),
+            );
+        }
+    };
+
+    Html(markup.into_string())
+}
+
+async fn initialize(
+    State(ca_state): State<AppState>,
+    Form(form): Form<InitializeForm>,
+) -> Html<String> {
+    let config = match AppConfig::load() {
+        Ok(c) => c,
+        Err(e) => {
+            return Html(
+                templates::render_error(&format!("Failed to load config: {}", e)).into_string(),
+            )
+        }
+    };
+
+    // Clear existing storage if any
+    if let Err(e) = clear_storage() {
+        return Html(
+            templates::render_error(&format!("Failed to clear storage: {}", e)).into_string(),
+        );
+    }
+
+    // Initialize storage with Root CA
+    let storage = match Storage::new() {
+        Ok(s) => s,
+        Err(e) => {
+            return Html(
+                templates::render_error(&format!("Failed to create storage: {}", e)).into_string(),
+            )
+        }
+    };
+
+    match storage.initialize(form.root_ca_password.clone()) {
+        Ok(_) => {
+            // Update state to CreateAdmin with password
+            let mut state = ca_state.lock().await;
+            *state = CAServerState::CreateAdmin {
+                root_ca_password: SecretString::new(form.root_ca_password.into()),
+            };
+
+            Html(
+                templates::render_success(
+                    "Root CA initialized successfully! Please create the first admin user.",
+                )
+                .into_string(),
+            )
+        }
+        Err(e) => {
+            Html(templates::render_error(&format!("Failed to initialize: {}", e)).into_string())
+        }
+    }
+}
+
+async fn create_admin(
+    State(ca_state): State<AppState>,
+    Form(form): Form<CreateAdminForm>,
+) -> impl IntoResponse {
+    info!(
+        "Received admin creation request for CN: {}",
+        form.common_name
+    );
+
+    let mut state = ca_state.lock().await;
+
+    let password = match &*state {
+        CAServerState::CreateAdmin { root_ca_password }
+        | CAServerState::Initialized { root_ca_password } => {
+            root_ca_password.expose_secret().clone()
+        }
+        _ => {
+            error!("Invalid state for creating admin: current state does not allow admin creation");
+            return Html(templates::render_error("Invalid state for creating admin").into_string())
+                .into_response();
+        }
+    };
+
+    let admin_data = CertificateData {
+        subject_common_name: form.common_name.clone(),
+        issuer_common_name: String::new(), // Will be set by storage
+        organization: form.organization,
+        organizational_unit: form.organizational_unit,
+        locality: form.locality,
+        state: form.state,
+        country: form.country,
+        cert_type: crate::pki_generator::CertificateDataType::UserCert,
+        validity_days: 365 * 2, // 2 years
+    };
+
+    let storage = match crate::storage::Storage::<crate::storage::Initialized>::open() {
+        Ok(s) => s,
+        Err(e) => {
+            return Html(
+                templates::render_error(&format!("Failed to open storage: {}", e)).into_string(),
+            )
+            .into_response()
+        }
+    };
+
+    match storage.create_admin(admin_data, password.to_string()) {
+        Ok((_storage, cert_pem, key_pem)) => {
+            info!("Admin user created successfully: {}", form.common_name);
+            // Transition to Ready state (password dropped)
+            *state = CAServerState::Ready;
+            drop(state); // Release lock
+
+            // Create a simple HTML page with download links
+            let cert_filename = format!("{}.crt", form.common_name.replace(" ", "_"));
+            let key_filename = format!("{}.key", form.common_name.replace(" ", "_"));
+
+            let cert_b64 =
+                base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &cert_pem);
+            let key_b64 =
+                base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &key_pem);
+
+            let html_response = templates::render_admin_created_with_downloads(
+                &cert_filename,
+                &key_filename,
+                &cert_b64,
+                &key_b64,
+            );
+
+            Html(html_response.into_string()).into_response()
+        }
+        Err(e) => {
+            Html(templates::render_error(&format!("Failed to create admin: {}", e)).into_string())
+                .into_response()
+        }
+    }
+}
+
+async fn login(State(ca_state): State<AppState>, mut multipart: Multipart) -> Html<String> {
+    info!("Received login request");
+
+    let mut cert_data: Option<Vec<u8>> = None;
+    let mut key_data: Option<Vec<u8>> = None;
+    let mut root_ca_password: Option<String> = None;
+
+    // Parse multipart form data
+    while let Some(field) = multipart.next_field().await.unwrap_or(None) {
+        let name = field.name().unwrap_or("").to_string();
+        let data = field.bytes().await.unwrap_or_default();
+
+        match name.as_str() {
+            "certificate" => cert_data = Some(data.to_vec()),
+            "private_key" => key_data = Some(data.to_vec()),
+            "root_ca_password" => {
+                root_ca_password = Some(String::from_utf8_lossy(&data).to_string())
+            }
+            _ => {}
+        }
+    }
+
+    // Validate all required fields are present
+    let cert_bytes = match cert_data {
+        Some(data) => data,
+        None => return Html(templates::render_error("Certificate file is required").into_string()),
+    };
+
+    let key_bytes = match key_data {
+        Some(data) => data,
+        None => return Html(templates::render_error("Private key file is required").into_string()),
+    };
+
+    let password = match root_ca_password {
+        Some(pwd) => pwd,
+        None => return Html(templates::render_error("Root CA password is required").into_string()),
+    };
+
+    // Step 1: Parse certificate
+    let user_cert = match X509::from_pem(&cert_bytes) {
+        Ok(cert) => cert,
+        Err(_) => {
+            return Html(
+                templates::render_error("Invalid certificate format (expected PEM)").into_string(),
+            )
+        }
+    };
+
+    // Step 2: Parse private key
+    let user_private_key = match PKey::private_key_from_pem(&key_bytes) {
+        Ok(key) => key,
+        Err(_) => {
+            return Html(
+                templates::render_error("Invalid private key format (expected PEM)").into_string(),
+            )
+        }
+    };
+
+    // Step 3: Verify public/private key pair match
+    let cert_public_key = match user_cert.public_key() {
+        Ok(key) => key,
+        Err(_) => {
+            return Html(
+                templates::render_error("Failed to extract public key from certificate")
+                    .into_string(),
+            )
+        }
+    };
+
+    if !keys_match(&user_private_key, &cert_public_key) {
+        return Html(
+            templates::render_error("Private key does not match certificate").into_string(),
+        );
+    }
+
+    // Step 4: Verify Root CA password by attempting to decrypt Root CA key
+    let config = match AppConfig::load() {
+        Ok(c) => c,
+        Err(e) => {
+            return Html(
+                templates::render_error(&format!("Failed to load config: {}", e)).into_string(),
+            )
+        }
+    };
+
+    let storage = match crate::storage::Storage::<crate::storage::Ready>::open() {
+        Ok(s) => s,
+        Err(e) => {
+            return Html(
+                templates::render_error(&format!("Failed to open storage: {}", e)).into_string(),
+            )
+        }
+    };
+
+    // Try to verify password by loading Root CA private key
+    let root_ca_valid = verify_root_ca_password(&password);
+    if !root_ca_valid {
+        return Html(templates::render_error("Invalid Root CA password").into_string());
+    }
+
+    // Step 5: Verify certificate exists in blockchain
+    let cert_subject = match user_cert
+        .subject_name()
+        .entries_by_nid(openssl::nid::Nid::COMMONNAME)
+        .next()
+        .and_then(|e| e.data().as_utf8().ok())
+        .map(|d| d.to_string())
+    {
+        Some(cn) => cn,
+        None => {
+            return Html(templates::render_error("Certificate missing Common Name").into_string())
+        }
+    };
+
+    // Verify certificate exists in storage
+    let cert_exists = storage
+        .get_certificate_by_subject(&cert_subject)
+        .unwrap_or(None)
+        .is_some();
+
+    if !cert_exists {
+        warn!(
+            "Login attempt with certificate not found in PKI system: {}",
+            cert_subject
+        );
+        return Html(templates::render_error("Certificate not found in PKI system").into_string());
+    }
+
+    // Step 6: Challenge-Response authentication
+    // Generate random challenge data
+    let mut challenge = vec![0u8; 32];
+    openssl::rand::rand_bytes(&mut challenge).unwrap();
+
+    // Sign challenge with private key
+    let signature = match sign_data(&user_private_key, &challenge) {
+        Ok(sig) => sig,
+        Err(_) => {
+            return Html(templates::render_error("Failed to sign challenge data").into_string())
+        }
+    };
+
+    // Verify signature with certificate's public key
+    let signature_valid = match verify_signature(&cert_public_key, &challenge, &signature) {
+        Ok(valid) => valid,
+        Err(_) => return Html(templates::render_error("Failed to verify signature").into_string()),
+    };
+
+    if !signature_valid {
+        return Html(
+            templates::render_error("Invalid signature - authentication failed").into_string(),
+        );
+    }
+
+    // All checks passed - authenticate user
+    info!("User authenticated successfully: {}", cert_subject);
+    let mut state = ca_state.lock().await;
+    *state = CAServerState::Authenticated {
+        root_ca_password: SecretString::new(password.into()),
+        user_cert_cn: cert_subject.clone(),
+    };
+
+    Html(templates::render_success("Login successful! Redirecting to dashboard...").into_string())
+}
+
+// Helper function to verify public/private key pair match
+fn keys_match(private_key: &PKey<Private>, public_key: &PKey<Public>) -> bool {
+    // Sign test data with private key and verify with public key
+    let test_data = b"authentication_test";
+
+    match sign_data(private_key, test_data) {
+        Ok(signature) => match verify_signature(public_key, test_data, &signature) {
+            Ok(valid) => valid,
+            Err(_) => false,
+        },
+        Err(_) => false,
+    }
+}
+
+// Helper function to sign data with private key
+fn sign_data(
+    private_key: &PKey<Private>,
+    data: &[u8],
+) -> Result<Vec<u8>, openssl::error::ErrorStack> {
+    use openssl::sign::Signer;
+    let mut signer = Signer::new(MessageDigest::sha256(), private_key)?;
+    signer.update(data)?;
+    signer.sign_to_vec()
+}
+
+// Helper function to verify signature with public key
+fn verify_signature(
+    public_key: &PKey<Public>,
+    data: &[u8],
+    signature: &[u8],
+) -> Result<bool, openssl::error::ErrorStack> {
+    let mut verifier = Verifier::new(MessageDigest::sha256(), public_key)?;
+    verifier.update(data)?;
+    verifier.verify(signature)
+}
+
+// Helper function to verify Root CA password
+fn verify_root_ca_password(password: &str) -> bool {
+    use std::fs;
+
+    let config = match AppConfig::load() {
+        Ok(c) => c,
+        Err(_) => return false,
+    };
+
+    // Try to open the private key blockchain and decrypt Root CA key
+    let key_chain_path = config.blockchains.private_key_path;
+    if !key_chain_path.exists() {
+        return false;
+    }
+
+    match libblockchain::blockchain::open_read_only_chain(key_chain_path) {
+        Ok(chain) => {
+            if let Ok(count) = chain.block_count() {
+                if count == 0 {
+                    return false;
+                }
+            }
+
+            // Try to get and decrypt Root CA key at height 0
+            match chain.get_block_by_height(0) {
+                Ok(block) => {
+                    // Try to decrypt the key with the provided password
+                    match PKey::private_key_from_pem_passphrase(
+                        &block.block_data(),
+                        password.as_bytes(),
+                    ) {
+                        Ok(_) => true,
+                        Err(_) => false,
+                    }
+                }
+                Err(_) => false,
+            }
+        }
+        Err(_) => false,
+    }
+}
+
+async fn logout(State(ca_state): State<AppState>) -> Redirect {
+    info!("User logged out");
+    let mut state = ca_state.lock().await;
+    *state = CAServerState::Ready;
+    Redirect::to("/")
+}
+
+async fn admin_dashboard(State(ca_state): State<AppState>) -> Html<String> {
+    let state = ca_state.lock().await;
+
+    match &*state {
+        CAServerState::Authenticated { user_cert_cn, .. } => {
+            Html(templates::render_admin_dashboard(user_cert_cn).into_string())
+        }
+        _ => Html(templates::render_error("Not authenticated").into_string()),
+    }
+}
+
+async fn admin_create_user(State(ca_state): State<AppState>) -> Html<String> {
+    let state = ca_state.lock().await;
+
+    match &*state {
+        CAServerState::Authenticated { .. } => {
+            Html(templates::render_create_user_page().into_string())
+        }
+        _ => Html(templates::render_error("Not authenticated").into_string()),
+    }
+}
+
+async fn admin_create_intermediate(State(ca_state): State<AppState>) -> Html<String> {
+    let state = ca_state.lock().await;
+
+    match &*state {
+        CAServerState::Authenticated { .. } => {
+            Html(templates::render_create_intermediate_page().into_string())
+        }
+        _ => Html(templates::render_error("Not authenticated").into_string()),
+    }
+}
+
+async fn admin_status(State(ca_state): State<AppState>) -> Html<String> {
+    let state = ca_state.lock().await;
+
+    match &*state {
+        CAServerState::Authenticated { .. } => Html(templates::render_status_page().into_string()),
+        _ => Html(templates::render_error("Not authenticated").into_string()),
     }
 }

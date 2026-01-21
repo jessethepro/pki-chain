@@ -3,9 +3,29 @@
 [blockchains]
 certificate_path = "data/certificates"
 private_key_path = "data/private_keys"
+crl_path = "data/crl"
 
 [key_exports]
-key_export_directory_path = "exports/keystore"
 app_key_path = "key/app.key"
+app_cert_path = "certificate/app.crt"
 root_key_name = "0.key.enc"
-key_archive_name = "key-archive.tar"
+# Optional: defaults to "exports/keystore" if not specified
+# key_export_directory_path = "exports/keystore"
+
+# Optional: Server configuration - uses defaults if not specified
+[server]
+host = "127.0.0.1"
+port = 3000
+web_root = "web_root"
+tls_cert_path = "web_certs/server/chain.pem"
+tls_key_path = "web_certs/server/server.key"
+
+# Optional: Root CA defaults - uses hardcoded defaults if not specified
+[root_ca_defaults]
+root_ca_common_name = "MenaceLabs Root CA"
+root_ca_organization = "MenaceLabs"
+root_ca_organizational_unit = "CY"
+root_ca_locality = "Sao Jose dos Campos"
+root_ca_state = "SP"
+root_ca_country = "BR"
+root_ca_validity_days = 3650

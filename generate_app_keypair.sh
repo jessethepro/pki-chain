@@ -1,5 +1,5 @@
 #!/bin/bash
-# generate_app_keypair.sh - Generate application keypair with password-protected key and self-signed certificate
+# generate_app_keypair.sh - Generate application keypair (unencrypted) with self-signed certificate
 
 set -e
 
@@ -60,25 +60,6 @@ fi
 
 VALIDITY_DAYS=$((VALIDITY_YEARS * 365))
 
-# Secure password input if not set
-if [ -z "$PASSWORD" ]; then
-    echo
-    echo "Enter password for private key (will be hidden):"
-    read -s PASSWORD
-    echo "Confirm password:"
-    read -s PASSWORD_CONFIRM
-    
-    if [ "$PASSWORD" != "$PASSWORD_CONFIRM" ]; then
-        echo "Error: Passwords do not match"
-        exit 1
-    fi
-    
-    if [ -z "$PASSWORD" ]; then
-        echo "Error: Password cannot be empty"
-        exit 1
-    fi
-fi
-
 echo
 echo "Generating application keypair..."
 
@@ -116,15 +97,14 @@ if [ -n "$EMAIL" ]; then
     echo "subjectAltName = email:${EMAIL}" >> "$EXT_CONF"
 fi
 
-# Generate password-protected private key (4096-bit RSA with AES-256 encryption)
-echo "Generating password-protected RSA private key (4096-bit)..."
-openssl genrsa -aes256 -passout "pass:${PASSWORD}" -out "$OUTPUT_KEY" 4096 2>/dev/null
+# Generate unencrypted private key (4096-bit RSA)
+echo "Generating RSA private key (4096-bit, unencrypted)..."
+openssl genrsa -out "$OUTPUT_KEY" 4096 2>/dev/null
 
 # Generate self-signed certificate
 echo "Generating self-signed X.509 certificate..."
 openssl req -new -x509 -days "$VALIDITY_DAYS" \
     -key "$OUTPUT_KEY" \
-    -passin "pass:${PASSWORD}" \
     -out "$OUTPUT_CRT" \
     -subj "$SUBJECT" \
     -set_serial "0x${SERIAL}" \
@@ -136,7 +116,7 @@ THUMBPRINT=$(openssl x509 -in "$OUTPUT_CRT" -noout -fingerprint -sha256 | cut -d
 
 echo
 echo "=== Application Keypair Generated Successfully ==="
-echo "Private key file: $OUTPUT_KEY (password-protected with AES-256)"
+echo "Private key file: $OUTPUT_KEY (UNENCRYPTED - keep secure!)"
 echo "Certificate file: $OUTPUT_CRT"
 echo "Serial Number: $SERIAL"
 echo "Thumbprint (SHA-256): $THUMBPRINT"
@@ -157,5 +137,6 @@ echo "Certificate Details:"
 openssl x509 -in "$OUTPUT_CRT" -noout -subject -dates -fingerprint -sha256
 
 echo
-echo "IMPORTANT: Keep $OUTPUT_KEY secure and remember the password!"
+echo "⚠️  WARNING: Private key is NOT password-protected!"
+echo "IMPORTANT: Keep $OUTPUT_KEY secure with restrictive file permissions!"
 echo "Done!"

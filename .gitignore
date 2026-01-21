@@ -1,15 +1,69 @@
+# Rust build artifacts
 /target
+**/*.rs.bk
+Cargo.lock
 
-# Certificate and key files
+# Certificate and key files (SENSITIVE)
 *.pfx
 *.cer
 *.crt
 *.key
 *.csr
 *.pem
+*.p12
+*.der
+*.enc
 
-# Blockchain data
-/data
+# Application keys and certificates (SENSITIVE)
+/key/
+/certificate/
 
-# Encrypted key store (contains sensitive cryptographic material)
-/exports
+# Blockchain databases (contains all PKI data - SENSITIVE)
+/data/
+/data/certificates/
+/data/private_keys/
+/data/crl/
+
+# Encrypted key stores (contains private keys - SENSITIVE)
+/exports/
+/exports/keystore/
+
+# TLS certificates for web server (regenerate with generate-certs.sh)
+/web_certs/
+/web_certs/root/
+/web_certs/intermediate/
+/web_certs/server/
+
+# Log files (may contain sensitive information)
+/logs/
+*.log
+
+# Backup files
+*.backup
+*.bak
+*.old
+*~
+
+# Temporary files
+*.tmp
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# Editor and IDE files
+.vscode/
+.idea/
+*.iml
+.project
+.classpath
+.settings/
+
+# Environment files
+.env
+.env.local
+.env.*.local
+
+# Test artifacts
+/test_output/
+/temp/
