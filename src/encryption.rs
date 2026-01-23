@@ -14,7 +14,6 @@ pub const AES_GCM_TAG_SIZE: usize = 16; // 128 bits
 /// Size of data length field in serialized format (u32 = 4 bytes)
 pub const DATA_LEN_SIZE: usize = 4; // u32 for block length
 pub struct EncryptedData {
-    iv: Vec<u8>,
     tag: Vec<u8>,
     nonce: Vec<u8>,
     encrypted_aes_key: Vec<u8>,
@@ -57,7 +56,6 @@ impl EncryptedData {
             Ok(ciphertext)
         })()?;
         Ok(EncryptedData {
-            iv: vec![],
             encrypted_aes_key,
             tag: tag.to_vec(),
             nonce: nonce.to_vec(),
@@ -163,7 +161,6 @@ pub fn deserialize_encrypted_data(serialized_data: &[u8]) -> Result<EncryptedDat
     let encrypted_data = serialized_data[offset..offset + data_len].to_vec();
 
     Ok(EncryptedData {
-        iv: vec![],
         encrypted_aes_key,
         nonce,
         tag,
