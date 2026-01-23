@@ -25,13 +25,16 @@ Built in Rust with enterprise-grade cryptography, PKI Chain provides a complete 
 - 🔐 **State-Driven Authentication**: NoExist → Initialized → CreateAdmin → Ready → Authenticated
 - 📜 **X.509 Certificate Login**: Upload certificate + private key for authentication
 - 🔑 **Challenge-Response**: Cryptographic proof of private key ownership
-- 💾 **Auto-Download Credentials**: Certificate and key files after admin creation
+- � **Admin-Only Access**: Only administrators can access the web UI (verified via certificate OU field)
+- �💾 **Auto-Download Credentials**: Certificate and key files after admin creation
 - 🎨 **Custom UI**: Maud HTML templates with plum purple styling (rgb(46, 15, 92))
 
 ### PKI Management
 - 🏗️ **Three-Tier Hierarchy**: Root CA → Intermediate CA → User Certificates
 - 🔒 **4096-bit RSA Keys**: Strong cryptography with SHA-256 signatures
 - 📋 **Admin Dashboard**: Manage certificates and view system status
+- 📝 **Web Forms**: Create intermediate CAs and user certificates via UI
+- 🎯 **Smart Certificate Creation**: User certificates don't require Root CA password
 - ✅ **Certificate Validation**: OpenSSL-based chain validation
 - 🔄 **Transactional Safety**: Automatic rollback on storage failures
 
@@ -39,11 +42,11 @@ Built in Rust with enterprise-grade cryptography, PKI Chain provides a complete 
 - 🔐 **Hybrid Storage Architecture**: 
   - Certificates stored as DER in blockchain (encrypted with app key)
   - Root CA: PKCS#8 PEM with password protection
-  - Other keys: RSA + AES-GCM-256 hybrid encryption
+  - All other keys: Encrypted with app.key (RSA + AES-GCM-256)
   - SHA-512 hashes and signatures in blockchain
 - 🔑 **In-Memory Key Management**: Secure runtime storage with zeroize on drop
-- 🛡️ **Password-Protected Root CA**: Never stored in plaintext
-- 🔐 **Encrypted Private Keys**: Hybrid RSA-OAEP + AES-GCM-256
+- 🛡️ **Password-Protected Root CA**: Only needed for signing intermediate CAs
+- 🔐 **Encrypted Private Keys**: Hybrid RSA-OAEP + AES-GCM-256 with app.key
 
 ### Logging & Monitoring
 - 📝 **Tracing Framework**: Structured logging with tracing-subscriber
@@ -110,8 +113,11 @@ Access the web application at **https://127.0.0.1:3000**
    ✓ Private key matches certificate public key
    ✓ Root CA password is correct
    ✓ Challenge-response signature valid
+   ✓ Certificate has admin privileges (OU field ends with " Admin")
 5. Access granted to admin dashboard
 ```
+
+**Note**: Only users with admin certificates (OU field ending in " Admin") can access the web UI. This suffix is automatically added during admin user creation.
 
 **Security Note**: Browser will show security warning for self-signed TLS certificate (expected for local development).
 
@@ -178,23 +184,29 @@ Access the web application at **https://127.0.0.1:3000**
 ### Key Modules
 
 - **[main.rs](src/main.rs)** (96 lines): Entry point, launches webserver
-- **[webserver.rs](src/webserver.rs)** (552 lines): Axum HTTPS server with state machine
+- **[webserver.rs](src/webserver.rs)** (963 lines): Axum HTTPS server with state machine
   - CA server states: NoExist, Initialized, CreateAdmin, Ready, Authenticated
+  - Admin-only authentication via certificate OU field verification
   - Tracing initialization with daily rotation
   - All panics replaced with graceful error handling
-- **[templates.rs](src/templates.rs)** (411 lines): Maud HTML templates
+- **[templates.rs](src/templates.rs)** (619 lines): Maud HTML templates
   - State-driven page rendering
   - Custom CSS with plum purple theme
   - Certificate/key download pages
-- **[storage.rs](src/storage.rs)** (784 lines): Type-state blockchain storage
+  - User certificate creation form with intermediate CA dropdown
+  - Intermediate CA creation form
+- **[storage.rs](src/storage.rs)** (1039 lines): Type-state blockchain storage
   - Three separate blockchains (certificates, keys, CRL)
   - In-memory subject name index for fast lookups
   - Transactional operations with rollback
-- **[pki_generator.rs](src/pki_generator.rs)** (217 lines): Certificate generation
+  - User certificate creation without Root CA password
+  - Intermediate CA detection by issuer (issued by Root CA)
+- **[pki_generator.rs](src/pki_generator.rs)** (251 lines): Certificate generation
   - Unified generation for all certificate types
   - 4096-bit RSA keys, SHA-256 signatures
+  - Proper issuer DN field generation
 - **[encryption.rs](src/encryption.rs)** (211 lines): Hybrid RSA + AES-GCM-256
-- **[configs.rs](src/configs.rs)** (157 lines): TOML configuration management
+- **[configs.rs](src/configs.rs)** (149 lines): TOML configuration management
 
 ### PKI Hierarchy
 
@@ -207,18 +219,21 @@ Root CA (self-signed, pathlen=1)
 ### Storage Architecture
 
 **Blockchain Layer** (RocksDB):
-- **Certificate Chain**: X.509 certificates in DER format (encrypted with app.crt)
-- **Private Key Chain**: SHA-512 hashes + signatures (encrypted with app.crt)
-- **CRL Chain**: Certificate Revocation Lists (encrypted with app.crt)
-
-**Filesystem Layer** (`exports/keystore/`):
-- **Root CA Key**: PKCS#8 PEM with password protection
-- **Other Keys**: Hybrid RSA-OAEP + AES-GCM-256 encryption
+- **Certificate Chain**: X.509 certificates in DER format (encrypted with app.key)
+- **Private Key Chain**: Private keys encrypted, SHA-512 hashes + signatures
+  - Root CA: PKCS#8 PEM with password protection
+  - All others: Encrypted with app.key (RSA-OAEP + AES-GCM-256)
+- **CRL Chain**: Certificate Revocation Lists (encrypted with app.key)
 
 **In-Memory**:
-- Application key loaded from `key/app.key` (decrypts blockchains)
+- Application key loaded from `key/app.key` (decrypts all blockchains and non-Root CA keys)
 - Certificate index: `HashMap<String, u64>` for O(1) lookups
 - Secure memory handling with zeroize on drop
+
+**Key Benefits**:
+- Root CA password only required for creating intermediate CAs
+- User certificates can be created without exposing Root CA password
+- All operations except intermediate CA signing use app.key (in-memory)
 
 ## Installation
 
@@ -281,7 +296,9 @@ Access the web application at **https://127.0.0.1:3000**
 
 2. **Create Admin User** (auto-downloads certificate + key):
    - Fill out Distinguished Name fields (CN, O, OU, L, ST, C)
-   - System creates intermediate CA + user certificate
+   - Enter Root CA password (required to sign admin's intermediate CA)
+   - System creates admin intermediate CA + admin user certificate
+   - OU field automatically appended with " Admin" suffix
    - Browser auto-downloads `<username>.crt` and `<username>.key`
 
 3. **Login** (X.509 certificate authentication):
@@ -289,12 +306,13 @@ Access the web application at **https://127.0.0.1:3000**
    - Upload `.key` file (private key)
    - Enter Root CA password
    - Challenge-response verification authenticates you
+   - System verifies admin status (OU field must end with " Admin")
 
 4. **Admin Dashboard** (certificate management):
-   - Create user certificates
-   - Create intermediate CAs
-   - View system status
-   - Certificate validation
+   - **Create Intermediate CAs**: Requires Root CA password
+   - **Create User Certificates**: No Root CA password needed (uses app.key)
+   - **View System Status**: Blockchain statistics and validation
+   - **Logout**: End authenticated session
 
 ### Logging
 
@@ -374,26 +392,27 @@ On first run, the web interface guides you through initialization:
 - **Storage**: Private key stored as password-protected PKCS#8 PEM in blockchain
 
 ### Heights 1-2: First Admin (Created During Setup)
-- **Height 1**: Admin Intermediate CA (pathlen=0, signed by Root)
-- **Height 2**: Admin User Certificate (signed by Admin Intermediate)
-- **Private Keys**: Encrypted with Root CA public key (hybrid RSA + AES-GCM-256)
+- **Height 1**: Admin Intermediate CA (CN="Admin User Intermediate", pathlen=0, signed by Root)
+- **Height 2**: Admin User Certificate (OU ends with " Admin", signed by Admin Intermediate)
+- **Private Keys**: Encrypted with app.key (hybrid RSA + AES-GCM-256)
 
 ### Heights 3+: User-Created Certificates
 All subsequent certificates created via admin dashboard:
-- **Intermediate CAs**: pathlen=0, configurable validity
-- **User Certificates**: CA=false, configurable validity
-- **Encryption**: All private keys encrypted with Root CA public key
+- **Intermediate CAs**: pathlen=0, configurable validity, requires Root CA password
+- **User Certificates**: CA=false, configurable validity, no Root CA password needed
+- **Encryption**: All private keys (except Root CA) encrypted with app.key
 
 ## Certificate Parameters
 
 - **RSA Key Size**: 4096 bits
 - **Signature Algorithm**: SHA-256 with RSA
 - **Root CA**: pathlen=1, validity 10 years (default)
-- **Intermediate CA**: pathlen=0, validity 5 years (default)
-- **User Certificates**: CA=false, validity 2 years (default)
+- **Intermediate CA**: pathlen=0, validity 5 years (default), requires Root CA password to create
+- **User Certificates**: CA=false, validity 1 year (default), no Root CA password needed
+- **Admin Certificates**: OU field ends with " Admin" suffix (automatically added)
 - **Encryption**:
-  - Root CA: PKCS#8 PEM with password protection
-  - Others: Hybrid RSA-OAEP + AES-256-GCM (AES key encrypted with Root CA public key)
+  - Root CA: PKCS#8 PEM with password protection (only needed for signing intermediate CAs)
+  - All others: Hybrid RSA-OAEP + AES-256-GCM encrypted with app.key from memory
 
 ## Development
 
@@ -403,15 +422,14 @@ All subsequent certificates created via admin dashboard:
 pki-chain/
 ├── src/
 │   ├── lib.rs                       # Library interface
-│   ├── main.rs                      # Application entry point
-│   ├── webserver.rs                 # HTTPS web server (Axum + state machine)
-│   ├── templates.rs                 # Maud HTML templates (411 lines)
-│   ├── storage.rs                   # Type-state blockchain storage (784 lines)
-│   ├── pki_generator.rs             # Unified certificate generation
-│   ├── encryption.rs                # Hybrid RSA + AES-GCM-256 encryption
-│   ├── private_key_storage.rs       # Encrypted key store utilities
-│   ├── key_archive.rs               # Tar-based key backup/restore
-│   └── configs.rs                   # TOML configuration parsing
+│   ├── main.rs                      # Application entry point (96 lines)
+│   ├── webserver.rs                 # HTTPS web server (Axum + state machine, 963 lines)
+│   ├── templates.rs                 # Maud HTML templates (619 lines)
+│   ├── storage.rs                   # Type-state blockchain storage (1039 lines)
+│   ├── pki_generator.rs             # Unified certificate generation (251 lines)
+│   ├── encryption.rs                # Hybrid RSA + AES-GCM-256 encryption (211 lines)
+│   ├── key_archive.rs               # Tar-based key backup/restore (139 lines)
+│   └── configs.rs                   # TOML configuration parsing (149 lines)
 ├── .github/
 │   └── copilot-instructions.md      # AI coding assistant instructions
 ├── config.toml                     # Configuration file
