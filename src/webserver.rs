@@ -57,6 +57,31 @@ struct CreateAdminForm {
     locality: String,
     state: String,
     country: String,
+    root_ca_password: String,
+}
+
+#[derive(Deserialize)]
+struct CreateIntermediateForm {
+    common_name: String,
+    organization: String,
+    organizational_unit: String,
+    locality: String,
+    state: String,
+    country: String,
+    validity_days: u32,
+    root_ca_password: String,
+}
+
+#[derive(Deserialize)]
+struct CreateUserForm {
+    intermediate_ca: String,
+    common_name: String,
+    organization: String,
+    organizational_unit: String,
+    locality: String,
+    state: String,
+    country: String,
+    validity_days: u32,
 }
 
 // Login uses Multipart for file uploads
@@ -143,6 +168,11 @@ pub fn start_webserver() {
             .route("/admin/dashboard", get(admin_dashboard))
             .route("/admin/create-user", get(admin_create_user))
             .route("/admin/create-intermediate", get(admin_create_intermediate))
+            .route(
+                "/admin/create-intermediate",
+                post(submit_create_intermediate),
+            )
+            .route("/admin/create-user", post(submit_create_user))
             .route("/admin/status", get(admin_status))
             .route("/logout", post(logout))
             .with_state(app_state);
@@ -293,28 +323,27 @@ async fn create_admin(
 
     let mut state = ca_state.lock().await;
 
-    let password = match &*state {
-        CAServerState::CreateAdmin { root_ca_password }
-        | CAServerState::Initialized { root_ca_password } => {
-            root_ca_password.expose_secret().clone()
-        }
-        _ => {
-            error!("Invalid state for creating admin: current state does not allow admin creation");
-            return Html(templates::render_error("Invalid state for creating admin").into_string())
-                .into_response();
-        }
-    };
+    // Verify we're in the correct state (Initialized or CreateAdmin)
+    if !matches!(
+        &*state,
+        CAServerState::CreateAdmin { .. } | CAServerState::Initialized { .. }
+    ) {
+        error!("Invalid state for creating admin: current state does not allow admin creation");
+        return Html(templates::render_error("Invalid state for creating admin").into_string())
+            .into_response();
+    }
 
     let admin_data = CertificateData {
         subject_common_name: form.common_name.clone(),
         issuer_common_name: String::new(), // Will be set by storage
         organization: form.organization,
-        organizational_unit: form.organizational_unit,
+        organizational_unit: format!("{} Admin", form.organizational_unit), // Mark as Admin
         locality: form.locality,
         state: form.state,
         country: form.country,
         cert_type: crate::pki_generator::CertificateDataType::UserCert,
         validity_days: 365 * 2, // 2 years
+        is_admin: true,
     };
 
     let storage = match crate::storage::Storage::<crate::storage::Initialized>::open() {
@@ -327,7 +356,7 @@ async fn create_admin(
         }
     };
 
-    match storage.create_admin(admin_data, password.to_string()) {
+    match storage.create_admin(admin_data, form.root_ca_password.clone()) {
         Ok((_storage, cert_pem, key_pem)) => {
             info!("Admin user created successfully: {}", form.common_name);
             // Transition to Ready state (password dropped)
@@ -512,8 +541,21 @@ async fn login(State(ca_state): State<AppState>, mut multipart: Multipart) -> Ht
         );
     }
 
+    // Step 7: Verify admin status - check if this is an admin certificate
+    // Admin certificates have a specific marker that we check
+    let is_admin = check_admin_status(&user_cert);
+    if !is_admin {
+        warn!("Login attempt with non-admin certificate: {}", cert_subject);
+        return Html(
+            templates::render_error(
+                "Access denied: This certificate does not have administrative privileges. Only administrators can access the web interface."
+            )
+            .into_string(),
+        );
+    }
+
     // All checks passed - authenticate user
-    info!("User authenticated successfully: {}", cert_subject);
+    info!("Admin user authenticated successfully: {}", cert_subject);
     let mut state = ca_state.lock().await;
     *state = CAServerState::Authenticated {
         root_ca_password: SecretString::new(password.into()),
@@ -521,6 +563,25 @@ async fn login(State(ca_state): State<AppState>, mut multipart: Multipart) -> Ht
     };
 
     Html(templates::render_success("Login successful! Redirecting to dashboard...").into_string())
+}
+
+// Helper function to check if certificate has admin privileges
+fn check_admin_status(cert: &X509) -> bool {
+    // Check if the certificate was created as an admin certificate
+    // Admin certificates have " Admin" suffix in their OU field
+    // This is set during create_admin flow
+
+    if let Some(ou) = cert
+        .subject_name()
+        .entries_by_nid(openssl::nid::Nid::ORGANIZATIONALUNITNAME)
+        .next()
+        .and_then(|e| e.data().as_utf8().ok())
+    {
+        // Check for " Admin" suffix (note the leading space)
+        return ou.ends_with(" Admin");
+    }
+
+    false
 }
 
 // Helper function to verify public/private key pair match
@@ -624,7 +685,30 @@ async fn admin_create_user(State(ca_state): State<AppState>) -> Html<String> {
 
     match &*state {
         CAServerState::Authenticated { .. } => {
-            Html(templates::render_create_user_page().into_string())
+            drop(state); // Release lock before I/O
+
+            // Open storage to get list of intermediate CAs
+            let storage = match crate::storage::Storage::<crate::storage::Ready>::open() {
+                Ok(s) => s,
+                Err(e) => {
+                    return Html(
+                        templates::render_error(&format!("Failed to open storage: {}", e))
+                            .into_string(),
+                    )
+                }
+            };
+
+            let intermediate_cas = match storage.list_intermediate_cas() {
+                Ok(cas) => cas,
+                Err(e) => {
+                    return Html(
+                        templates::render_error(&format!("Failed to list intermediate CAs: {}", e))
+                            .into_string(),
+                    )
+                }
+            };
+
+            Html(templates::render_create_user_page(&intermediate_cas).into_string())
         }
         _ => Html(templates::render_error("Not authenticated").into_string()),
     }
@@ -641,11 +725,242 @@ async fn admin_create_intermediate(State(ca_state): State<AppState>) -> Html<Str
     }
 }
 
+async fn submit_create_intermediate(
+    State(ca_state): State<AppState>,
+    Form(form): Form<CreateIntermediateForm>,
+) -> Html<String> {
+    info!(
+        "Received intermediate CA creation request for CN: {}",
+        form.common_name
+    );
+
+    let state = ca_state.lock().await;
+
+    // Verify authenticated
+    if !matches!(&*state, CAServerState::Authenticated { .. }) {
+        return Html(templates::render_error("Not authenticated").into_string());
+    }
+
+    drop(state); // Release lock before long operations
+
+    // Open storage
+    let storage = match crate::storage::Storage::<crate::storage::Ready>::open() {
+        Ok(s) => s,
+        Err(e) => {
+            return Html(
+                templates::render_error(&format!("Failed to open storage: {}", e)).into_string(),
+            )
+        }
+    };
+
+    // Prepare certificate data
+    let cert_data = CertificateData {
+        subject_common_name: form.common_name.clone(),
+        issuer_common_name: String::new(), // Will be set to Root CA CN by storage
+        organization: form.organization,
+        organizational_unit: form.organizational_unit,
+        locality: form.locality,
+        state: form.state,
+        country: form.country,
+        cert_type: crate::pki_generator::CertificateDataType::IntermediateCA,
+        validity_days: form.validity_days,
+        is_admin: false,
+    };
+
+    // Create intermediate CA
+    match storage.create_intermediate(cert_data, form.root_ca_password) {
+        Ok((cert_pem, key_pem)) => {
+            info!("Intermediate CA created successfully: {}", form.common_name);
+
+            // Create download files
+            let cert_filename = format!("{}.crt", form.common_name.replace(" ", "_"));
+            let key_filename = format!("{}.key", form.common_name.replace(" ", "_"));
+
+            let cert_b64 =
+                base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &cert_pem);
+            let key_b64 =
+                base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &key_pem);
+
+            Html(
+                templates::render_intermediate_created_with_downloads(
+                    &cert_filename,
+                    &key_filename,
+                    &cert_b64,
+                    &key_b64,
+                )
+                .into_string(),
+            )
+        }
+        Err(e) => Html(
+            templates::render_error(&format!("Failed to create intermediate CA: {}", e))
+                .into_string(),
+        ),
+    }
+}
+
+async fn submit_create_user(
+    State(ca_state): State<AppState>,
+    Form(form): Form<CreateUserForm>,
+) -> Html<String> {
+    info!(
+        "Received user certificate creation request for CN: {}",
+        form.common_name
+    );
+
+    let state = ca_state.lock().await;
+
+    // Verify authenticated
+    if !matches!(&*state, CAServerState::Authenticated { .. }) {
+        return Html(templates::render_error("Not authenticated").into_string());
+    }
+
+    drop(state); // Release lock before long operations
+
+    // Open storage
+    let storage = match crate::storage::Storage::<crate::storage::Ready>::open() {
+        Ok(s) => s,
+        Err(e) => {
+            return Html(
+                templates::render_error(&format!("Failed to open storage: {}", e)).into_string(),
+            )
+        }
+    };
+
+    // Prepare certificate data
+    let cert_data = CertificateData {
+        subject_common_name: form.common_name.clone(),
+        issuer_common_name: String::new(), // Will be set to intermediate CA CN by storage
+        organization: form.organization,
+        organizational_unit: form.organizational_unit,
+        locality: form.locality,
+        state: form.state,
+        country: form.country,
+        cert_type: crate::pki_generator::CertificateDataType::UserCert,
+        validity_days: form.validity_days,
+        is_admin: false,
+    };
+
+    // Create user certificate
+    match storage.create_user_certificate(cert_data, &form.intermediate_ca) {
+        Ok((cert_pem, key_pem)) => {
+            info!(
+                "User certificate created successfully: {}",
+                form.common_name
+            );
+
+            // Create download files
+            let cert_filename = format!("{}.crt", form.common_name.replace(" ", "_"));
+            let key_filename = format!("{}.key", form.common_name.replace(" ", "_"));
+
+            let cert_b64 =
+                base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &cert_pem);
+            let key_b64 =
+                base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &key_pem);
+
+            Html(
+                templates::render_user_created_with_downloads(
+                    &cert_filename,
+                    &key_filename,
+                    &cert_b64,
+                    &key_b64,
+                )
+                .into_string(),
+            )
+        }
+        Err(e) => Html(
+            templates::render_error(&format!("Failed to create user certificate: {}", e))
+                .into_string(),
+        ),
+    }
+}
+
 async fn admin_status(State(ca_state): State<AppState>) -> Html<String> {
     let state = ca_state.lock().await;
 
     match &*state {
-        CAServerState::Authenticated { .. } => Html(templates::render_status_page().into_string()),
+        CAServerState::Authenticated { .. } => {
+            // Open storage to get statistics
+            let storage = match crate::storage::Storage::<crate::storage::Ready>::open() {
+                Ok(s) => s,
+                Err(e) => {
+                    return Html(
+                        templates::render_error(&format!("Failed to open storage: {}", e))
+                            .into_string(),
+                    )
+                }
+            };
+
+            // Get certificate count
+            let cert_count = match storage.certificate_count() {
+                Ok(count) => count,
+                Err(e) => {
+                    return Html(
+                        templates::render_error(&format!("Failed to get certificate count: {}", e))
+                            .into_string(),
+                    )
+                }
+            };
+
+            // Get private key count (from private_key_chain)
+            let config = match AppConfig::load() {
+                Ok(c) => c,
+                Err(e) => {
+                    return Html(
+                        templates::render_error(&format!("Failed to load config: {}", e))
+                            .into_string(),
+                    )
+                }
+            };
+
+            let key_count = match libblockchain::blockchain::open_read_only_chain(
+                config.blockchains.private_key_path.clone(),
+            ) {
+                Ok(chain) => match chain.block_count() {
+                    Ok(count) => count,
+                    Err(e) => {
+                        return Html(
+                            templates::render_error(&format!("Failed to get key count: {}", e))
+                                .into_string(),
+                        )
+                    }
+                },
+                Err(e) => {
+                    return Html(
+                        templates::render_error(&format!("Failed to open key blockchain: {}", e))
+                            .into_string(),
+                    )
+                }
+            };
+
+            // Validate blockchains
+            let cert_validation_ok = if let Ok(chain) =
+                libblockchain::blockchain::open_read_only_chain(
+                    config.blockchains.certificate_path.clone(),
+                ) {
+                chain.validate().is_ok()
+            } else {
+                false
+            };
+
+            let key_validation_ok = if let Ok(chain) =
+                libblockchain::blockchain::open_read_only_chain(
+                    config.blockchains.private_key_path.clone(),
+                ) {
+                chain.validate().is_ok()
+            } else {
+                false
+            };
+
+            Html(
+                templates::render_status_page(
+                    cert_count,
+                    key_count,
+                    cert_validation_ok,
+                    key_validation_ok,
+                )
+                .into_string(),
+            )
+        }
         _ => Html(templates::render_error("Not authenticated").into_string()),
     }
 }

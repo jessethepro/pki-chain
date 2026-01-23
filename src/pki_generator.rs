@@ -31,6 +31,7 @@ pub struct CertificateData {
     pub country: String,
     pub validity_days: u32,
     pub cert_type: CertificateDataType,
+    pub is_admin: bool,
 }
 
 pub fn generate_root_ca(cert_data: CertificateData) -> Result<(PKey<Private>, X509)> {
@@ -103,15 +104,42 @@ pub fn generate_key_pair(
         .append_entry_by_nid(openssl::nid::Nid::COUNTRYNAME, &cert_data.country)
         .map_err(|e| anyhow!("Failed to set country: {}", e))?;
 
-    let name = name_builder.build();
+    let subject_name = name_builder.build();
 
     builder
-        .set_subject_name(&name)
+        .set_subject_name(&subject_name)
         .map_err(|e| anyhow!("Failed to set subject: {}", e))?;
-    // Set issuer name
+
+    // Build issuer name (different from subject unless self-signed)
+    let mut issuer_name_builder = openssl::x509::X509Name::builder()
+        .map_err(|e| anyhow!("Failed to create issuer name builder: {}", e))?;
+    issuer_name_builder
+        .append_entry_by_nid(openssl::nid::Nid::COMMONNAME, &cert_data.issuer_common_name)
+        .map_err(|e| anyhow!("Failed to set issuer CN: {}", e))?;
+    issuer_name_builder
+        .append_entry_by_nid(openssl::nid::Nid::ORGANIZATIONNAME, &cert_data.organization)
+        .map_err(|e| anyhow!("Failed to set issuer organization: {}", e))?;
+    issuer_name_builder
+        .append_entry_by_nid(
+            openssl::nid::Nid::ORGANIZATIONALUNITNAME,
+            &cert_data.organizational_unit,
+        )
+        .map_err(|e| anyhow!("Failed to set issuer organizational unit: {}", e))?;
+    issuer_name_builder
+        .append_entry_by_nid(openssl::nid::Nid::LOCALITYNAME, &cert_data.locality)
+        .map_err(|e| anyhow!("Failed to set issuer locality: {}", e))?;
+    issuer_name_builder
+        .append_entry_by_nid(openssl::nid::Nid::STATEORPROVINCENAME, &cert_data.state)
+        .map_err(|e| anyhow!("Failed to set issuer state/province: {}", e))?;
+    issuer_name_builder
+        .append_entry_by_nid(openssl::nid::Nid::COUNTRYNAME, &cert_data.country)
+        .map_err(|e| anyhow!("Failed to set issuer country: {}", e))?;
+
+    let issuer_name = issuer_name_builder.build();
     builder
-        .set_issuer_name(&name)
+        .set_issuer_name(&issuer_name)
         .map_err(|e| anyhow!("Failed to set issuer: {}", e))?;
+
     // Set validity period
     let not_before = openssl::asn1::Asn1Time::days_from_now(0)
         .map_err(|e| anyhow!("Failed to create not_before: {}", e))?;
@@ -181,6 +209,11 @@ pub fn generate_key_pair(
             builder
                 .append_extension(ku_extension)
                 .map_err(|e| anyhow!("Failed to add KeyUsage: {}", e))?;
+
+            // Admin status is encoded in the OU field during certificate creation
+            // Admin certificates have " Admin" suffix in their OU field
+            // This is checked during login in webserver.rs
+
             builder
                 .sign(&signing_key, MessageDigest::sha256())
                 .map_err(|e| anyhow!("Failed to sign certificate: {}", e))?;

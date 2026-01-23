@@ -173,6 +173,7 @@ impl Storage<NoExist> {
             locality: config.root_ca_defaults.root_ca_locality.clone(),
             cert_type: CertificateDataType::RootCA,
             validity_days: config.root_ca_defaults.root_ca_validity_days,
+            is_admin: false,
         })?;
         println!("✓ Root CA generated");
 
@@ -348,10 +349,7 @@ impl Storage<Initialized> {
         // Generate admin intermediate CA
         let (admin_intermediate_key, admin_intermediate_cert) = generate_key_pair(
             CertificateData {
-                subject_common_name: format!(
-                    "{} - Intermediate CA",
-                    admin_data.subject_common_name
-                ),
+                subject_common_name: "Admin User Intermediate".to_string(),
                 issuer_common_name: self
                     .state
                     .root_ca_cert
@@ -368,6 +366,7 @@ impl Storage<Initialized> {
                 locality: admin_data.locality.clone(),
                 cert_type: CertificateDataType::IntermediateCA,
                 validity_days: 365 * 5, // 5 years
+                is_admin: false,
             },
             &root_private_key,
         )?;
@@ -387,20 +386,32 @@ impl Storage<Initialized> {
             admin_intermediate_height
         );
 
-        // Encrypt and store intermediate CA private key (with Root CA public key)
-        let root_public_key = self.state.root_ca_cert.public_key()?;
+        // Encrypt and store intermediate CA private key (with App public key)
         let encrypted_intermediate_key = EncryptedData::encrypt_data(
             admin_intermediate_key.private_key_to_der()?,
-            root_public_key.clone(),
+            self.state.app_public_key.clone(),
         )?;
         self.state
             .private_key_chain
             .put_block(encrypted_intermediate_key.serialize_encrypted_data())?;
         println!("✓ Admin intermediate CA private key stored");
 
+        // Get admin intermediate CA CN for user cert issuer
+        let admin_intermediate_cn = admin_intermediate_cert
+            .subject_name()
+            .entries_by_nid(openssl::nid::Nid::COMMONNAME)
+            .next()
+            .and_then(|e| e.data().as_utf8().ok())
+            .map(|d| d.to_string())
+            .context("Admin intermediate CA missing CN")?;
+
         // Generate admin user certificate
+        let admin_user_data = CertificateData {
+            issuer_common_name: admin_intermediate_cn,
+            ..admin_data
+        };
         let (admin_user_key, admin_user_cert) =
-            generate_key_pair(admin_data, &admin_intermediate_key)?;
+            generate_key_pair(admin_user_data, &admin_intermediate_key)?;
         println!("✓ Admin user certificate generated");
 
         // Encrypt and store admin user certificate
@@ -417,9 +428,11 @@ impl Storage<Initialized> {
             admin_user_height
         );
 
-        // Encrypt and store admin user private key (with Root CA public key)
-        let encrypted_user_key =
-            EncryptedData::encrypt_data(admin_user_key.private_key_to_der()?, root_public_key)?;
+        // Encrypt and store admin user private key (with App public key)
+        let encrypted_user_key = EncryptedData::encrypt_data(
+            admin_user_key.private_key_to_der()?,
+            self.state.app_public_key.clone(),
+        )?;
         self.state
             .private_key_chain
             .put_block(encrypted_user_key.serialize_encrypted_data())?;
@@ -561,6 +574,68 @@ impl Storage<Ready> {
         self.state.crl_chain.block_count()
     }
 
+    /// List all intermediate CA common names
+    pub fn list_intermediate_cas(&self) -> Result<Vec<String>> {
+        let config = AppConfig::load().context("Failed to load config")?;
+        let app_private_key_pem = fs::read(&config.key_exports.app_key_path)
+            .context("Failed to read application private key")?;
+        let app_private_key = PKey::private_key_from_pem(&app_private_key_pem)
+            .context("Failed to parse application private key")?;
+
+        let mut intermediate_cas = Vec::new();
+        let cert_count = self.state.certificate_chain.block_count()?;
+
+        // Get Root CA CN for comparison
+        let root_ca_cn = self
+            .state
+            .root_ca_cert
+            .subject_name()
+            .entries_by_nid(openssl::nid::Nid::COMMONNAME)
+            .next()
+            .and_then(|e| e.data().as_utf8().ok())
+            .map(|d| d.to_string())
+            .context("Root CA missing CN")?;
+
+        // Skip height 0 (Root CA), check all other certificates
+        for height in 1..cert_count {
+            let block = self.state.certificate_chain.get_block_by_height(height)?;
+            let encrypted_cert_data = deserialize_encrypted_data(&block.block_data())?;
+            let cert_der = encrypted_cert_data.decrypt_data(app_private_key.clone())?;
+            let cert = X509::from_der(&cert_der).context("Failed to parse certificate")?;
+
+            // Check if this is an intermediate CA:
+            // 1. Issued by Root CA (issuer CN matches Root CA CN)
+            // 2. Subject CN contains "Intermediate CA" (naming convention)
+            let issuer_cn = cert
+                .issuer_name()
+                .entries_by_nid(openssl::nid::Nid::COMMONNAME)
+                .next()
+                .and_then(|e| e.data().as_utf8().ok())
+                .map(|d| d.to_string());
+
+            let subject_cn = cert
+                .subject_name()
+                .entries_by_nid(openssl::nid::Nid::COMMONNAME)
+                .next()
+                .and_then(|e| e.data().as_utf8().ok())
+                .map(|d| d.to_string())
+                .context("Certificate missing CN")?;
+
+            // Check if this is an intermediate CA:
+            // 1. Issued by Root CA (issuer CN matches Root CA CN)
+            // 2. NOT a user certificate (user certs have " Admin" in OU or are signed by intermediate)
+            // Simple heuristic: anything issued directly by Root CA is an intermediate CA
+            if let Some(issuer) = issuer_cn {
+                if issuer == root_ca_cn {
+                    // This certificate was issued by Root CA, so it's an intermediate CA
+                    intermediate_cas.push(subject_cn);
+                }
+            }
+        }
+
+        Ok(intermediate_cas)
+    }
+
     /// Get certificate by subject common name
     pub fn get_certificate_by_subject(&self, subject_cn: &str) -> Result<Option<X509>> {
         if let Some(&height) = self.state.subject_name_to_height.get(subject_cn) {
@@ -582,6 +657,186 @@ impl Storage<Ready> {
         } else {
             Ok(None)
         }
+    }
+
+    /// Create intermediate CA certificate signed by Root CA
+    ///
+    /// # Arguments
+    ///
+    /// * `cert_data` - Certificate data for the intermediate CA
+    /// * `root_ca_password` - Password to decrypt Root CA private key
+    ///
+    /// # Returns
+    ///
+    /// Tuple of (certificate_pem, private_key_pem) for download
+    pub fn create_intermediate(
+        &self,
+        cert_data: CertificateData,
+        root_ca_password: String,
+    ) -> Result<(Vec<u8>, Vec<u8>)> {
+        println!("🔧 Creating intermediate CA...");
+
+        // Load Root CA private key from blockchain
+        let root_key_block = self.state.private_key_chain.get_block_by_height(0)?;
+        let root_private_key = PKey::private_key_from_pem_passphrase(
+            &root_key_block.block_data(),
+            root_ca_password.as_bytes(),
+        )
+        .context("Failed to decrypt Root CA private key - invalid password?")?;
+        println!("✓ Root CA private key unlocked");
+
+        // Set issuer to Root CA common name
+        let root_ca_cn = self
+            .state
+            .root_ca_cert
+            .subject_name()
+            .entries_by_nid(openssl::nid::Nid::COMMONNAME)
+            .next()
+            .and_then(|e| e.data().as_utf8().ok())
+            .map(|d| d.to_string())
+            .context("Root CA missing CN")?;
+
+        let cert_data_with_issuer = CertificateData {
+            issuer_common_name: root_ca_cn,
+            is_admin: false,
+            ..cert_data
+        };
+
+        // Generate intermediate CA certificate
+        let (intermediate_key, intermediate_cert) =
+            generate_key_pair(cert_data_with_issuer, &root_private_key)?;
+        println!("✓ Intermediate CA certificate generated");
+
+        // Encrypt and store intermediate CA certificate
+        let encrypted_intermediate_cert = EncryptedData::encrypt_data(
+            intermediate_cert.to_der()?,
+            self.state.app_public_key.clone(),
+        )?;
+        let intermediate_height = self
+            .state
+            .certificate_chain
+            .put_block(encrypted_intermediate_cert.serialize_encrypted_data())?;
+        println!(
+            "✓ Intermediate CA certificate stored at height {}",
+            intermediate_height
+        );
+
+        // Encrypt and store intermediate CA private key (with App public key)
+        let encrypted_intermediate_key = EncryptedData::encrypt_data(
+            intermediate_key.private_key_to_der()?,
+            self.state.app_public_key.clone(),
+        )?;
+        self.state
+            .private_key_chain
+            .put_block(encrypted_intermediate_key.serialize_encrypted_data())?;
+        println!("✓ Intermediate CA private key stored");
+
+        // Export as PEM for download
+        let cert_pem = intermediate_cert.to_pem()?;
+        let key_pem = intermediate_key.private_key_to_pem_pkcs8()?;
+
+        println!("✅ Intermediate CA created successfully!");
+
+        Ok((cert_pem, key_pem))
+    }
+
+    /// Create user certificate signed by an intermediate CA
+    ///
+    /// # Arguments
+    ///
+    /// * `cert_data` - Certificate data for the user
+    /// * `intermediate_ca_cn` - Common name of the intermediate CA to use as issuer
+    ///
+    /// # Returns
+    ///
+    /// Tuple of (certificate_pem, private_key_pem) for download
+    pub fn create_user_certificate(
+        &self,
+        cert_data: CertificateData,
+        intermediate_ca_cn: &str,
+    ) -> Result<(Vec<u8>, Vec<u8>)> {
+        println!("👤 Creating user certificate...");
+
+        // Load app private key for decryption
+        let config = AppConfig::load().context("Failed to load config")?;
+        let app_private_key_pem = fs::read(&config.key_exports.app_key_path)
+            .context("Failed to read application private key")?;
+        let app_private_key = PKey::private_key_from_pem(&app_private_key_pem)
+            .context("Failed to parse application private key")?;
+
+        // Get intermediate CA certificate
+        let intermediate_height = self
+            .state
+            .subject_name_to_height
+            .get(intermediate_ca_cn)
+            .context("Intermediate CA not found")?;
+
+        let intermediate_cert_block = self
+            .state
+            .certificate_chain
+            .get_block_by_height(*intermediate_height)?;
+        let encrypted_intermediate_cert_data =
+            deserialize_encrypted_data(&intermediate_cert_block.block_data())?;
+        let intermediate_cert_der =
+            encrypted_intermediate_cert_data.decrypt_data(app_private_key.clone())?;
+        let _intermediate_cert = X509::from_der(&intermediate_cert_der)
+            .context("Failed to parse intermediate CA certificate")?;
+        println!("✓ Intermediate CA certificate loaded");
+
+        // Get intermediate CA private key
+        let intermediate_key_block = self
+            .state
+            .private_key_chain
+            .get_block_by_height(*intermediate_height)?;
+        let encrypted_intermediate_key_data =
+            deserialize_encrypted_data(&intermediate_key_block.block_data())?;
+
+        // Decrypt intermediate private key with app private key
+        // (intermediate keys are encrypted with app key, not root key)
+        let intermediate_key_der =
+            encrypted_intermediate_key_data.decrypt_data(app_private_key.clone())?;
+        let intermediate_private_key = PKey::private_key_from_der(&intermediate_key_der)
+            .context("Failed to parse intermediate CA private key")?;
+        println!("✓ Intermediate CA private key loaded");
+
+        // Set issuer to intermediate CA common name
+        let cert_data_with_issuer = CertificateData {
+            issuer_common_name: intermediate_ca_cn.to_string(),
+            is_admin: false,
+            ..cert_data
+        };
+
+        // Generate user certificate
+        let (user_key, user_cert) =
+            generate_key_pair(cert_data_with_issuer, &intermediate_private_key)?;
+        println!("✓ User certificate generated");
+
+        // Encrypt and store user certificate
+        let encrypted_user_cert =
+            EncryptedData::encrypt_data(user_cert.to_der()?, self.state.app_public_key.clone())?;
+        let user_height = self
+            .state
+            .certificate_chain
+            .put_block(encrypted_user_cert.serialize_encrypted_data())?;
+        println!("✓ User certificate stored at height {}", user_height);
+
+        // Encrypt and store user private key (with app public key)
+        let encrypted_user_key = EncryptedData::encrypt_data(
+            user_key.private_key_to_der()?,
+            self.state.app_public_key.clone(),
+        )?;
+        self.state
+            .private_key_chain
+            .put_block(encrypted_user_key.serialize_encrypted_data())?;
+        println!("✓ User private key stored");
+
+        // Export as PEM for download
+        let cert_pem = user_cert.to_pem()?;
+        let key_pem = user_key.private_key_to_pem_pkcs8()?;
+
+        println!("✅ User certificate created successfully!");
+
+        Ok((cert_pem, key_pem))
     }
 }
 

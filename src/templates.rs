@@ -178,6 +178,7 @@ pub fn render_create_admin_page() -> Markup {
 
                 label for="organizational_unit" { "Organizational Unit (OU):" }
                 input type="text" id="organizational_unit" name="organizational_unit" required placeholder="IT Department";
+                small style="color: #6c757d;" { "Note: ' Admin' suffix will be automatically added to mark this as an admin certificate" }
 
                 label for="locality" { "Locality (L):" }
                 input type="text" id="locality" name="locality" required placeholder="San Francisco";
@@ -187,6 +188,10 @@ pub fn render_create_admin_page() -> Markup {
 
                 label for="country" { "Country (C - 2 letters):" }
                 input type="text" id="country" name="country" required minlength="2" maxlength="2" placeholder="US";
+
+                label for="root_ca_password" { "Root CA Password:" }
+                input type="password" id="root_ca_password" name="root_ca_password" required placeholder="Enter the password you set during initialization";
+                small style="color: #6c757d;" { "This is the password you created when initializing the PKI system" }
 
                 button type="submit" { "Create Admin User" }
             }
@@ -265,13 +270,75 @@ pub fn render_admin_dashboard(user_cn: &str) -> Markup {
     )
 }
 
-pub fn render_create_user_page() -> Markup {
+pub fn render_create_user_page(intermediate_cas: &[String]) -> Markup {
     render_layout(
         "Create User Certificate",
         html! {
-            h1 { "Create User Certificate" }
-            p { "User certificate creation form will be implemented here." }
-            p { a href="/admin/dashboard" { "Back to Dashboard" } }
+            h1 { "👤 Create User Certificate" }
+
+            nav {
+                a href="/admin/dashboard" { "← Back to Dashboard" }
+            }
+
+            div class="info" {
+                p { "Create a new user certificate signed by an Intermediate CA." }
+                p { "User certificates cannot sign other certificates and are intended for end users." }
+            }
+
+            @if intermediate_cas.is_empty() {
+                div class="error" {
+                    h3 { "⚠️ No Intermediate CAs Available" }
+                    p { "You must create at least one Intermediate CA before creating user certificates." }
+                    p { a href="/admin/create-intermediate" { button { "Create Intermediate CA" } } }
+                }
+            } @else {
+                form method="POST" action="/admin/create-user" {
+                    label for="intermediate_ca" { "Issuing Intermediate CA:" }
+                    select id="intermediate_ca" name="intermediate_ca" required {
+                        option value="" disabled selected { "Select an Intermediate CA" }
+                        @for ca_name in intermediate_cas {
+                            option value=(ca_name) { (ca_name) }
+                        }
+                    }
+                    small style="color: #6c757d;" { "This Intermediate CA will sign the user certificate" }
+
+                    label for="common_name" { "Common Name (CN):" }
+                    input type="text" id="common_name" name="common_name" required placeholder="user@example.com";
+
+                    label for="organization" { "Organization (O):" }
+                    input type="text" id="organization" name="organization" required placeholder="Example Corp";
+
+                    label for="organizational_unit" { "Organizational Unit (OU):" }
+                    input type="text" id="organizational_unit" name="organizational_unit" required placeholder="Engineering";
+
+                    label for="locality" { "Locality (L):" }
+                    input type="text" id="locality" name="locality" required placeholder="San Francisco";
+
+                    label for="state" { "State/Province (ST):" }
+                    input type="text" id="state" name="state" required placeholder="California";
+
+                    label for="country" { "Country (C - 2 letters):" }
+                    input type="text" id="country" name="country" required minlength="2" maxlength="2" placeholder="US";
+
+                    label for="validity_days" { "Validity Period (days):" }
+                    input type="number" id="validity_days" name="validity_days" required value="365" min="1" max="1825" placeholder="365";
+                    small style="color: #6c757d;" { "Default: 365 days (1 year), Maximum: 1825 days (5 years)" }
+
+                    button type="submit" { "Create User Certificate" }
+                }
+
+                div class="info" style="margin-top: 20px;" {
+                    h3 { "📋 Certificate Details" }
+                    ul {
+                        li { "Certificate will be signed by the selected Intermediate CA" }
+                        li { "Certificate Type: End User (non-CA)" }
+                        li { "Key Usage: Digital Signature, Key Encipherment, Data Encipherment" }
+                        li { "RSA Key Size: 4096 bits" }
+                        li { "Signature Algorithm: SHA-256" }
+                        li { strong { "Note: " } "Root CA password is NOT required for user certificates" }
+                    }
+                }
+            }
         },
     )
 }
@@ -280,20 +347,132 @@ pub fn render_create_intermediate_page() -> Markup {
     render_layout(
         "Create Intermediate CA",
         html! {
-            h1 { "Create Intermediate CA" }
-            p { "Intermediate CA creation form will be implemented here." }
-            p { a href="/admin/dashboard" { "Back to Dashboard" } }
+            h1 { "🏗️ Create Intermediate Certificate Authority" }
+
+            nav {
+                a href="/admin/dashboard" { "← Back to Dashboard" }
+            }
+
+            div class="info" {
+                p { "Create a new Intermediate CA signed by the Root CA." }
+                p { "Intermediate CAs can sign user certificates but cannot sign other CAs (pathlen=0)." }
+            }
+
+            form method="POST" action="/admin/create-intermediate" {
+                label for="common_name" { "Common Name (CN):" }
+                input type="text" id="common_name" name="common_name" required placeholder="Intermediate CA - Department Name";
+
+                label for="organization" { "Organization (O):" }
+                input type="text" id="organization" name="organization" required placeholder="Example Corp";
+
+                label for="organizational_unit" { "Organizational Unit (OU):" }
+                input type="text" id="organizational_unit" name="organizational_unit" required placeholder="IT Security";
+
+                label for="locality" { "Locality (L):" }
+                input type="text" id="locality" name="locality" required placeholder="San Francisco";
+
+                label for="state" { "State/Province (ST):" }
+                input type="text" id="state" name="state" required placeholder="California";
+
+                label for="country" { "Country (C - 2 letters):" }
+                input type="text" id="country" name="country" required minlength="2" maxlength="2" placeholder="US";
+
+                label for="validity_days" { "Validity Period (days):" }
+                input type="number" id="validity_days" name="validity_days" required value="1825" min="1" max="3650" placeholder="1825";
+                small style="color: #6c757d;" { "Default: 1825 days (5 years), Maximum: 3650 days (10 years)" }
+
+                label for="root_ca_password" { "Root CA Password:" }
+                input type="password" id="root_ca_password" name="root_ca_password" required placeholder="Enter Root CA password to sign certificate";
+
+                button type="submit" { "Create Intermediate CA" }
+            }
+
+            div class="info" style="margin-top: 20px;" {
+                h3 { "📋 Certificate Details" }
+                ul {
+                    li { "Certificate will be signed by the Root CA" }
+                    li { "Path Length: 0 (can sign user certificates only)" }
+                    li { "Key Usage: Certificate Signing, CRL Signing, Digital Signature" }
+                    li { "RSA Key Size: 4096 bits" }
+                    li { "Signature Algorithm: SHA-256" }
+                }
+            }
         },
     )
 }
 
-pub fn render_status_page() -> Markup {
+pub fn render_status_page(
+    cert_count: u64,
+    key_count: u64,
+    cert_validation_ok: bool,
+    key_validation_ok: bool,
+) -> Markup {
     render_layout(
         "System Status",
         html! {
-            h1 { "System Status" }
-            p { "System status information will be displayed here." }
-            p { a href="/admin/dashboard" { "Back to Dashboard" } }
+            h1 { "📊 System Status" }
+
+            nav {
+                a href="/admin/dashboard" { "← Back to Dashboard" }
+            }
+
+            h2 { "Blockchain Statistics" }
+
+            div class="config" {
+                p { strong { "Certificate Blockchain:" } }
+                ul {
+                    li { "Total Certificates: " strong { (cert_count) } }
+                    li {
+                        "Validation Status: "
+                        @if cert_validation_ok {
+                            span style="color: #0f5132; font-weight: 600;" { "✅ Valid" }
+                        } @else {
+                            span style="color: #842029; font-weight: 600;" { "❌ Invalid" }
+                        }
+                    }
+                }
+            }
+
+            div class="config" {
+                p { strong { "Private Key Blockchain:" } }
+                ul {
+                    li { "Total Private Keys: " strong { (key_count) } }
+                    li {
+                        "Validation Status: "
+                        @if key_validation_ok {
+                            span style="color: #0f5132; font-weight: 600;" { "✅ Valid" }
+                        } @else {
+                            span style="color: #842029; font-weight: 600;" { "❌ Invalid" }
+                        }
+                    }
+                }
+            }
+
+            @if cert_count != key_count {
+                div class="error" {
+                    h3 { "⚠️ Warning" }
+                    p { "Certificate and private key counts do not match!" }
+                    p { "Expected: " (cert_count) " certificates = " (key_count) " private keys" }
+                }
+            } @else if cert_validation_ok && key_validation_ok {
+                div class="success" {
+                    p { "✅ All blockchains are valid and synchronized" }
+                }
+            } @else {
+                div class="error" {
+                    p { "❌ Blockchain validation failed - integrity compromised" }
+                }
+            }
+
+            h2 { "Certificate Hierarchy" }
+            div class="info" {
+                ul {
+                    li { "Height 0: Root CA (genesis block)" }
+                    @if cert_count > 1 {
+                        li { "Heights 1+: Intermediate CAs and User Certificates (" (cert_count - 1) " total)" }
+                    }
+                }
+            }
         },
     )
 }
@@ -358,6 +537,102 @@ pub fn render_admin_created_with_downloads(
 
             p style="margin-top: 30px;" {
                 a href="/" { button { "Continue to Login" } }
+            }
+        },
+    )
+}
+
+pub fn render_intermediate_created_with_downloads(
+    cert_filename: &str,
+    key_filename: &str,
+    cert_b64: &str,
+    key_b64: &str,
+) -> Markup {
+    render_layout(
+        "Intermediate CA Created",
+        html! {
+            div class="success" {
+                h2 { "✅ Intermediate CA Created Successfully!" }
+                p { "Your intermediate CA certificate and private key are ready for download." }
+            }
+
+            div class="info" {
+                h3 { "⬇️ Download Your Credentials" }
+                p { "Please download both files and store them securely." }
+
+                p {
+                    a download=(cert_filename) href={"data:application/x-pem-file;base64," (cert_b64)} {
+                        button { "📄 Download Certificate (.crt)" }
+                    }
+                }
+
+                p {
+                    a download=(key_filename) href={"data:application/x-pem-file;base64," (key_b64)} {
+                        button { "🔑 Download Private Key (.key)" }
+                    }
+                }
+            }
+
+            div class="info" {
+                h3 { "⚠️ Important Security Notes" }
+                ul {
+                    li { "Store your private key in a secure location" }
+                    li { "Never share your private key with anyone" }
+                    li { "This Intermediate CA can sign user certificates" }
+                    li { "The private key is in PKCS#8 format (unencrypted)" }
+                }
+            }
+
+            p style="margin-top: 30px;" {
+                a href="/admin/dashboard" { button { "Back to Dashboard" } }
+            }
+        },
+    )
+}
+
+pub fn render_user_created_with_downloads(
+    cert_filename: &str,
+    key_filename: &str,
+    cert_b64: &str,
+    key_b64: &str,
+) -> Markup {
+    render_layout(
+        "User Certificate Created",
+        html! {
+            div class="success" {
+                h2 { "✅ User Certificate Created Successfully!" }
+                p { "Your user certificate and private key are ready for download." }
+            }
+
+            div class="info" {
+                h3 { "⬇️ Download Your Credentials" }
+                p { "Please download both files and store them securely." }
+
+                p {
+                    a download=(cert_filename) href={"data:application/x-pem-file;base64," (cert_b64)} {
+                        button { "📄 Download Certificate (.crt)" }
+                    }
+                }
+
+                p {
+                    a download=(key_filename) href={"data:application/x-pem-file;base64," (key_b64)} {
+                        button { "🔑 Download Private Key (.key)" }
+                    }
+                }
+            }
+
+            div class="info" {
+                h3 { "⚠️ Important Security Notes" }
+                ul {
+                    li { "Store your private key in a secure location" }
+                    li { "Never share your private key with anyone" }
+                    li { "This user certificate can be used for authentication and encryption" }
+                    li { "The private key is in PKCS#8 format (unencrypted)" }
+                }
+            }
+
+            p style="margin-top: 30px;" {
+                a href="/admin/dashboard" { button { "Back to Dashboard" } }
             }
         },
     )

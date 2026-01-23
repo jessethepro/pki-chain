@@ -2,7 +2,7 @@
 
 ## Quick Start for AI Agents
 
-**Before coding**: Run `cargo build` to see current compilation errors - this project has known issues that need fixing before new features can be added.
+**Before coding**: Run `cargo build` to verify the project builds successfully. The codebase compiles with only minor warnings.
 
 **What is this?** Blockchain-backed PKI certificate authority in Rust with:
 - Three-tier hierarchy: Root CA → Intermediate CA → User Certificates
@@ -19,41 +19,24 @@ Blockchain-backed PKI (Public Key Infrastructure) certificate authority in Rust.
 
 **Critical Dependencies**: `libblockchain` (GitHub: jessethepro/libblockchain, RocksDB blockchain), `openssl` (4096-bit RSA, X.509), `anyhow` (error context), `axum` (async web framework), `maud` (HTML templates), `tokio` (async runtime), `axum-server` (TLS support), `zeroize` (secure memory)
 
-## ⚠️ CRITICAL: Project Currently Has Compilation Errors
+## ✅ Build Status: Compiling Successfully
 
-**The codebase has active compilation errors. Run `cargo build` to see current state before making changes.**
+**The codebase compiles successfully with only warnings.** Run `cargo build` to verify before making changes.
 
-### Known Compilation Issues (as of 2026-01-20)
+### Current Warnings (as of 2026-01-22)
 
-**Priority 1: storage.rs - State Machine & Generic Types**
-- ❌ Lines 28, 29, 35, 36, 43, 44, 50, 57, 405: `BlockChain` missing generic type parameter - libblockchain v0.1.0 uses `BlockChain<ReadWrite>` or `BlockChain<ReadOnly>`
-- ❌ Line 99, 101, 344, 415: `BlockChain::new()` doesn't exist - API changed to `open_read_write_chain(path)` helper function
-- ❌ Line 403: `KeyArchive` type not found - module not exported in lib.rs
-- ❌ Line 410: `APIStorage` type undeclared - should be `Storage::<APIMode>::open()`
-- ❌ Line 425, 685: `impl Storage` and `clear_storage()` return types missing generic parameter
-- ❌ Lines 368, 436, 671: Iterator type annotations needed for blockchain iteration
-- ❌ Line 709: `Storage::new()` takes 0 args but 1 supplied
-- **Fix Strategy**: 
-  1. Use `BlockChain<ReadWrite>` for admin operations, `BlockChain<ReadOnly>` for API mode
-  2. Replace `BlockChain::new(path)` with `libblockchain::blockchain::open_read_write_chain(path)`
-  3. Export `KeyArchive` in lib.rs: `pub mod key_archive;`
-  4. Fix `APIStorage::open()` → `Storage::<APIMode>::open()`
-  5. Add explicit type annotations to blockchain iterators: `for block_result in cert_iter { let block: Block = block_result?; }`
+**Minor Warnings - Non-blocking**:
+- ⚠️ `webserver.rs:299`: Redundant `.clone()` on `&str` from `expose_secret()` - can be removed
+- ⚠️ Various unused imports and variables - safe to ignore or clean up with `cargo fix`
 
-**Priority 2: protocol.rs - Unused Imports**
-- ⚠️ Lines 1-11: Multiple unused imports (warnings, not errors)
-- **Fix Strategy**: Remove unused imports or add #[allow(unused_imports)] if planned for future use
-
-**Priority 3: webserver.rs - Unused Variables**
-- ⚠️ Lines 98, 105: Unused `payload` parameters in handler functions
-- **Fix Strategy**: Use payload data or prefix with underscore: `_payload`
-
-### Build Status Check
+### Build Command
 ```bash
-cargo build  # Always run before implementing features to see current errors
+cargo build              # Debug build (fast, unoptimized)
+cargo build --release    # Release build (optimized, slower)
+cargo fix               # Auto-fix warnings where possible
 ```
 
-**Before implementing new features**: Verify compilation succeeds. If errors persist, fix them first using the strategies above.
+**Before implementing new features**: Run `cargo build` to verify no regressions. The project is in good working order.
 
 ## Architecture
 
@@ -96,49 +79,42 @@ cargo build  # Always run before implementing features to see current errors
    - Thread-safe lookups: `subject_name_to_height: HashMap<String, u64>` for O(1) cert queries
    - Transactional operations with rollback on failure
    
-4. **[protocol.rs](../src/protocol.rs)** (~544 lines): Request/Response abstraction layer (may be deprecated).
-   - **Note**: May be replaced by direct Storage calls from webserver handlers
-   - Contains many unused imports (warnings) - cleanup needed
-   
-5. **[pki_generator.rs](../src/pki_generator.rs)** (~217 lines): Unified cert generation.
+4. **[pki_generator.rs](../src/pki_generator.rs)** (~217 lines): Unified cert generation.
    - `generate_root_ca(CertificateData)` - self-signed Root CA
    - `generate_key_pair(CertificateData, signing_key)` - all other certs
    - `CertificateDataType` enum: RootCA, IntermediateCA, UserCert, TlsCert
    
-6. **[private_key_storage.rs](../src/private_key_storage.rs)** (~631 lines): `EncryptedKeyStore` struct.
-   - **DEPRECATED MODULE**: Storage now uses KeyArchive (key_archive.rs) instead
-   - Kept for reference - implements similar encryption but not currently integrated
-   - Root CA (height 0): PKCS#8 PEM with password
-   - Others: Hybrid RSA-OAEP + AES-GCM-256 (AES key encrypted with Root CA public key)
-   
-7. **[encryption.rs](../src/encryption.rs)** (~211 lines): Generic encryption utilities.
+5. **[encryption.rs](../src/encryption.rs)** (~211 lines): Generic encryption utilities.
    - `EncryptedData` / `EncryptedFileData` structs
-   - Used by key_archive.rs only - NOT used by private_key_storage (which has its own encryption logic)
+   - Hybrid RSA-OAEP + AES-GCM-256 encryption
+   - Used by key_archive.rs for file-level encryption
    
-8. **[key_archive.rs](../src/key_archive.rs)** (~139 lines): Tar-based key backup/restore.
+6. **[key_archive.rs](../src/key_archive.rs)** (~139 lines): Tar-based key backup/restore.
    - Methods: `list_keys_in_tar()`, `add_key_to_archive()`, `get_key_from_archive()`
    - Uses encryption.rs utilities for file-level hybrid encryption
    - Stores keys in tar archive at path specified during KeyArchive::new(path)
+   
+7. **[configs.rs](../src/configs.rs)** (~149 lines): Configuration system with TOML parsing.
+   - `AppConfig` struct for app-wide settings
+   - Default values for server, blockchains, and Root CA parameters
 
 ### Storage Architecture (Hybrid: Blockchain + Filesystem)
 
-**Current State**: Storage uses `encrypted_key_store: KeyArchive` for tar-based key archiving. KeyArchive provides file-level encryption using encryption.rs utilities.
+**Simplified Encryption Model**: All private keys (except Root CA) are encrypted with `app.key` for consistent, password-free access.
 
 ```
 Certificate Blockchain (data/certificates/)     Private Key Blockchain (data/private_keys/)
-├─ Block 0: Root CA (DER)                       ├─ Block 0: SHA-512 hash + signature
-├─ Block 1: Intermediate CA #1 (DER)           ├─ Block 1: SHA-512 hash + signature
-└─ Block 2: User Cert #1 (DER)                 └─ Block 2: SHA-512 hash + signature
+├─ Block 0: Root CA (DER)                       ├─ Block 0: Root CA Private Key (PKCS#8 password-protected)
+├─ Block 1: Intermediate CA #1 (DER)           ├─ Block 1: Intermediate CA #1 Private Key (App key encrypted)
+└─ Block 2: User Cert #1 (DER)                 └─ Block 2: User Cert #1 Private Key (App key encrypted)
          ▼ Encrypted with app key                       ▼ Encrypted with app key
                                                          
-Encrypted Key Archive (exports/keystore.tar)    In-Memory (PKey objects)
-   Via KeyArchive (key_archive.rs)              └─ App key loaded from key/app.key
-├─ 0.key.enc: Root CA (PKCS#8 PEM, password)      (decrypts blockchains)
-├─ 1.key.enc: Hybrid RSA+AES-GCM-256
-└─ 2.key.enc: Hybrid RSA+AES-GCM-256
+Encryption Keys (in memory at runtime)           Root CA (PKCS#8 password)
+└─ App key loaded from key/app.key                ├─ Only needed for signing intermediate CAs
+   (decrypts all blockchains + all private keys)  └─ Not needed for user certificate creation
 ```
 
-**Height 0** = Root CA (genesis). **Heights 1+** = User-created certs (Intermediate/User). 
+**Height 0** = Root CA (genesis, password-protected). **Heights 1+** = Intermediate/User certs (app key encrypted). 
 
 **KeyArchive API**: 
 - `add_key_to_archive(height, pkey)` - Encrypts and stores private key in tar
@@ -186,19 +162,15 @@ GET /admin/* → Maud templates: Admin dashboard
 ### 2. Certificate Creation Flow
 ```rust
 WebServer → validates DN fields (CN, O, OU, L, ST, C) + country code (2 letters)
-  → Request::CreateIntermediate { certificate_data } OR Request::CreateUser { ... }
-  → Protocol::process_request()
-    → storage.get_key_certificate_by_height(issuer_height)  // Retrieve signing key/cert
+  → Storage methods directly invoked from handlers
     → pki_generator::generate_key_pair(cert_data, signing_key)
       → Applies X.509 extensions based on CertificateDataType:
          RootCA: pathlen=1, keyCertSign, cRLSign
          IntermediateCA: pathlen=0, keyCertSign, cRLSign
          UserCert: CA=false, digitalSignature, keyEncipherment
-    → storage.store_certificate_and_key(cert_der, pkey, height)
+    → Storage stores certificate and key
       → certificate_chain.put_block(cert_der)  // Height N
-      → encrypted_key_store.store_key(height, root_pub_key, pkey)
-        → If Root (height 0): PKCS#8 PEM
-        → Else: Generate random AES-256 key, encrypt DER with AES-GCM, encrypt AES key with Root CA public key (RSA-OAEP)
+      → Encrypt and store private key (Root: PKCS#8, others: RSA+AES-GCM)
       → private_key_chain.put_block(sha512_hash + signature)  // Height N
       → On failure: certificate_chain.delete_latest_block()  // Rollback
 ```
@@ -363,29 +335,20 @@ _certificate_chain
 
 ## Development Workflows
 
-### Building and Running
+### Build and Development
 
 ```bash
 # Build (requires libblockchain from GitHub)
 cargo build --release
 
 # Generate TLS certificates for HTTPS server (first run)
-./generate-certs.sh
+./generate-webserver-certs.sh
 
 # Run application (starts HTTPS web server on port 3000)
-# Note: Release binary is at target/release/pki-chain
 ./target/debug/pki-chain   # or ./target/release/pki-chain
 ```
 
-### Detailed Error Reference
-
-See the **Known Compilation Issues** section at the top of this document for the current list of errors with line numbers and fix strategies. The errors are organized by priority:
-
-1. **Priority 1**: storage.rs - State machine with typestate pattern needs generic type parameters for BlockChain
-2. **Priority 2**: protocol.rs - Unused imports (warnings only)
-3. **Priority 3**: webserver.rs - Unused variables (warnings only)
-
-**Note**: These errors are tracked and updated regularly (last update: 2026-01-20). Always run `cargo build` to see the current state.
+The project compiles successfully with only minor warnings. See **Build Status** section at the top for current warnings.
 
 **First run prerequisites**: 
 1. Execute `./generate_app_keypair.sh` to create `pki-chain-app.key` (then move to `key/app.key`) before running the application
@@ -470,19 +433,20 @@ All cryptographic operations use `openssl` crate:
 
 4. **Transactional Rollback**: On cert creation failure, rollback via `certificate_chain.delete_latest_block()` to maintain sync between cert and key blockchains. Heights must match: cert@N ↔ key@N.
 
-5. **Protocol Ownership**: `Protocol` contains `Option<Storage>` (not guaranteed). Flow: WebServer → Protocol → Storage → Blockchain. Storage created on-demand via `/api/initialize` or `/api/login`. Access via `protocol.storage.as_ref()`.
+5. **Direct Storage Access**: WebServer handlers access Storage directly. Storage created during initialization via `Storage::new()` and passed through application state.
 
 6. **Private Key Encryption**: 
-   - **Root CA (height 0)**: PKCS#8 PEM with password, stored in `exports/keystore/0.key.enc`
-   - **Others (height 1+)**: Hybrid RSA+AES-GCM-256:
+   - **Root CA (height 0)**: PKCS#8 PEM with password protection, stored in private key blockchain
+   - **All other keys (heights 1+)**: Hybrid RSA+AES-GCM-256 encrypted with `app.key`:
      - Generate random AES-256 session key
-     - Encrypt session key with Root CA public key (RSA-OAEP)
+     - Encrypt session key with app public key (RSA-OAEP)
      - Encrypt private key DER with AES-GCM-256 using session key
      - Format: `[AES Len(u32)][Encrypted AES Key][Nonce(12)][Tag(16)][Data Len(u32)][Encrypted Data]`
+   - **Benefit**: Intermediate CA keys can be decrypted without Root CA password, enabling user certificate creation without password prompts
 
-7. **In-Memory Keys**: App key loaded from `key/app.key` into memory during `Storage::new()`. Used to decrypt blockchain databases. Root CA key loaded on-demand from encrypted keystore (prompts for password).
+7. **In-Memory Keys**: App key loaded from `key/app.key` into memory during `Storage::new()`. Used to decrypt certificate/CRL blockchains and all non-Root CA private keys. Root CA password only needed when creating intermediate CAs.
 
-8. **Arc vs Mutex Wrapping**: In webserver.rs, Protocol should be wrapped in `Arc<Mutex<Protocol>>` (not just `Arc<Protocol>`) because `process_request()` needs `&mut self`. Storage's `subject_name_to_height` uses interior `Mutex` for thread-safe concurrent access.
+8. **State Management**: In webserver.rs, `CAServerState` is wrapped in `Arc<Mutex<CAServerState>>` for shared mutable state across handlers. Each handler locks state as needed for brief operations.
 
 9. **libblockchain Type-State Pattern**: Use correct generic types:
    - Admin operations: `BlockChain<ReadWrite>` (can read + write)
@@ -521,18 +485,17 @@ All cryptographic operations use `openssl` crate:
 ## File Organization
 
 - [src/main.rs](../src/main.rs): Entry point, launches webserver (~96 lines)
-- [src/webserver.rs](../src/webserver.rs): Axum HTTPS server, static file serving, REST API endpoints, TLS configuration (~189 lines)
-- [src/storage.rs](../src/storage.rs): Storage abstraction with dual blockchain management, transactional operations (~474 lines)
-- [src/protocol.rs](../src/protocol.rs): Protocol abstraction layer - Request/Response enums, `process_request()` implementation, certificate validation logic (~544 lines)
-- [src/pki_generator.rs](../src/pki_generator.rs): Unified certificate generation with `CertificateData` struct, `CertificateDataType` enum, `generate_root_ca()` and `generate_key_pair()` functions for all certificate types (~218 lines)
-- [src/private_key_storage.rs](../src/private_key_storage.rs): Encrypted key store with AES-256-GCM encryption, `EncryptedKeyStore` struct, `Zeroize` trait implementation for secure memory handling (~632 lines)
-- [src/encryption.rs](../src/encryption.rs): Generic encryption utilities - `EncryptedData` and `EncryptedFileData` structs for hybrid RSA-OAEP + AES-256-GCM encryption. Used by key_archive module for tar file encryption (~211 lines)
-- [src/key_archive.rs](../src/key_archive.rs): Tar-based key backup/restore system, `KeyArchive` struct with extract/list/archive operations for cold storage. Uses encryption.rs for file-level encryption (~139 lines)
-- [src/configs.rs](../src/configs.rs): Configuration system with TOML parsing, `AppConfig` struct defining blockchain paths, app key path, and key export directory (~41 lines)
-- [src/lib.rs](../src/lib.rs): Library interface exposing public modules, comprehensive API documentation with usage examples and architecture diagrams (~173 lines)
-- [config.toml](../config.toml): Configuration file defining paths for blockchains, app key, and key exports
-- [web_root/](../web_root/): Static files for web interface (HTML, CSS, JS)
-- Shell scripts: Test utilities and key generation helpers
+- [src/webserver.rs](../src/webserver.rs): Axum HTTPS server, route handlers, authentication logic, TLS configuration (~534 lines)
+- [src/templates.rs](../src/templates.rs): Maud HTML template functions for all web pages - layout, forms, admin dashboard (~378 lines)
+- [src/storage.rs](../src/storage.rs): Typestate pattern storage with three blockchains, state transitions NoExist→Initialized→Ready (~712 lines)
+- [src/pki_generator.rs](../src/pki_generator.rs): Unified certificate generation with `CertificateData` struct, `CertificateDataType` enum (~217 lines)
+- [src/encryption.rs](../src/encryption.rs): Generic encryption utilities - `EncryptedData` and `EncryptedFileData` structs for hybrid RSA-OAEP + AES-256-GCM encryption (~211 lines)
+- [src/key_archive.rs](../src/key_archive.rs): Tar-based key backup/restore system with file-level encryption (~139 lines)
+- [src/configs.rs](../src/configs.rs): Configuration system with TOML parsing, `AppConfig` struct (~149 lines)
+- [src/lib.rs](../src/lib.rs): Library interface exposing public modules (~6 lines)
+- [config.toml](../config.toml): Configuration file defining paths for blockchains, server, and Root CA defaults
+- [web_root/](../web_root/): Static files served by the web server (if needed)
+- Shell scripts: `generate_app_keypair.sh`, `generate-webserver-certs.sh` for setup
 
 ## Constants and Paths
 
@@ -541,3 +504,27 @@ All cryptographic operations use `openssl` crate:
 - **Private Key Blockchain**: `data/private_keys/` (configurable in config.toml, RocksDB database storing SHA-512 hashes + signatures column family)
 - **Encrypted Key Store**: `exports/keystore/` (configurable in config.toml, AES-256-GCM encrypted private keys, format: Root CA as PKCS#8 PEM, others as `[AES Key Len][Encrypted AES Key][Nonce(12)][Tag(16)][Data Len][Encrypted Data]`, constant: `key_export_directory_path` in configs.rs)
 - **Initial Hierarchy Common Names**: `ROOT_CA_SUBJECT_COMMON_NAME` = "MenaceLabs Root CA" (in storage.rs)
+## Future Enhancements
+
+### YubiKey/HSM Authentication Integration
+
+**Planned**: Replace certificate file upload authentication with WebAuthn/FIDO2 hardware security key support.
+
+**Benefits**:
+- Hardware-bound authentication (private keys never leave YubiKey)
+- Phishing-resistant (challenge-response with device attestation)
+- No certificate file management (keys generated and stored on device)
+- Standards-based (WebAuthn API supported by modern browsers)
+
+**Implementation Approach**:
+1. **Registration**: Generate key pair on YubiKey during admin creation, store public key in blockchain
+2. **Authentication**: Challenge-response using `navigator.credentials.get()` (WebAuthn API)
+3. **Verification**: Server validates signature against stored public key
+4. **Fallback**: Keep current certificate upload for compatibility
+
+**Limitations**:
+- WebAuthn cannot sign X.509 certificates (limited to authentication challenges)
+- Certificate creation still requires traditional key pairs
+- YubiKey used for admin login security, not certificate signing operations
+
+**Reference**: See `navigator.credentials.create()` and `navigator.credentials.get()` WebAuthn APIs for implementation details.
