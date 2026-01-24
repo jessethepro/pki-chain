@@ -14,7 +14,7 @@ root_key_name = "0.key.enc"
 
 # Optional: Server configuration - uses defaults if not specified
 [server]
-host = "127.0.0.1"
+host = "0.0.0.0"
 port = 3000
 web_root = "web_root"
 tls_cert_path = "web_certs/server/chain.pem"

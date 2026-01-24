@@ -4,8 +4,10 @@ use crate::storage::{check_storage_state, clear_storage, Storage, StorageState};
 use crate::templates;
 use axum::Json;
 use axum::{
-    extract::{Multipart, State},
-    response::{Html, IntoResponse, Redirect},
+    extract::{ConnectInfo, Multipart, State},
+    http::{Request, StatusCode},
+    middleware::{self, Next},
+    response::{Html, IntoResponse, Redirect, Response},
     routing::{get, post},
     Form, Router,
 };
@@ -212,7 +214,8 @@ pub fn start_webserver() {
 
         let app_state = Arc::new(Mutex::new(initial_state));
 
-        let app = Router::new()
+        // Admin routes (localhost-only)
+        let admin_routes = Router::new()
             .route("/", get(index))
             .route("/initialize", post(initialize))
             .route("/create-admin", post(create_admin))
@@ -229,9 +232,17 @@ pub fn start_webserver() {
             .route("/admin/revoke", get(admin_revoke))
             .route("/admin/revoke", post(submit_revoke))
             .route("/logout", post(logout))
+            .layer(middleware::from_fn(localhost_only))
+            .with_state(app_state.clone());
+
+        // API routes (accessible from all networks)
+        let api_routes = Router::new()
             .route("/api/get-certificate", post(api_get_certificate))
             .route("/api/verify-certificate", post(api_verify_certificate))
             .with_state(app_state);
+
+        // Combine routes
+        let app = Router::new().merge(admin_routes).merge(api_routes);
 
         // Configure TLS with certificates from config
         let tls_config = match RustlsConfig::from_pem_file(
@@ -262,8 +273,17 @@ pub fn start_webserver() {
 
         info!("🔒 PKI Chain Certificate Authority");
         info!(
-            "   HTTPS: https://{}:{}",
-            app_config.server.host, app_config.server.port
+            "   Admin Interface: https://127.0.0.1:{} (localhost only)",
+            app_config.server.port
+        );
+        info!(
+            "   REST API: https://{}:{} (all networks)",
+            if app_config.server.host == "0.0.0.0" {
+                "<your-ip>"
+            } else {
+                &app_config.server.host
+            },
+            app_config.server.port
         );
         info!("   TLS Cert: {}", app_config.server.tls_cert_path.display());
         info!("   TLS Key: {}", app_config.server.tls_key_path.display());
@@ -273,8 +293,17 @@ pub fn start_webserver() {
 
         println!("🔒 PKI Chain Certificate Authority");
         println!(
-            "   HTTPS: https://{}:{}",
-            app_config.server.host, app_config.server.port
+            "   Admin Interface: https://127.0.0.1:{} (localhost only)",
+            app_config.server.port
+        );
+        println!(
+            "   REST API: https://{}:{} (all networks)",
+            if app_config.server.host == "0.0.0.0" {
+                "<your-ip>"
+            } else {
+                &app_config.server.host
+            },
+            app_config.server.port
         );
         println!("   TLS Cert: {}", app_config.server.tls_cert_path.display());
         println!("   TLS Key: {}", app_config.server.tls_key_path.display());
@@ -283,7 +312,7 @@ pub fn start_webserver() {
         println!("\n✅ Server ready!\n");
 
         if let Err(e) = axum_server::bind_rustls(addr, tls_config)
-            .serve(app.into_make_service())
+            .serve(app.into_make_service_with_connect_info::<SocketAddr>())
             .await
         {
             error!("Server error: {}", e);
@@ -291,6 +320,27 @@ pub fn start_webserver() {
             std::process::exit(1);
         }
     });
+}
+
+// ============================================================================
+// Middleware
+// ============================================================================
+
+/// Middleware to restrict access to localhost only
+async fn localhost_only(
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    request: Request<axum::body::Body>,
+    next: Next,
+) -> Result<Response, StatusCode> {
+    // Check if request is from localhost (127.0.0.1 or ::1)
+    let is_localhost = addr.ip().is_loopback();
+
+    if !is_localhost {
+        warn!("Blocked non-localhost access to admin route from: {}", addr);
+        return Err(StatusCode::FORBIDDEN);
+    }
+
+    Ok(next.run(request).await)
 }
 
 // ============================================================================
