@@ -12,12 +12,11 @@ use axum::{
     Form, Router,
 };
 use axum_server::tls_rustls::RustlsConfig;
-use base64::Engine;
 use openssl::hash::MessageDigest;
 use openssl::pkey::{PKey, Private, Public};
 use openssl::sign::Verifier;
 use openssl::x509::X509;
-use secrecy::{ExposeSecret, SecretString};
+use secrecy::SecretString;
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::net::SocketAddr;
@@ -28,7 +27,7 @@ use tracing_appender::rolling::{RollingFileAppender, Rotation};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 /// CA Server State
-#[derive(Clone)]
+//#[derive(Clone)]
 enum CAServerState {
     NoExist,
     Initialized {
@@ -91,7 +90,7 @@ struct CreateUserForm {
 struct RevokeForm {
     serial_number: String,
     reason: Option<String>,
-    confirm: String,
+    //confirm: String,
 }
 
 // ============================================================================
@@ -186,21 +185,25 @@ pub fn start_webserver() {
         };
 
         // Check initial storage state
-        let initial_state = match check_storage_state() {
+        let (initial_state, api_enabled) = match check_storage_state() {
             Ok(state) => match state {
                 StorageState::NoExist => {
                     info!("Storage state: NoExist (fresh installation)");
-                    CAServerState::NoExist
+                    (CAServerState::NoExist, false)
                 }
                 StorageState::Initialized => {
                     info!("Storage state: Initialized (Root CA exists)");
-                    CAServerState::Initialized {
-                        root_ca_password: SecretString::new(String::new().into()),
-                    }
+                    (
+                        CAServerState::Initialized {
+                            root_ca_password: SecretString::new(String::new().into()),
+                        },
+                        false,
+                    )
                 }
                 StorageState::Ready => {
                     info!("Storage state: Ready (admin exists)");
-                    CAServerState::Ready
+                    info!("✅ REST API enabled - certificates available for programmatic access");
+                    (CAServerState::Ready, true)
                 }
             },
             Err(e) => {
@@ -208,7 +211,7 @@ pub fn start_webserver() {
                     "Failed to check storage state: {}. Defaulting to NoExist.",
                     e
                 );
-                CAServerState::NoExist
+                (CAServerState::NoExist, false)
             }
         };
 
@@ -276,15 +279,27 @@ pub fn start_webserver() {
             "   Admin Interface: https://127.0.0.1:{} (localhost only)",
             app_config.server.port
         );
-        info!(
-            "   REST API: https://{}:{} (all networks)",
-            if app_config.server.host == "0.0.0.0" {
-                "<your-ip>"
-            } else {
-                &app_config.server.host
-            },
-            app_config.server.port
-        );
+        if api_enabled {
+            info!(
+                "   REST API: https://{}:{} (all networks) - ✅ ACTIVE",
+                if app_config.server.host == "0.0.0.0" {
+                    "<your-ip>"
+                } else {
+                    &app_config.server.host
+                },
+                app_config.server.port
+            );
+        } else {
+            info!(
+                "   REST API: https://{}:{} (all networks) - ⏸️  INACTIVE (complete initialization first)",
+                if app_config.server.host == "0.0.0.0" {
+                    "<your-ip>"
+                } else {
+                    &app_config.server.host
+                },
+                app_config.server.port
+            );
+        }
         info!("   TLS Cert: {}", app_config.server.tls_cert_path.display());
         info!("   TLS Key: {}", app_config.server.tls_key_path.display());
         info!("   Web Root: {}", app_config.server.web_root.display());
@@ -296,15 +311,31 @@ pub fn start_webserver() {
             "   Admin Interface: https://127.0.0.1:{} (localhost only)",
             app_config.server.port
         );
-        println!(
-            "   REST API: https://{}:{} (all networks)",
-            if app_config.server.host == "0.0.0.0" {
-                "<your-ip>"
-            } else {
-                &app_config.server.host
-            },
-            app_config.server.port
-        );
+        if api_enabled {
+            println!(
+                "   REST API: https://{}:{} (all networks) - ✅ ACTIVE",
+                if app_config.server.host == "0.0.0.0" {
+                    "<your-ip>"
+                } else {
+                    &app_config.server.host
+                },
+                app_config.server.port
+            );
+            println!("   📡 API Endpoints:");
+            println!("      POST /api/get-certificate");
+            println!("      POST /api/verify-certificate");
+        } else {
+            println!(
+                "   REST API: https://{}:{} (all networks) - ⏸️  INACTIVE",
+                if app_config.server.host == "0.0.0.0" {
+                    "<your-ip>"
+                } else {
+                    &app_config.server.host
+                },
+                app_config.server.port
+            );
+            println!("   ℹ️  Complete system initialization to enable API access");
+        }
         println!("   TLS Cert: {}", app_config.server.tls_cert_path.display());
         println!("   TLS Key: {}", app_config.server.tls_key_path.display());
         println!("   Web Root: {}", app_config.server.web_root.display());
