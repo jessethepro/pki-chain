@@ -659,6 +659,42 @@ impl Storage<Ready> {
         }
     }
 
+    /// Get certificate by serial number (hex string)
+    ///
+    /// Searches through all certificates to find one matching the serial number
+    pub fn get_certificate_by_serial(&self, serial_hex: &str) -> Result<Option<X509>> {
+        let config = AppConfig::load().context("Failed to load config")?;
+        let app_private_key_pem = fs::read(&config.key_exports.app_key_path)
+            .context("Failed to read application private key")?;
+        let app_private_key = PKey::private_key_from_pem(&app_private_key_pem)
+            .context("Failed to parse application private key")?;
+
+        let cert_count = self.state.certificate_chain.block_count()?;
+
+        // Search through all certificates
+        for height in 0..cert_count {
+            let block = self.state.certificate_chain.get_block_by_height(height)?;
+            let encrypted_cert_data = deserialize_encrypted_data(&block.block_data())?;
+            let cert_der = encrypted_cert_data.decrypt_data(app_private_key.clone())?;
+            let cert = X509::from_der(&cert_der).context("Failed to parse certificate")?;
+
+            // Get serial number from certificate
+            let serial = cert.serial_number();
+            let cert_serial_hex = serial
+                .to_bn()
+                .context("Failed to convert serial to BigNum")?
+                .to_hex_str()
+                .context("Failed to convert serial to hex")?
+                .to_string();
+
+            if cert_serial_hex == serial_hex {
+                return Ok(Some(cert));
+            }
+        }
+
+        Ok(None)
+    }
+
     /// Create intermediate CA certificate signed by Root CA
     ///
     /// # Arguments

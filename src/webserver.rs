@@ -2,6 +2,7 @@ use crate::configs::AppConfig;
 use crate::pki_generator::CertificateData;
 use crate::storage::{check_storage_state, clear_storage, Storage, StorageState};
 use crate::templates;
+use axum::Json;
 use axum::{
     extract::{Multipart, State},
     response::{Html, IntoResponse, Redirect},
@@ -15,7 +16,7 @@ use openssl::pkey::{PKey, Private, Public};
 use openssl::sign::Verifier;
 use openssl::x509::X509;
 use secrecy::{ExposeSecret, SecretString};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::fs;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -89,6 +90,50 @@ struct RevokeForm {
     serial_number: String,
     reason: Option<String>,
     confirm: String,
+}
+
+// ============================================================================
+// API Request/Response Structures
+// ============================================================================
+
+#[derive(Deserialize)]
+struct GetCertificateRequest {
+    requester_serial: String,
+    target_cn: String,
+    signature: String, // base64-encoded signature of target_cn
+}
+
+#[derive(Serialize)]
+struct GetCertificateResponse {
+    success: bool,
+    certificate_pem: Option<String>,
+    serial_number: Option<String>,
+    subject_cn: Option<String>,
+    issuer_cn: Option<String>,
+    not_before: Option<String>,
+    not_after: Option<String>,
+    encrypted_hash: Option<String>, // base64-encoded encrypted hash
+    error: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct VerifyCertificateRequest {
+    requester_serial: String,
+    target_serial: String,
+    signature: String, // base64-encoded signature of target_serial
+}
+
+#[derive(Serialize)]
+struct VerifyCertificateResponse {
+    success: bool,
+    valid: Option<bool>,
+    serial_number: Option<String>,
+    subject_cn: Option<String>,
+    not_before: Option<String>,
+    not_after: Option<String>,
+    revoked: Option<bool>,
+    encrypted_hash: Option<String>, // base64-encoded encrypted hash
+    error: Option<String>,
 }
 
 // Login uses Multipart for file uploads
@@ -184,6 +229,8 @@ pub fn start_webserver() {
             .route("/admin/revoke", get(admin_revoke))
             .route("/admin/revoke", post(submit_revoke))
             .route("/logout", post(logout))
+            .route("/api/get-certificate", post(api_get_certificate))
+            .route("/api/verify-certificate", post(api_verify_certificate))
             .with_state(app_state);
 
         // Configure TLS with certificates from config
@@ -1048,13 +1095,19 @@ async fn admin_revoke(State(ca_state): State<AppState>) -> Html<String> {
                 Ok(revoked) => revoked,
                 Err(e) => {
                     return Html(
-                        templates::render_error(&format!("Failed to get revoked certificates: {}", e))
-                            .into_string(),
+                        templates::render_error(&format!(
+                            "Failed to get revoked certificates: {}",
+                            e
+                        ))
+                        .into_string(),
                     )
                 }
             };
 
-            Html(templates::render_revoke_certificate_page(&certificates, &revoked_certificates).into_string())
+            Html(
+                templates::render_revoke_certificate_page(&certificates, &revoked_certificates)
+                    .into_string(),
+            )
         }
         _ => Html(templates::render_error("Not authenticated").into_string()),
     }
@@ -1105,4 +1158,490 @@ async fn submit_revoke(
             templates::render_error(&format!("Failed to revoke certificate: {}", e)).into_string(),
         ),
     }
+}
+
+// ============================================================================
+// API Handlers
+// ============================================================================
+
+/// Authenticate API request by verifying certificate exists and signature is valid
+fn authenticate_api_request(
+    requester_serial: &str,
+    data_to_verify: &str,
+    signature_b64: &str,
+) -> Result<X509, String> {
+    // Open storage to get requester's certificate
+    let storage = match crate::storage::Storage::<crate::storage::Ready>::open() {
+        Ok(s) => s,
+        Err(e) => return Err(format!("Failed to open storage: {}", e)),
+    };
+
+    // Get certificate by serial number
+    let cert = match storage.get_certificate_by_serial(requester_serial) {
+        Ok(Some(c)) => c,
+        Ok(None) => return Err("Certificate not found".to_string()),
+        Err(e) => return Err(format!("Failed to get certificate: {}", e)),
+    };
+
+    // Check if certificate is revoked
+    let is_revoked = match storage.is_certificate_revoked(requester_serial) {
+        Ok(revoked) => revoked,
+        Err(e) => return Err(format!("Failed to check revocation status: {}", e)),
+    };
+
+    if is_revoked {
+        return Err("Certificate has been revoked".to_string());
+    }
+
+    // Decode signature from base64
+    let signature =
+        match base64::Engine::decode(&base64::engine::general_purpose::STANDARD, signature_b64) {
+            Ok(sig) => sig,
+            Err(_) => return Err("Invalid base64 signature".to_string()),
+        };
+
+    // Verify signature with certificate's public key
+    let public_key = match cert.public_key() {
+        Ok(key) => key,
+        Err(_) => return Err("Failed to extract public key".to_string()),
+    };
+
+    let signature_valid = match verify_signature(&public_key, data_to_verify.as_bytes(), &signature)
+    {
+        Ok(valid) => valid,
+        Err(_) => return Err("Failed to verify signature".to_string()),
+    };
+
+    if !signature_valid {
+        return Err("Invalid signature".to_string());
+    }
+
+    Ok(cert)
+}
+
+/// Encrypt hash with requester's public key for response authentication
+fn encrypt_response_hash(data: &str, requester_cert: &X509) -> Result<String, String> {
+    use openssl::hash::Hasher;
+    use openssl::rsa::Padding;
+
+    // Create SHA-256 hash of response data
+    let mut hasher = match Hasher::new(MessageDigest::sha256()) {
+        Ok(h) => h,
+        Err(_) => return Err("Failed to create hasher".to_string()),
+    };
+
+    if let Err(_) = hasher.update(data.as_bytes()) {
+        return Err("Failed to hash data".to_string());
+    }
+
+    let hash = match hasher.finish() {
+        Ok(h) => h,
+        Err(_) => return Err("Failed to finish hash".to_string()),
+    };
+
+    // Encrypt hash with requester's public key (RSA-OAEP)
+    let public_key = match requester_cert.public_key() {
+        Ok(key) => key,
+        Err(_) => return Err("Failed to extract public key".to_string()),
+    };
+
+    let rsa = match public_key.rsa() {
+        Ok(r) => r,
+        Err(_) => return Err("Failed to get RSA key".to_string()),
+    };
+
+    let mut encrypted_hash = vec![0u8; rsa.size() as usize];
+    let len = match rsa.public_encrypt(&hash, &mut encrypted_hash, Padding::PKCS1_OAEP) {
+        Ok(l) => l,
+        Err(_) => return Err("Failed to encrypt hash".to_string()),
+    };
+
+    encrypted_hash.truncate(len);
+
+    // Encode as base64
+    Ok(base64::Engine::encode(
+        &base64::engine::general_purpose::STANDARD,
+        &encrypted_hash,
+    ))
+}
+
+async fn api_get_certificate(
+    Json(request): Json<GetCertificateRequest>,
+) -> Json<GetCertificateResponse> {
+    info!(
+        "API get-certificate request from serial: {}, target CN: {}",
+        request.requester_serial, request.target_cn
+    );
+
+    // Authenticate requester
+    let requester_cert = match authenticate_api_request(
+        &request.requester_serial,
+        &request.target_cn,
+        &request.signature,
+    ) {
+        Ok(cert) => cert,
+        Err(e) => {
+            warn!("API authentication failed: {}", e);
+            return Json(GetCertificateResponse {
+                success: false,
+                certificate_pem: None,
+                serial_number: None,
+                subject_cn: None,
+                issuer_cn: None,
+                not_before: None,
+                not_after: None,
+                encrypted_hash: None,
+                error: Some(format!("Authentication failed: {}", e)),
+            });
+        }
+    };
+
+    // Open storage to get target certificate
+    let storage = match crate::storage::Storage::<crate::storage::Ready>::open() {
+        Ok(s) => s,
+        Err(e) => {
+            error!("Failed to open storage: {}", e);
+            return Json(GetCertificateResponse {
+                success: false,
+                certificate_pem: None,
+                serial_number: None,
+                subject_cn: None,
+                issuer_cn: None,
+                not_before: None,
+                not_after: None,
+                encrypted_hash: None,
+                error: Some("Internal server error".to_string()),
+            });
+        }
+    };
+
+    // Get certificate by CN
+    let target_cert = match storage.get_certificate_by_subject(&request.target_cn) {
+        Ok(Some(cert)) => cert,
+        Ok(None) => {
+            return Json(GetCertificateResponse {
+                success: false,
+                certificate_pem: None,
+                serial_number: None,
+                subject_cn: None,
+                issuer_cn: None,
+                not_before: None,
+                not_after: None,
+                encrypted_hash: None,
+                error: Some("Certificate not found".to_string()),
+            });
+        }
+        Err(e) => {
+            error!("Failed to get certificate: {}", e);
+            return Json(GetCertificateResponse {
+                success: false,
+                certificate_pem: None,
+                serial_number: None,
+                subject_cn: None,
+                issuer_cn: None,
+                not_before: None,
+                not_after: None,
+                encrypted_hash: None,
+                error: Some("Internal server error".to_string()),
+            });
+        }
+    };
+
+    // Get serial number and check if revoked
+    let serial = target_cert.serial_number();
+    let serial_hex = match serial
+        .to_bn()
+        .and_then(|bn| bn.to_hex_str())
+        .map(|s| s.to_string())
+    {
+        Ok(hex) => hex,
+        Err(_) => {
+            return Json(GetCertificateResponse {
+                success: false,
+                certificate_pem: None,
+                serial_number: None,
+                subject_cn: None,
+                issuer_cn: None,
+                not_before: None,
+                not_after: None,
+                encrypted_hash: None,
+                error: Some("Failed to extract serial number".to_string()),
+            });
+        }
+    };
+
+    // Check if certificate is revoked
+    let is_revoked = match storage.is_certificate_revoked(&serial_hex) {
+        Ok(revoked) => revoked,
+        Err(e) => {
+            error!("Failed to check revocation status: {}", e);
+            return Json(GetCertificateResponse {
+                success: false,
+                certificate_pem: None,
+                serial_number: None,
+                subject_cn: None,
+                issuer_cn: None,
+                not_before: None,
+                not_after: None,
+                encrypted_hash: None,
+                error: Some("Internal server error".to_string()),
+            });
+        }
+    };
+
+    if is_revoked {
+        return Json(GetCertificateResponse {
+            success: false,
+            certificate_pem: None,
+            serial_number: None,
+            subject_cn: None,
+            issuer_cn: None,
+            not_before: None,
+            not_after: None,
+            encrypted_hash: None,
+            error: Some("Certificate has been revoked".to_string()),
+        });
+    }
+
+    // Extract certificate details
+    let cert_pem = match target_cert.to_pem() {
+        Ok(pem) => String::from_utf8_lossy(&pem).to_string(),
+        Err(_) => {
+            return Json(GetCertificateResponse {
+                success: false,
+                certificate_pem: None,
+                serial_number: None,
+                subject_cn: None,
+                issuer_cn: None,
+                not_before: None,
+                not_after: None,
+                encrypted_hash: None,
+                error: Some("Failed to export certificate".to_string()),
+            });
+        }
+    };
+
+    let subject_cn = target_cert
+        .subject_name()
+        .entries_by_nid(openssl::nid::Nid::COMMONNAME)
+        .next()
+        .and_then(|e| e.data().as_utf8().ok())
+        .map(|d| d.to_string())
+        .unwrap_or_else(|| "Unknown".to_string());
+
+    let issuer_cn = target_cert
+        .issuer_name()
+        .entries_by_nid(openssl::nid::Nid::COMMONNAME)
+        .next()
+        .and_then(|e| e.data().as_utf8().ok())
+        .map(|d| d.to_string())
+        .unwrap_or_else(|| "Unknown".to_string());
+
+    let not_before = target_cert.not_before().to_string();
+    let not_after = target_cert.not_after().to_string();
+
+    // Create response data for hashing
+    let response_data = format!(
+        "{}|{}|{}|{}|{}",
+        serial_hex, subject_cn, issuer_cn, not_before, not_after
+    );
+
+    // Encrypt hash with requester's public key
+    let encrypted_hash = match encrypt_response_hash(&response_data, &requester_cert) {
+        Ok(hash) => hash,
+        Err(e) => {
+            error!("Failed to encrypt response hash: {}", e);
+            return Json(GetCertificateResponse {
+                success: false,
+                certificate_pem: None,
+                serial_number: None,
+                subject_cn: None,
+                issuer_cn: None,
+                not_before: None,
+                not_after: None,
+                encrypted_hash: None,
+                error: Some("Internal server error".to_string()),
+            });
+        }
+    };
+
+    info!(
+        "API get-certificate successful: returned certificate for {}",
+        subject_cn
+    );
+
+    Json(GetCertificateResponse {
+        success: true,
+        certificate_pem: Some(cert_pem),
+        serial_number: Some(serial_hex),
+        subject_cn: Some(subject_cn),
+        issuer_cn: Some(issuer_cn),
+        not_before: Some(not_before),
+        not_after: Some(not_after),
+        encrypted_hash: Some(encrypted_hash),
+        error: None,
+    })
+}
+
+async fn api_verify_certificate(
+    Json(request): Json<VerifyCertificateRequest>,
+) -> Json<VerifyCertificateResponse> {
+    info!(
+        "API verify-certificate request from serial: {}, target serial: {}",
+        request.requester_serial, request.target_serial
+    );
+
+    // Authenticate requester
+    let requester_cert = match authenticate_api_request(
+        &request.requester_serial,
+        &request.target_serial,
+        &request.signature,
+    ) {
+        Ok(cert) => cert,
+        Err(e) => {
+            warn!("API authentication failed: {}", e);
+            return Json(VerifyCertificateResponse {
+                success: false,
+                valid: None,
+                serial_number: None,
+                subject_cn: None,
+                not_before: None,
+                not_after: None,
+                revoked: None,
+                encrypted_hash: None,
+                error: Some(format!("Authentication failed: {}", e)),
+            });
+        }
+    };
+
+    // Open storage to get target certificate
+    let storage = match crate::storage::Storage::<crate::storage::Ready>::open() {
+        Ok(s) => s,
+        Err(e) => {
+            error!("Failed to open storage: {}", e);
+            return Json(VerifyCertificateResponse {
+                success: false,
+                valid: None,
+                serial_number: None,
+                subject_cn: None,
+                not_before: None,
+                not_after: None,
+                revoked: None,
+                encrypted_hash: None,
+                error: Some("Internal server error".to_string()),
+            });
+        }
+    };
+
+    // Get certificate by serial number
+    let target_cert = match storage.get_certificate_by_serial(&request.target_serial) {
+        Ok(Some(cert)) => cert,
+        Ok(None) => {
+            return Json(VerifyCertificateResponse {
+                success: false,
+                valid: Some(false),
+                serial_number: Some(request.target_serial.clone()),
+                subject_cn: None,
+                not_before: None,
+                not_after: None,
+                revoked: None,
+                encrypted_hash: None,
+                error: Some("Certificate not found".to_string()),
+            });
+        }
+        Err(e) => {
+            error!("Failed to get certificate: {}", e);
+            return Json(VerifyCertificateResponse {
+                success: false,
+                valid: None,
+                serial_number: None,
+                subject_cn: None,
+                not_before: None,
+                not_after: None,
+                revoked: None,
+                encrypted_hash: None,
+                error: Some("Internal server error".to_string()),
+            });
+        }
+    };
+
+    // Check if certificate is revoked
+    let is_revoked = match storage.is_certificate_revoked(&request.target_serial) {
+        Ok(revoked) => revoked,
+        Err(e) => {
+            error!("Failed to check revocation status: {}", e);
+            return Json(VerifyCertificateResponse {
+                success: false,
+                valid: None,
+                serial_number: None,
+                subject_cn: None,
+                not_before: None,
+                not_after: None,
+                revoked: None,
+                encrypted_hash: None,
+                error: Some("Internal server error".to_string()),
+            });
+        }
+    };
+
+    // Extract certificate details
+    let subject_cn = target_cert
+        .subject_name()
+        .entries_by_nid(openssl::nid::Nid::COMMONNAME)
+        .next()
+        .and_then(|e| e.data().as_utf8().ok())
+        .map(|d| d.to_string())
+        .unwrap_or_else(|| "Unknown".to_string());
+
+    let not_before = target_cert.not_before().to_string();
+    let not_after = target_cert.not_after().to_string();
+
+    // Check if certificate is currently valid (dates)
+    use openssl::asn1::Asn1Time;
+    let now = Asn1Time::days_from_now(0).unwrap();
+    let date_valid = target_cert.not_before() <= &now && &now <= target_cert.not_after();
+
+    let is_valid = date_valid && !is_revoked;
+
+    // Create response data for hashing
+    let response_data = format!(
+        "{}|{}|{}|{}|{}|{}",
+        request.target_serial, subject_cn, not_before, not_after, is_valid, is_revoked
+    );
+
+    // Encrypt hash with requester's public key
+    let encrypted_hash = match encrypt_response_hash(&response_data, &requester_cert) {
+        Ok(hash) => hash,
+        Err(e) => {
+            error!("Failed to encrypt response hash: {}", e);
+            return Json(VerifyCertificateResponse {
+                success: false,
+                valid: None,
+                serial_number: None,
+                subject_cn: None,
+                not_before: None,
+                not_after: None,
+                revoked: None,
+                encrypted_hash: None,
+                error: Some("Internal server error".to_string()),
+            });
+        }
+    };
+
+    info!(
+        "API verify-certificate successful: certificate {} is valid={}, revoked={}",
+        subject_cn, is_valid, is_revoked
+    );
+
+    Json(VerifyCertificateResponse {
+        success: true,
+        valid: Some(is_valid),
+        serial_number: Some(request.target_serial),
+        subject_cn: Some(subject_cn),
+        not_before: Some(not_before),
+        not_after: Some(not_after),
+        revoked: Some(is_revoked),
+        encrypted_hash: Some(encrypted_hash),
+        error: None,
+    })
 }
