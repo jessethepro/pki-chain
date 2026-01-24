@@ -84,6 +84,13 @@ struct CreateUserForm {
     validity_days: u32,
 }
 
+#[derive(Deserialize)]
+struct RevokeForm {
+    serial_number: String,
+    reason: Option<String>,
+    confirm: String,
+}
+
 // Login uses Multipart for file uploads
 
 pub fn start_webserver() {
@@ -174,6 +181,8 @@ pub fn start_webserver() {
             )
             .route("/admin/create-user", post(submit_create_user))
             .route("/admin/status", get(admin_status))
+            .route("/admin/revoke", get(admin_revoke))
+            .route("/admin/revoke", post(submit_revoke))
             .route("/logout", post(logout))
             .with_state(app_state);
 
@@ -549,6 +558,46 @@ async fn login(State(ca_state): State<AppState>, mut multipart: Multipart) -> Ht
         return Html(
             templates::render_error(
                 "Access denied: This certificate does not have administrative privileges. Only administrators can access the web interface."
+            )
+            .into_string(),
+        );
+    }
+
+    // Step 8: Check if certificate has been revoked
+    let serial = user_cert.serial_number();
+    let serial_hex = match serial
+        .to_bn()
+        .and_then(|bn| bn.to_hex_str())
+        .map(|s| s.to_string())
+    {
+        Ok(hex) => hex,
+        Err(_) => {
+            return Html(
+                templates::render_error("Failed to extract certificate serial number")
+                    .into_string(),
+            )
+        }
+    };
+
+    let is_revoked = match storage.is_certificate_revoked(&serial_hex) {
+        Ok(revoked) => revoked,
+        Err(e) => {
+            error!("Failed to check revocation status: {}", e);
+            return Html(
+                templates::render_error("Failed to check certificate revocation status")
+                    .into_string(),
+            );
+        }
+    };
+
+    if is_revoked {
+        warn!(
+            "Login attempt with revoked certificate: {} (Serial: {})",
+            cert_subject, serial_hex
+        );
+        return Html(
+            templates::render_error(
+                "Access denied: This certificate has been revoked. Please contact your administrator to obtain a new certificate."
             )
             .into_string(),
         );
@@ -962,5 +1011,87 @@ async fn admin_status(State(ca_state): State<AppState>) -> Html<String> {
             )
         }
         _ => Html(templates::render_error("Not authenticated").into_string()),
+    }
+}
+
+async fn admin_revoke(State(ca_state): State<AppState>) -> Html<String> {
+    let state = ca_state.lock().await;
+
+    match &*state {
+        CAServerState::Authenticated { .. } => {
+            drop(state); // Release lock before I/O
+
+            // Open storage to get list of certificates
+            let storage = match crate::storage::Storage::<crate::storage::Ready>::open() {
+                Ok(s) => s,
+                Err(e) => {
+                    return Html(
+                        templates::render_error(&format!("Failed to open storage: {}", e))
+                            .into_string(),
+                    )
+                }
+            };
+
+            // Get list of all certificates (excluding Root CA at height 0)
+            let certificates = match storage.list_certificates_for_revocation() {
+                Ok(certs) => certs,
+                Err(e) => {
+                    return Html(
+                        templates::render_error(&format!("Failed to list certificates: {}", e))
+                            .into_string(),
+                    )
+                }
+            };
+
+            Html(templates::render_revoke_certificate_page(&certificates).into_string())
+        }
+        _ => Html(templates::render_error("Not authenticated").into_string()),
+    }
+}
+
+async fn submit_revoke(
+    State(ca_state): State<AppState>,
+    Form(form): Form<RevokeForm>,
+) -> Html<String> {
+    info!(
+        "Received certificate revocation request for serial: {}",
+        form.serial_number
+    );
+
+    let state = ca_state.lock().await;
+
+    // Verify authenticated
+    if !matches!(&*state, CAServerState::Authenticated { .. }) {
+        return Html(templates::render_error("Not authenticated").into_string());
+    }
+
+    drop(state); // Release lock before long operations
+
+    // Open storage
+    let storage = match crate::storage::Storage::<crate::storage::Ready>::open() {
+        Ok(s) => s,
+        Err(e) => {
+            return Html(
+                templates::render_error(&format!("Failed to open storage: {}", e)).into_string(),
+            )
+        }
+    };
+
+    // Revoke certificate
+    match storage.revoke_certificate(&form.serial_number, form.reason.as_deref()) {
+        Ok(common_name) => {
+            info!(
+                "Certificate revoked successfully: {} (Serial: {})",
+                common_name, form.serial_number
+            );
+
+            Html(
+                templates::render_certificate_revoked(&form.serial_number, &common_name)
+                    .into_string(),
+            )
+        }
+        Err(e) => Html(
+            templates::render_error(&format!("Failed to revoke certificate: {}", e)).into_string(),
+        ),
     }
 }

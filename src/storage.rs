@@ -707,6 +707,23 @@ impl Storage<Ready> {
             generate_key_pair(cert_data_with_issuer, &root_private_key)?;
         println!("✓ Intermediate CA certificate generated");
 
+        // Generate self signature for blockchain integrity check between
+        // private key and certificate chains
+        let self_signature = || -> Result<Vec<u8>> {
+            let mut signer = openssl::sign::Signer::new(
+                openssl::hash::MessageDigest::sha256(),
+                &intermediate_key,
+            )
+            .context("Failed to create signer for self-signature")?;
+            signer
+                .update(&intermediate_cert.to_der()?)
+                .context("Failed to update signer with certificate data")?;
+            let signature = signer
+                .sign_to_vec()
+                .context("Failed to generate self-signature")?;
+            Ok(signature)
+        }()?;
+
         // Encrypt and store intermediate CA certificate
         let encrypted_intermediate_cert = EncryptedData::encrypt_data(
             intermediate_cert.to_der()?,
@@ -720,6 +737,11 @@ impl Storage<Ready> {
             "✓ Intermediate CA certificate stored at height {}",
             intermediate_height
         );
+        // Private key chain and certificate chain store the same signature to verify
+        // height integrity between them
+        self.state
+            .certificate_chain
+            .put_signature(intermediate_height, self_signature.clone())?;
 
         // Encrypt and store intermediate CA private key (with App public key)
         let encrypted_intermediate_key = EncryptedData::encrypt_data(
@@ -730,6 +752,10 @@ impl Storage<Ready> {
             .private_key_chain
             .put_block(encrypted_intermediate_key.serialize_encrypted_data())?;
         println!("✓ Intermediate CA private key stored");
+
+        self.state
+            .private_key_chain
+            .put_signature(intermediate_height, self_signature)?;
 
         // Export as PEM for download
         let cert_pem = intermediate_cert.to_pem()?;
@@ -811,6 +837,19 @@ impl Storage<Ready> {
             generate_key_pair(cert_data_with_issuer, &intermediate_private_key)?;
         println!("✓ User certificate generated");
 
+        let certificate_signature = || -> Result<Vec<u8>> {
+            let mut signer =
+                openssl::sign::Signer::new(openssl::hash::MessageDigest::sha256(), &user_key)
+                    .context("Failed to create signer for certificate signature")?;
+            signer
+                .update(&user_cert.to_der()?)
+                .context("Failed to update signer with certificate data")?;
+            let signature = signer
+                .sign_to_vec()
+                .context("Failed to generate certificate signature")?;
+            Ok(signature)
+        }()?;
+
         // Encrypt and store user certificate
         let encrypted_user_cert =
             EncryptedData::encrypt_data(user_cert.to_der()?, self.state.app_public_key.clone())?;
@@ -819,6 +858,10 @@ impl Storage<Ready> {
             .certificate_chain
             .put_block(encrypted_user_cert.serialize_encrypted_data())?;
         println!("✓ User certificate stored at height {}", user_height);
+
+        self.state
+            .certificate_chain
+            .put_signature(user_height, certificate_signature.clone())?;
 
         // Encrypt and store user private key (with app public key)
         let encrypted_user_key = EncryptedData::encrypt_data(
@@ -830,6 +873,10 @@ impl Storage<Ready> {
             .put_block(encrypted_user_key.serialize_encrypted_data())?;
         println!("✓ User private key stored");
 
+        self.state
+            .private_key_chain
+            .put_signature(user_height, certificate_signature)?;
+
         // Export as PEM for download
         let cert_pem = user_cert.to_pem()?;
         let key_pem = user_key.private_key_to_pem_pkcs8()?;
@@ -837,6 +884,174 @@ impl Storage<Ready> {
         println!("✅ User certificate created successfully!");
 
         Ok((cert_pem, key_pem))
+    }
+
+    /// List all certificates available for revocation (excluding Root CA)
+    ///
+    /// Returns Vec of (common_name, serial_number) tuples
+    pub fn list_certificates_for_revocation(&self) -> Result<Vec<(String, String)>> {
+        let config = AppConfig::load().context("Failed to load config")?;
+        let app_private_key_pem = fs::read(&config.key_exports.app_key_path)
+            .context("Failed to read application private key")?;
+        let app_private_key = PKey::private_key_from_pem(&app_private_key_pem)
+            .context("Failed to parse application private key")?;
+
+        let mut certificates = Vec::new();
+        let cert_count = self.state.certificate_chain.block_count()?;
+
+        // Skip height 0 (Root CA cannot be revoked)
+        for height in 1..cert_count {
+            let block = self.state.certificate_chain.get_block_by_height(height)?;
+            let encrypted_cert_data = deserialize_encrypted_data(&block.block_data())?;
+            let cert_der = encrypted_cert_data.decrypt_data(app_private_key.clone())?;
+            let cert = X509::from_der(&cert_der).context("Failed to parse certificate")?;
+
+            let subject_cn = cert
+                .subject_name()
+                .entries_by_nid(openssl::nid::Nid::COMMONNAME)
+                .next()
+                .and_then(|e| e.data().as_utf8().ok())
+                .map(|d| d.to_string())
+                .context("Certificate missing CN")?;
+
+            // Get serial number as hex string
+            let serial = cert.serial_number();
+            let serial_hex = serial
+                .to_bn()
+                .context("Failed to convert serial to BigNum")?
+                .to_hex_str()
+                .context("Failed to convert serial to hex")?
+                .to_string();
+
+            certificates.push((subject_cn, serial_hex));
+        }
+
+        Ok(certificates)
+    }
+
+    /// Revoke a certificate by serial number
+    ///
+    /// Adds certificate to CRL blockchain. This operation is immutable.
+    ///
+    /// # Arguments
+    ///
+    /// * `serial_number` - Hex string of certificate serial number
+    /// * `reason` - Optional revocation reason
+    ///
+    /// # Returns
+    ///
+    /// Common name of the revoked certificate
+    pub fn revoke_certificate(&self, serial_number: &str, reason: Option<&str>) -> Result<String> {
+        println!("🚫 Revoking certificate with serial: {}", serial_number);
+
+        let config = AppConfig::load().context("Failed to load config")?;
+        let app_private_key_pem = fs::read(&config.key_exports.app_key_path)
+            .context("Failed to read application private key")?;
+        let app_private_key = PKey::private_key_from_pem(&app_private_key_pem)
+            .context("Failed to parse application private key")?;
+
+        // Find the certificate with this serial number
+        let cert_count = self.state.certificate_chain.block_count()?;
+        let mut target_cert: Option<X509> = None;
+        let mut target_height: Option<u64> = None;
+
+        for height in 1..cert_count {
+            let block = self.state.certificate_chain.get_block_by_height(height)?;
+            let encrypted_cert_data = deserialize_encrypted_data(&block.block_data())?;
+            let cert_der = encrypted_cert_data.decrypt_data(app_private_key.clone())?;
+            let cert = X509::from_der(&cert_der).context("Failed to parse certificate")?;
+
+            let serial = cert.serial_number();
+            let serial_hex = serial
+                .to_bn()
+                .context("Failed to convert serial to BigNum")?
+                .to_hex_str()
+                .context("Failed to convert serial to hex")?
+                .to_string();
+
+            if serial_hex == serial_number {
+                target_cert = Some(cert);
+                target_height = Some(height);
+                break;
+            }
+        }
+
+        let cert = target_cert.context("Certificate with serial number not found")?;
+        let height = target_height.context("Certificate height not found")?;
+
+        let subject_cn = cert
+            .subject_name()
+            .entries_by_nid(openssl::nid::Nid::COMMONNAME)
+            .next()
+            .and_then(|e| e.data().as_utf8().ok())
+            .map(|d| d.to_string())
+            .context("Certificate missing CN")?;
+
+        println!("✓ Found certificate: {} at height {}", subject_cn, height);
+
+        // Create revocation entry with timestamp, serial, CN, and reason
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .context("Failed to get timestamp")?
+            .as_secs();
+
+        let revocation_data = serde_json::json!({
+            "serial_number": serial_number,
+            "common_name": subject_cn,
+            "revocation_timestamp": timestamp,
+            "reason": reason.unwrap_or("Not specified"),
+            "blockchain_height": height,
+        });
+
+        let revocation_json =
+            serde_json::to_vec(&revocation_data).context("Failed to serialize revocation data")?;
+
+        // Encrypt and store in CRL blockchain
+        let encrypted_revocation =
+            EncryptedData::encrypt_data(revocation_json, self.state.app_public_key.clone())?;
+        let crl_height = self
+            .state
+            .crl_chain
+            .put_block(encrypted_revocation.serialize_encrypted_data())?;
+
+        println!(
+            "✓ Revocation record stored in CRL blockchain at height {}",
+            crl_height
+        );
+        println!("✅ Certificate revoked successfully!");
+
+        Ok(subject_cn)
+    }
+
+    /// Check if a certificate is revoked by serial number
+    ///
+    /// Scans CRL blockchain for matching serial number
+    pub fn is_certificate_revoked(&self, serial_number: &str) -> Result<bool> {
+        let config = AppConfig::load().context("Failed to load config")?;
+        let app_private_key_pem = fs::read(&config.key_exports.app_key_path)
+            .context("Failed to read application private key")?;
+        let app_private_key = PKey::private_key_from_pem(&app_private_key_pem)
+            .context("Failed to parse application private key")?;
+
+        let crl_count = self.state.crl_chain.block_count()?;
+
+        for height in 0..crl_count {
+            let block = self.state.crl_chain.get_block_by_height(height)?;
+            let encrypted_data = deserialize_encrypted_data(&block.block_data())?;
+            let revocation_json = encrypted_data.decrypt_data(app_private_key.clone())?;
+
+            let revocation: serde_json::Value = serde_json::from_slice(&revocation_json)
+                .context("Failed to parse revocation data")?;
+
+            if let Some(revoked_serial) = revocation["serial_number"].as_str() {
+                if revoked_serial == serial_number {
+                    return Ok(true);
+                }
+            }
+        }
+
+        Ok(false)
     }
 }
 
@@ -1034,5 +1249,37 @@ pub fn clear_storage() -> Result<()> {
     }
 
     println!("✅ Storage cleared successfully");
+    Ok(())
+}
+
+pub fn complete_pki_storage_validation(
+    certificate_chain: &BlockChain<ReadWrite>,
+    private_key_chain: &BlockChain<ReadWrite>,
+) -> Result<()> {
+    let signatures_synced = || -> Result<bool> {
+        let cert_count = certificate_chain.block_count()?;
+        let key_count = private_key_chain.block_count()?;
+
+        if cert_count != key_count {
+            return Ok(false);
+        }
+
+        for height in 0..cert_count {
+            let cert_signature = certificate_chain.get_signature_by_height(height)?;
+            let key_signature = private_key_chain.get_signature_by_height(height)?;
+
+            if cert_signature != key_signature {
+                return Ok(false);
+            }
+        }
+
+        Ok(true)
+    }()?;
+    if !signatures_synced {
+        return Err(anyhow!(
+            "Certificate and private key blockchains are out of sync"
+        ));
+    }
+
     Ok(())
 }

@@ -257,6 +257,7 @@ pub fn render_admin_dashboard(user_cn: &str) -> Markup {
             nav {
                 a href="/admin/create-user" { "Create User Certificate" }
                 a href="/admin/create-intermediate" { "Create Intermediate CA" }
+                a href="/admin/revoke" { "Revoke Certificate" }
                 a href="/admin/status" { "View Status" }
             }
 
@@ -396,6 +397,103 @@ pub fn render_create_intermediate_page() -> Markup {
                     li { "RSA Key Size: 4096 bits" }
                     li { "Signature Algorithm: SHA-256" }
                 }
+            }
+        },
+    )
+}
+
+pub fn render_revoke_certificate_page(certificates: &[(String, String)]) -> Markup {
+    render_layout(
+        "Revoke Certificate",
+        html! {
+            h1 { "🚫 Revoke Certificate" }
+
+            nav {
+                a href="/admin/dashboard" { "← Back to Dashboard" }
+            }
+
+            div class="error" {
+                h3 { "⚠️ Warning: Irreversible Action" }
+                ul {
+                    li { "Certificate revocation is " strong { "permanent and immutable" } }
+                    li { "Revoked certificates " strong { "cannot be un-revoked" } }
+                    li { "Users with revoked certificates will be denied login access" }
+                    li { "To restore access, you must create a " strong { "new certificate" } " with a different serial number" }
+                }
+            }
+
+            @if certificates.is_empty() {
+                div class="info" {
+                    p { "No certificates available for revocation." }
+                    p { "Only user certificates and intermediate CAs can be revoked. The Root CA cannot be revoked." }
+                }
+            } @else {
+                form method="POST" action="/admin/revoke" {
+                    label for="serial_number" { "Select Certificate to Revoke:" }
+                    select id="serial_number" name="serial_number" required {
+                        option value="" disabled selected { "Select a certificate" }
+                        @for (cn, serial) in certificates {
+                            option value=(serial) { (cn) " (Serial: " (serial) ")" }
+                        }
+                    }
+                    small style="color: #6c757d;" { "Note: Root CA (height 0) cannot be revoked" }
+
+                    label for="reason" { "Reason for Revocation (optional):" }
+                    input type="text" id="reason" name="reason" placeholder="e.g., Key compromise, user terminated, superseded";
+
+                    div class="error" style="margin-top: 20px; padding: 20px;" {
+                        input type="checkbox" id="confirm" name="confirm" required style="width: auto; margin-right: 10px;";
+                        label for="confirm" style="display: inline;" {
+                            "I understand this action is " strong { "permanent and irreversible" }
+                        }
+                    }
+
+                    button type="submit" style="background: #dc3545;" { "⚠️ Revoke Certificate" }
+                }
+
+                div class="info" style="margin-top: 30px;" {
+                    h3 { "📋 Revocation Details" }
+                    ul {
+                        li { "Revoked certificates are added to the CRL (Certificate Revocation List)" }
+                        li { "Revocation is recorded in the blockchain with timestamp" }
+                        li { "Login attempts with revoked certificates will be automatically rejected" }
+                        li { "Serial numbers are unique - new certificates will have different serials" }
+                    }
+                }
+            }
+        },
+    )
+}
+
+pub fn render_certificate_revoked(serial_number: &str, common_name: &str) -> Markup {
+    render_layout(
+        "Certificate Revoked",
+        html! {
+            div class="error" {
+                h2 { "🚫 Certificate Revoked" }
+                p { "The certificate has been permanently revoked and added to the CRL." }
+            }
+
+            div class="info" {
+                h3 { "Revocation Details" }
+                p { strong { "Common Name:" } (common_name) }
+                p { strong { "Serial Number:" } (serial_number) }
+                p { strong { "Status:" } span style="color: #dc3545; font-weight: 600;" { "REVOKED" } }
+            }
+
+            div class="info" {
+                h3 { "⚠️ Important Information" }
+                ul {
+                    li { "This certificate can no longer be used for authentication" }
+                    li { "The user will be denied access when attempting to login" }
+                    li { strong { "This action is permanent and cannot be reversed" } }
+                    li { "To restore user access, create a new certificate with a different serial number" }
+                }
+            }
+
+            p style="margin-top: 30px;" {
+                a href="/admin/dashboard" { button { "Back to Dashboard" } }
+                a href="/admin/revoke" { button style="background: #6c757d; margin-left: 10px;" { "Revoke Another Certificate" } }
             }
         },
     )
