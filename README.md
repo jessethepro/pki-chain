@@ -16,7 +16,9 @@ Built in Rust with enterprise-grade cryptography, PKI Chain provides a complete 
 📊 **Comprehensive Logging** - Daily rotating logs with tracing framework  
 🏗️ **Complete PKI** - Root CA, Intermediate CAs, and User certificates  
 🔒 **RSA-4096** - Industry-standard cryptography with SHA-256 signatures  
-🎯 **Fast Lookups** - O(1) certificate retrieval with in-memory indexing
+🎯 **Fast Lookups** - O(1) certificate retrieval with in-memory indexing  
+🔌 **REST API** - JSON endpoints for certificate operations with cryptographic authentication  
+🚫 **Revocation System** - Immutable CRL blockchain with real-time revocation checks
 
 ## Features
 
@@ -37,6 +39,9 @@ Built in Rust with enterprise-grade cryptography, PKI Chain provides a complete 
 - 🎯 **Smart Certificate Creation**: User certificates don't require Root CA password
 - ✅ **Certificate Validation**: OpenSSL-based chain validation
 - 🔄 **Transactional Safety**: Automatic rollback on storage failures
+- 🚫 **Certificate Revocation**: Permanent, immutable revocation with CRL blockchain
+- 📊 **Revocation Table**: View all revoked certificates with timestamps and reasons
+- 🔍 **Real-Time Revocation Checks**: Login and API requests verify certificate status
 
 ### Security & Storage
 - 🔐 **Hybrid Storage Architecture**: 
@@ -47,6 +52,16 @@ Built in Rust with enterprise-grade cryptography, PKI Chain provides a complete 
 - 🔑 **In-Memory Key Management**: Secure runtime storage with zeroize on drop
 - 🛡️ **Password-Protected Root CA**: Only needed for signing intermediate CAs
 - 🔐 **Encrypted Private Keys**: Hybrid RSA-OAEP + AES-GCM-256 with app.key
+
+### REST API
+- 🔌 **JSON Endpoints**: Machine-readable certificate operations
+- 🔐 **Cryptographic Authentication**: Certificate serial + signature verification
+- 🛡️ **Root CA Protection**: Root CA explicitly denied API access
+- ✅ **Get Certificate**: Retrieve certificates by common name (non-revoked only)
+- 🔍 **Verify Certificate**: Check certificate validity and revocation status
+- 🔒 **Response Integrity**: SHA-256 hash encrypted with requester's public key
+- 📋 **Revocation Checks**: All API requests verify certificate is not revoked
+- 📚 **Complete Documentation**: API_README.md with Python and cURL examples
 
 ### Logging & Monitoring
 - 📝 **Tracing Framework**: Structured logging with tracing-subscriber
@@ -92,6 +107,7 @@ Access the web application at **https://127.0.0.1:3000**
 
 ### Available Routes
 
+**Web Interface (Admin Only):**
 - **`/`** - State-driven landing page (shows appropriate form based on system state)
 - **`/initialize`** - Create Root CA with password
 - **`/create-admin`** - Create first administrator account
@@ -99,8 +115,15 @@ Access the web application at **https://127.0.0.1:3000**
 - **`/admin/dashboard`** - Admin control panel
 - **`/admin/create-user`** - Create user certificates
 - **`/admin/create-intermediate`** - Create intermediate CAs
+- **`/admin/revoke`** - Revoke certificates (view revocation table)
 - **`/admin/status`** - View system statistics
 - **`/logout`** - End authenticated session
+
+**REST API (Certificate-Based Auth):**
+- **`POST /api/get-certificate`** - Retrieve certificate by common name (JSON)
+- **`POST /api/verify-certificate`** - Verify certificate validity by serial number (JSON)
+
+See [API_README.md](API_README.md) for complete API documentation with examples.
 
 ### Authentication Flow
 
@@ -184,9 +207,14 @@ Access the web application at **https://127.0.0.1:3000**
 ### Key Modules
 
 - **[main.rs](src/main.rs)** (96 lines): Entry point, launches webserver
-- **[webserver.rs](src/webserver.rs)** (963 lines): Axum HTTPS server with state machine
+- **[webserver.rs](src/webserver.rs)** (1657 lines): Axum HTTPS server with state machine and REST API
   - CA server states: NoExist, Initialized, CreateAdmin, Ready, Authenticated
   - Admin-only authentication via certificate OU field verification
+  - REST API endpoints: `/api/get-certificate`, `/api/verify-certificate`
+  - Cryptographic authentication: serial number + signature verification
+  - Root CA restriction: Self-signed certificates denied API access
+  - Response integrity: SHA-256 hash encrypted with requester's public key
+  - Certificate revocation UI with revoked certificates table
   - Tracing initialization with daily rotation
   - All panics replaced with graceful error handling
 - **[templates.rs](src/templates.rs)** (619 lines): Maud HTML templates
@@ -195,9 +223,13 @@ Access the web application at **https://127.0.0.1:3000**
   - Certificate/key download pages
   - User certificate creation form with intermediate CA dropdown
   - Intermediate CA creation form
-- **[storage.rs](src/storage.rs)** (1039 lines): Type-state blockchain storage
+- **[storage.rs](src/storage.rs)** (1364 lines): Type-state blockchain storage
   - Three separate blockchains (certificates, keys, CRL)
   - In-memory subject name index for fast lookups
+  - Certificate lookup by serial number for API operations
+  - Certificate revocation with CRL blockchain storage
+  - Real-time revocation checks (login and API authentication)
+  - Get revoked certificates list with metadata
   - Transactional operations with rollback
   - User certificate creation without Root CA password
   - Intermediate CA detection by issuer (issued by Root CA)
@@ -311,8 +343,137 @@ Access the web application at **https://127.0.0.1:3000**
 4. **Admin Dashboard** (certificate management):
    - **Create Intermediate CAs**: Requires Root CA password
    - **Create User Certificates**: No Root CA password needed (uses app.key)
+   - **Revoke Certificates**: Permanently revoke certificates (immutable CRL)
    - **View System Status**: Blockchain statistics and validation
    - **Logout**: End authenticated session
+
+### REST API Usage
+
+The REST API allows programmatic access to certificate operations. **Only non-Root CA certificates** can make API requests.
+
+**Authentication**: All API requests require:
+1. Requester's certificate serial number (hex string)
+2. Cryptographic signature of request data (base64-encoded)
+3. Certificate must exist in the PKI system and not be revoked
+4. Certificate must NOT be the Root CA (self-signed certificates denied)
+
+**Example: Get Certificate by Common Name**
+
+```python
+import json
+import requests
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import padding
+
+# Load certificate and private key
+with open('user.crt', 'rb') as f:
+    cert = x509.load_pem_x509_certificate(f.read())
+with open('user.key', 'rb') as f:
+    private_key = serialization.load_pem_private_key(f.read(), password=None)
+
+# Get requester serial number
+requester_serial = format(cert.serial_number, 'X')
+
+# Sign target CN
+target_cn = "target.user@example.com"
+signature = private_key.sign(
+    target_cn.encode('utf-8'),
+    padding.PKCS1v15(),
+    hashes.SHA256()
+)
+signature_b64 = base64.b64encode(signature).decode('ascii')
+
+# Make API request
+response = requests.post(
+    'https://127.0.0.1:3000/api/get-certificate',
+    json={
+        'requester_serial': requester_serial,
+        'target_cn': target_cn,
+        'signature': signature_b64
+    },
+    verify=False  # Self-signed cert
+)
+
+result = response.json()
+if result['success']:
+    print(f"Certificate: {result['certificate_pem']}")
+    print(f"Serial: {result['serial_number']}")
+    # Verify response integrity
+    encrypted_hash = result['encrypted_hash']
+    # Decrypt with private key and verify SHA-256
+else:
+    print(f"Error: {result['error']}")
+```
+
+**Example: Verify Certificate by Serial Number**
+
+```bash
+# Extract serial from certificate
+SERIAL=$(openssl x509 -in user.crt -noout -serial | cut -d'=' -f2)
+REQUESTER_SERIAL=$(openssl x509 -in requester.crt -noout -serial | cut -d'=' -f2)
+
+# Sign the target serial
+SIGNATURE=$(echo -n "$SERIAL" | openssl dgst -sha256 -sign requester.key | base64 -w 0)
+
+# Make API request
+curl -k -X POST https://127.0.0.1:3000/api/verify-certificate \
+  -H "Content-Type: application/json" \
+  -d "{
+    \"requester_serial\": \"$REQUESTER_SERIAL\",
+    \"target_serial\": \"$SERIAL\",
+    \"signature\": \"$SIGNATURE\"
+  }" | jq
+```
+
+**Response Fields:**
+- `success`: Boolean indicating if request succeeded
+- `certificate_pem`: Certificate in PEM format (get-certificate only)
+- `valid`: Boolean indicating certificate validity (verify-certificate only)
+- `revoked`: Boolean indicating revocation status (verify-certificate only)
+- `serial_number`: Certificate serial number (hex string)
+- `subject_cn`: Subject common name
+- `issuer_cn`: Issuer common name
+- `not_before`: Validity start date
+- `not_after`: Validity end date
+- `encrypted_hash`: SHA-256 hash of response data, encrypted with requester's public key
+- `error`: Error message if request failed
+
+**API Restrictions:**
+- ✅ User certificates can make API requests
+- ✅ Intermediate CA certificates can make API requests
+- ❌ Root CA certificates **cannot** make API requests
+- ❌ Revoked certificates **cannot** make API requests
+
+See [API_README.md](API_README.md) for complete documentation, error codes, and Python test client.
+
+### Certificate Revocation
+
+PKI Chain includes a permanent, immutable certificate revocation system:
+
+**Revocation Process:**
+1. Navigate to `/admin/revoke` in the web interface
+2. Select certificate from dropdown (all certificates except Root CA)
+3. Optionally enter revocation reason
+4. Confirm revocation (checkbox required)
+5. Certificate permanently added to CRL blockchain
+
+**Revoked Certificates Table:**
+- Displays all revoked certificates with metadata
+- Columns: Common Name, Serial Number, Revocation Date, Reason, Certificate Height
+- Timestamps shown in UTC format
+- Real-time updates when new certificates are revoked
+
+**Revocation Enforcement:**
+- Login attempts with revoked certificates are **automatically denied**
+- API requests from revoked certificates are **rejected**
+- Get Certificate API returns **only non-revoked certificates**
+- Verify Certificate API reports revocation status
+
+**Important Notes:**
+- ⚠️ Revocation is **permanent and irreversible** (immutable blockchain)
+- ⚠️ Revoked certificates **cannot be un-revoked**
+- ℹ️ To restore user access, create a **new certificate** with different serial number
+- ℹ️ Root CA **cannot be revoked** (system protection)
 
 ### Logging
 
@@ -423,16 +584,20 @@ pki-chain/
 ├── src/
 │   ├── lib.rs                       # Library interface
 │   ├── main.rs                      # Application entry point (96 lines)
-│   ├── webserver.rs                 # HTTPS web server (Axum + state machine, 963 lines)
+│   ├── webserver.rs                 # HTTPS web server (Axum + state machine + API, 1657 lines)
 │   ├── templates.rs                 # Maud HTML templates (619 lines)
-│   ├── storage.rs                   # Type-state blockchain storage (1039 lines)
+│   ├── storage.rs                   # Type-state blockchain storage (1364 lines)
 │   ├── pki_generator.rs             # Unified certificate generation (251 lines)
 │   ├── encryption.rs                # Hybrid RSA + AES-GCM-256 encryption (211 lines)
 │   ├── key_archive.rs               # Tar-based key backup/restore (139 lines)
 │   └── configs.rs                   # TOML configuration parsing (149 lines)
 ├── .github/
 │   └── copilot-instructions.md      # AI coding assistant instructions
-├── config.toml                     # Configuration file
+├── API_README.md                    # REST API documentation (~400 lines)
+├── API_IMPLEMENTATION_SUMMARY.md    # API architecture overview (~350 lines)
+├── test_api_client.py               # Python API test client (~340 lines)
+├── test_api_quick.sh                # Bash API testing script (~80 lines)
+├── config.toml                      # Configuration file
 ├── generate_app_keypair.sh          # Application key generator
 ├── generate-certs.sh                # TLS certificate generator
 ├── test_keypair_generation.sh       # End-to-end test suite
@@ -440,6 +605,9 @@ pki-chain/
 ├── web_certs/                       # TLS certificates (generated)
 ├── logs/                            # Daily rotating webserver logs
 ├── data/                            # Blockchain databases (RocksDB)
+│   ├── certificates/                # Certificate blockchain (encrypted DER)
+│   ├── private_keys/                # Private key hashes + signatures
+│   └── crl/                         # Certificate Revocation List blockchain
 └── exports/keystore/                # Encrypted private key storage
 ```
 
@@ -494,6 +662,10 @@ PKI Chain implements multiple layers of security:
 - Challenge-response signature verification
 - Root CA password protection for key operations
 - Session-based access control (authenticated vs unauthenticated)
+- REST API: Certificate serial + cryptographic signature verification
+- Root CA protection: Self-signed certificates denied API access
+- Real-time revocation checks for login and API authentication
+- Immutable CRL blockchain for permanent revocation records
 
 **Encryption at Rest:**
 - Root CA private key: PKCS#8 PEM with password protection
@@ -556,6 +728,25 @@ PKI Chain implements multiple layers of security:
 - Logs rotate daily automatically (logs/webserver.log.YYYY-MM-DD)
 - Old logs must be manually archived or deleted
 - Consider setting up log rotation policy
+
+**API Request Fails with "Authentication failed"**
+- Verify certificate serial number is correct (hex format)
+- Ensure signature is base64-encoded and uses SHA-256
+- Check that certificate exists in PKI system and is not revoked
+- Root CA certificates **cannot** make API requests (security restriction)
+- Review API_README.md for signature generation examples
+
+**"Certificate has been revoked" Error**
+- Certificate was permanently revoked via admin dashboard
+- Revocation is **immutable** and cannot be reversed
+- Create a new certificate for the user with different serial number
+- Check revoked certificates table at `/admin/revoke`
+
+**Cannot Revoke Certificate**
+- Root CA (height 0) cannot be revoked (system protection)
+- Ensure you're authenticated as an administrator
+- Certificate must exist in PKI system
+- Check logs/webserver.log for detailed error messages
 
 ## Contributing
 
