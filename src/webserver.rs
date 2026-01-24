@@ -1043,7 +1043,18 @@ async fn admin_revoke(State(ca_state): State<AppState>) -> Html<String> {
                 }
             };
 
-            Html(templates::render_revoke_certificate_page(&certificates).into_string())
+            // Get list of currently revoked certificates
+            let revoked_certificates = match storage.get_revoked_certificates() {
+                Ok(revoked) => revoked,
+                Err(e) => {
+                    return Html(
+                        templates::render_error(&format!("Failed to get revoked certificates: {}", e))
+                            .into_string(),
+                    )
+                }
+            };
+
+            Html(templates::render_revoke_certificate_page(&certificates, &revoked_certificates).into_string())
         }
         _ => Html(templates::render_error("Not authenticated").into_string()),
     }

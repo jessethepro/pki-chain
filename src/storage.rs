@@ -1053,6 +1053,48 @@ impl Storage<Ready> {
 
         Ok(false)
     }
+
+    /// Get list of all revoked certificates with their metadata
+    ///
+    /// Returns Vec of (serial_number, common_name, timestamp, reason, height)
+    pub fn get_revoked_certificates(&self) -> Result<Vec<(String, String, u64, String, u64)>> {
+        let config = AppConfig::load().context("Failed to load config")?;
+        let app_private_key_pem = fs::read(&config.key_exports.app_key_path)
+            .context("Failed to read application private key")?;
+        let app_private_key = PKey::private_key_from_pem(&app_private_key_pem)
+            .context("Failed to parse application private key")?;
+
+        let mut revoked_certs = Vec::new();
+        let crl_count = self.state.crl_chain.block_count()?;
+
+        for height in 0..crl_count {
+            let block = self.state.crl_chain.get_block_by_height(height)?;
+            let encrypted_data = deserialize_encrypted_data(&block.block_data())?;
+            let revocation_json = encrypted_data.decrypt_data(app_private_key.clone())?;
+
+            let revocation: serde_json::Value = serde_json::from_slice(&revocation_json)
+                .context("Failed to parse revocation data")?;
+
+            let serial = revocation["serial_number"]
+                .as_str()
+                .unwrap_or("Unknown")
+                .to_string();
+            let cn = revocation["common_name"]
+                .as_str()
+                .unwrap_or("Unknown")
+                .to_string();
+            let timestamp = revocation["revocation_timestamp"].as_u64().unwrap_or(0);
+            let reason = revocation["reason"]
+                .as_str()
+                .unwrap_or("Not specified")
+                .to_string();
+            let cert_height = revocation["blockchain_height"].as_u64().unwrap_or(0);
+
+            revoked_certs.push((serial, cn, timestamp, reason, cert_height));
+        }
+
+        Ok(revoked_certs)
+    }
 }
 
 // ============================================================================

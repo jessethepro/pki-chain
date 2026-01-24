@@ -402,7 +402,10 @@ pub fn render_create_intermediate_page() -> Markup {
     )
 }
 
-pub fn render_revoke_certificate_page(certificates: &[(String, String)]) -> Markup {
+pub fn render_revoke_certificate_page(
+    certificates: &[(String, String)],
+    revoked_certificates: &[(String, String, u64, String, u64)],
+) -> Markup {
     render_layout(
         "Revoke Certificate",
         html! {
@@ -459,6 +462,47 @@ pub fn render_revoke_certificate_page(certificates: &[(String, String)]) -> Mark
                         li { "Login attempts with revoked certificates will be automatically rejected" }
                         li { "Serial numbers are unique - new certificates will have different serials" }
                     }
+                }
+            }
+
+            @if !revoked_certificates.is_empty() {
+                h2 style="margin-top: 40px;" { "Currently Revoked Certificates" }
+
+                div class="info" {
+                    p { "Total revoked: " strong { (revoked_certificates.len()) } " certificate(s)" }
+                }
+
+                table style="width: 100%; border-collapse: collapse; margin-top: 20px; background: #ffffff;" {
+                    thead {
+                        tr style="background: #f8f9fa; border-bottom: 2px solid #495057;" {
+                            th style="padding: 12px; text-align: left; font-weight: 600; color: #000000;" { "Common Name" }
+                            th style="padding: 12px; text-align: left; font-weight: 600; color: #000000;" { "Serial Number" }
+                            th style="padding: 12px; text-align: left; font-weight: 600; color: #000000;" { "Revoked Date" }
+                            th style="padding: 12px; text-align: left; font-weight: 600; color: #000000;" { "Reason" }
+                            th style="padding: 12px; text-align: left; font-weight: 600; color: #000000;" { "Cert Height" }
+                        }
+                    }
+                    tbody {
+                        @for (serial, cn, timestamp, reason, height) in revoked_certificates {
+                            tr style="border-bottom: 1px solid #dee2e6;" {
+                                td style="padding: 10px; color: #212529;" { (cn) }
+                                td style="padding: 10px; font-family: monospace; font-size: 12px; color: #212529;" { (serial) }
+                                td style="padding: 10px; color: #212529;" {
+                                    @let datetime = chrono::DateTime::from_timestamp(*timestamp as i64, 0)
+                                        .map(|dt| dt.format("%Y-%m-%d %H:%M:%S UTC").to_string())
+                                        .unwrap_or_else(|| "Invalid date".to_string());
+                                    (datetime)
+                                }
+                                td style="padding: 10px; color: #212529;" { (reason) }
+                                td style="padding: 10px; text-align: center; color: #212529;" { (height) }
+                            }
+                        }
+                    }
+                }
+            } @else {
+                div class="info" style="margin-top: 40px;" {
+                    h3 { "✅ No Revoked Certificates" }
+                    p { "No certificates have been revoked yet. All certificates are currently active." }
                 }
             }
         },
