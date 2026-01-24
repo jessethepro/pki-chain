@@ -27,9 +27,15 @@ The REST API has been successfully implemented with full certificate-based authe
 - ✅ Request data is signed with requester's private key
 - ✅ Signature is base64-encoded and included in JSON
 - ✅ Server verifies certificate exists in blockchain
+- ✅ Server rejects Root CA certificate (self-signed check)
 - ✅ Server checks certificate is not revoked
 - ✅ Server validates signature with certificate's public key
 - ✅ Failed authentication returns descriptive error message
+
+**Allowed Requesters:**
+- ✅ User certificates (admin and regular)
+- ✅ Intermediate CA certificates
+- ❌ Root CA certificate (explicitly forbidden)
 
 #### Security Layers
 1. **Certificate Verification**: Must exist in blockchain
@@ -104,11 +110,13 @@ The REST API has been successfully implemented with full certificate-based authe
 
 6. Server receives request
 7. Server loads requester's certificate from blockchain by serial
-8. Server checks if certificate is revoked (CRL blockchain)
-9. Server extracts public key from certificate
-10. Server decodes signature from base64
-11. Server verifies signature matches request data
-12. Server processes request if authentication succeeds
+8. Server checks if certificate is Root CA (subject == issuer)
+9. Server rejects request if Root CA is detected
+10. Server checks if certificate is revoked (CRL blockchain)
+11. Server extracts public key from certificate
+12. Server decodes signature from base64
+13. Server verifies signature matches request data
+14. Server processes request if authentication succeeds
 ```
 
 ### Response Integrity Flow

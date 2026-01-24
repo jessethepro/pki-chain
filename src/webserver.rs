@@ -1183,6 +1183,28 @@ fn authenticate_api_request(
         Err(e) => return Err(format!("Failed to get certificate: {}", e)),
     };
 
+    // Check if this is the Root CA (self-signed certificate)
+    // Root CA is not allowed to make API requests
+    // Compare subject and issuer by extracting CN values
+    let subject_cn = cert
+        .subject_name()
+        .entries_by_nid(openssl::nid::Nid::COMMONNAME)
+        .next()
+        .and_then(|e| e.data().as_utf8().ok())
+        .map(|d| d.to_string());
+
+    let issuer_cn = cert
+        .issuer_name()
+        .entries_by_nid(openssl::nid::Nid::COMMONNAME)
+        .next()
+        .and_then(|e| e.data().as_utf8().ok())
+        .map(|d| d.to_string());
+
+    // If subject == issuer, it's a self-signed certificate (Root CA)
+    if subject_cn.is_some() && subject_cn == issuer_cn {
+        return Err("Root CA certificate cannot make API requests".to_string());
+    }
+
     // Check if certificate is revoked
     let is_revoked = match storage.is_certificate_revoked(requester_serial) {
         Ok(revoked) => revoked,

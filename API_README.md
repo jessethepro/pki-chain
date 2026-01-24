@@ -13,6 +13,11 @@ All API requests must include:
 1. **Requester Serial Number**: Hex string of the requester's X.509 certificate serial number
 2. **Cryptographic Signature**: Base64-encoded signature of the request data, signed with the requester's private key
 
+**Who Can Access the API:**
+- ✅ Any user certificate (admin or regular users)
+- ✅ Any intermediate CA certificate
+- ❌ Root CA certificate (explicitly forbidden)
+
 ### Authentication Flow
 
 1. Requester signs the target data (CN or serial number) with their private key
@@ -85,6 +90,7 @@ Retrieve an X.509 certificate by Common Name.
 
 **Error Conditions**:
 - `Authentication failed: Certificate not found` - Requester certificate not in blockchain
+- `Authentication failed: Root CA certificate cannot make API requests` - Root CA is not allowed
 - `Authentication failed: Certificate has been revoked` - Requester certificate is revoked
 - `Authentication failed: Invalid signature` - Signature verification failed
 - `Certificate not found` - Target certificate does not exist
@@ -266,6 +272,7 @@ All API responses use HTTP 200 OK status code. Check the `success` field in the 
 | Error | Cause | Solution |
 |-------|-------|----------|
 | `Authentication failed: Certificate not found` | Requester certificate not in blockchain | Ensure certificate was created by the PKI system |
+| `Authentication failed: Root CA certificate cannot make API requests` | Attempted to use Root CA | Use a user or intermediate CA certificate instead |
 | `Authentication failed: Certificate has been revoked` | Requester certificate is revoked | Use a non-revoked certificate |
 | `Authentication failed: Invalid signature` | Signature verification failed | Check signature generation process |
 | `Certificate not found` | Target certificate doesn't exist | Verify Common Name or serial number |
