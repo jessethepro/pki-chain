@@ -9,7 +9,7 @@ set -e  # Exit on error
 export OPENSSL_CONF=/etc/ssl/openssl.cnf
 
 # Configuration
-CERT_DIR="./certs"
+CERT_DIR="./web_certs"
 ROOT_NAME="LocalRootCA"
 INTERMEDIATE_NAME="LocalIntermediateCA"
 SERVER_NAME="localhost"
@@ -54,9 +54,9 @@ echo ""
 # ==============================================================================
 echo "📜 Step 2: Generating Intermediate CA..."
 
-chmod 400 intermediate/intermediate-ca.key  # Read-only by owner
 # Intermediate CA private key
 openssl genrsa -out intermediate/intermediate-ca.key 4096
+chmod 400 intermediate/intermediate-ca.key  # Read-only by owner
 
 # Intermediate CA CSR (Certificate Signing Request)
 openssl req -new \
@@ -82,10 +82,10 @@ openssl x509 -req \
   -out intermediate/intermediate-ca.crt \
   -days $DAYS_INTERMEDIATE \
   -sha256 \
-  -extfile intermediate/intermed
-
-chmod 644 intermediate/intermediate-ca.crt  # Readable by alliate-ca.cnf \
+  -extfile intermediate/intermediate-ca.cnf \
   -extensions v3_intermediate_ca
+
+chmod 644 intermediate/intermediate-ca.crt  # Readable by all
 
 echo "✓ Intermediate CA generated"
 echo "  - Private Key: intermediate/intermediate-ca.key"
@@ -97,9 +97,9 @@ echo ""
 # ==============================================================================
 echo "📜 Step 3: Generating Server Certificate for localhost..."
 
-chmod 400 server/server.key  # Read-only by owner - CRITICAL!
 # Server private key
 openssl genrsa -out server/server.key 2048
+chmod 400 server/server.key  # Read-only by owner - CRITICAL!
 
 # Server CSR
 openssl req -new \
@@ -138,6 +138,7 @@ subjectAltName = @alt_names
 DNS.1 = localhost
 DNS.2 = *.localhost
 DNS.3 = 127.0.0.1
+DNS.4 = services.local
 IP.1 = 127.0.0.1
 IP.2 = ::1
 EOF
@@ -151,10 +152,10 @@ openssl x509 -req \
   -out server/server.crt \
   -days $DAYS_SERVER \
   -sha256 \
-  -extfile server/serve
-
-chmod 644 server/server.crt  # Readable by allr.cnf \
+  -extfile server/server.cnf \
   -extensions v3_server
+
+chmod 644 server/server.crt  # Readable by all
 
 echo "✓ Server certificate generated"
 echo "  - Private Key: server/server.key"
@@ -165,14 +166,14 @@ echo ""
 # Step 4: Create Certificate Chain Bundle
 # ==============================================================================
 echo "📜 Step 4: Creating certificate chain bundle..."
+
+# Full chain (includes root for local trust tooling)
+cat server/server.crt intermediate/intermediate-ca.crt root/root-ca.crt > server/fullchain.pem
 chmod 644 server/fullchain.pem
 
 # Chain without root (common for web servers)
 cat server/server.crt intermediate/intermediate-ca.crt > server/chain.pem
-chmod 644oot/root-ca.crt > server/fullchain.pem
-
-# Chain without root (common for web servers)
-cat server/server.crt intermediate/intermediate-ca.crt > server/chain.pem
+chmod 644 server/chain.pem
 
 echo "✓ Certificate chain bundles created"
 echo "  - Full chain: server/fullchain.pem"

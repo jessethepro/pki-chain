@@ -67,8 +67,8 @@ echo "Generating application keypair..."
 SERIAL=$(openssl rand -hex 16)
 
 # Create output filenames
-OUTPUT_KEY="pki-chain-app.key"
-OUTPUT_CRT="pki-chain-app.crt"
+OUTPUT_KEY="key/app.key"
+OUTPUT_CRT="certificate/app.crt"
 
 # Build subject string (only include non-empty fields)
 SUBJECT="/CN=${CN}"
@@ -96,6 +96,9 @@ EOF
 if [ -n "$EMAIL" ]; then
     echo "subjectAltName = email:${EMAIL}" >> "$EXT_CONF"
 fi
+
+# Ensure output directories exist
+mkdir -p "$(dirname "$OUTPUT_KEY")" "$(dirname "$OUTPUT_CRT")"
 
 # Generate unencrypted private key (4096-bit RSA)
 echo "Generating RSA private key (4096-bit, unencrypted)..."
