@@ -8,19 +8,11 @@ crl_path = "data/crl"
 [key_exports]
 app_key_path = "key/app.key"
 app_cert_path = "certificate/app.crt"
-root_key_name = "0.key.enc"
-# Optional: defaults to "exports/keystore" if not specified
-# key_export_directory_path = "exports/keystore"
 
-# Optional: Server configuration - uses defaults if not specified
 [server]
-host = "0.0.0.0"
-port = 3000
-web_root = "web_root"
-tls_cert_path = "web_certs/server/chain.pem"
-tls_key_path = "web_certs/server/server.key"
+comm_sock = "/tmp/comm_server.sock"
+setup_sock = "/tmp/setup_server.sock"
 
-# Optional: Root CA defaults - uses hardcoded defaults if not specified
 [root_ca_defaults]
 root_ca_common_name = "MenaceLabs Root CA"
 root_ca_organization = "MenaceLabs"

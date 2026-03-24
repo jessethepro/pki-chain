@@ -4,7 +4,7 @@ use openssl::hash::MessageDigest;
 use openssl::pkey::{PKey, Private};
 use openssl::x509::extension::ExtendedKeyUsage;
 use openssl::x509::extension::{BasicConstraints, KeyUsage};
-use openssl::x509::X509;
+use openssl::x509::{X509Builder, X509};
 
 const INTERMEDIATE_CA_PATH_LENGTH: u32 = 0;
 const X509_VERSION_3: i32 = 2; // X509 version 3 is represented by 2
@@ -19,7 +19,6 @@ pub enum CertificateDataType {
     TlsCert,
 }
 
-/// Certificate data structure
 #[derive(Debug, Clone)]
 pub struct CertificateData {
     pub subject_common_name: String,

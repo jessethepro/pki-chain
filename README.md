@@ -1,6 +1,315 @@
 # PKI Chain
 
-**A production-ready blockchain-backed Public Key Infrastructure (PKI) certificate authority with secure web-based management interface.**
+**A blockchain-backed Public Key Infrastructure (PKI) certificate authority with Unix socket-based certificate services.**
+
+Built in Rust with enterprise-grade cryptography, PKI Chain provides a complete CA hierarchy with state-driven request handling and comprehensive logging. Features hybrid storage: certificates in blockchain (DER format), private keys encrypted with RSA+AES-GCM-256, and SHA-512 integrity hashes via [libblockchain](https://github.com/jessethepro/libblockchain).
+
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![Rust](https://img.shields.io/badge/rust-1.70%2B-orange.svg)](https://www.rust-lang.org/)
+[![Release](https://img.shields.io/github/v/release/jessethepro/pki-chain)](https://github.com/jessethepro/pki-chain/releases)
+
+## Highlights
+
+🔌 **Unix Socket API** - All certificate services requested over a Unix socket  
+🔐 **Cryptographic Auth** - X.509 certificate + signature verification for all requests  
+📊 **Comprehensive Logging** - Daily rotating logs with tracing framework  
+🏗️ **Complete PKI** - Root CA, Intermediate CAs, and User certificates  
+🔒 **RSA-4096** - Industry-standard cryptography with SHA-256 signatures  
+🎯 **Fast Lookups** - O(1) certificate retrieval with in-memory indexing  
+🚫 **Revocation System** - Immutable CRL blockchain with real-time revocation checks
+
+> **Note**: There is no built-in graphical or web interface. Client applications connect via the Unix socket protocol described below. A separate client project provides the user-facing interface.
+
+## Quick Start
+
+```bash
+# 1. Clone the repository
+git clone https://github.com/jessethepro/pki-chain.git
+cd pki-chain
+
+# 2. Generate master encryption key (REQUIRED for first run)
+./generate_app_keypair.sh
+
+# 3. Build the application
+cargo build --release
+
+# 4. Start the service
+./target/release/pki-chain
+```
+
+## Unix Socket Protocol
+
+All certificate services are accessed by connecting to the Unix socket path configured in `config.toml` (`server.comm_sock`).
+
+### Wire Format
+
+Each request and response uses the same binary framing (little-endian):
+
+| Field | Type | Description |
+|---|---|---|
+| `version` | `u32` | Protocol version (currently `1`) |
+| `payload_size` | `u32` | Byte length of the payload |
+| `payload` | `[u8; payload_size]` | UTF-8 JSON string |
+
+### Request Format
+
+The payload is a JSON object. The `request_type` key determines the handler:
+
+```json
+{
+  "request_type": "GetCACertificate",
+  "response_socket": "/tmp/my-client.sock"
+}
+```
+
+The `response_socket` field is required on all requests — the service connects back to that socket to send the response using the same wire format.
+
+### Two Server Modes
+
+- **`start_comm_server`** — normal operation; handles all certificate service requests (`Ready` state)
+- **`start_setup_server`** — initial admin setup only; accepts `AddAdmin` requests (`Initialized` state)
+
+Each accepted connection is handled in a dedicated thread (one request per connection).
+
+### Maximum Payload Size
+
+Requests with `payload_size` exceeding **10 MiB** are rejected before the body is read.
+
+## Architecture
+
+### Component Stack
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│              Client Application (separate project)          │
+│         Connects via Unix socket (configurable path)        │
+└────────────────────────┬────────────────────────────────────┘
+                         │  Wire: version u32 | size u32 | JSON payload
+┌────────────────────────▼────────────────────────────────────┐
+│              comm_protocol.rs (Unix Socket Server)          │
+│  ┌──────────────────────────────────────────────────────┐  │
+│  │  State Machine: NoExist → Initialized →              │  │
+│  │  CreateAdmin → Ready → Authenticated                 │  │
+│  └──────────────────────────────────────────────────────┘  │
+│  ┌──────────────────────────────────────────────────────┐  │
+│  │  Tracing Framework                                   │  │
+│  │  - Daily rotating logs (logs/pki_chain.log)          │  │
+│  │  - Also mirrored to stdout                           │  │
+│  │  - Level controlled by RUST_LOG (default: info)      │  │
+│  └──────────────────────────────────────────────────────┘  │
+└────────────────────────┬────────────────────────────────────┘
+                         │
+┌────────────────────────▼────────────────────────────────────┐
+│              Storage Layer (storage.rs)                      │
+│  ┌──────────────────────────────────────────────────────┐  │
+│  │  Type-State Pattern:                                 │  │
+│  │  Storage<NoExist> → Storage<Initialized> →          │  │
+│  │  Storage<Ready>                                      │  │
+│  └──────────────────────────────────────────────────────┘  │
+│  ┌──────────────────────────────────────────────────────┐  │
+│  │  Certificate Index (HashMap<String, u64>)            │  │
+│  │  - Subject CN → Blockchain Height                    │  │
+│  │  - O(1) certificate lookups                          │  │
+│  └──────────────────────────────────────────────────────┘  │
+└────────────────────────┬────────────────────────────────────┘
+                         │
+┌────────────────────────▼────────────────────────────────────┐
+│          Three Blockchain Storage (libblockchain)           │
+│  ┌──────────────────┬──────────────────┬─────────────────┐  │
+│  │ Certificate      │ Private Key      │ CRL             │  │
+│  │ Blockchain       │ Blockchain       │ Blockchain      │  │
+│  │                  │                  │                 │  │
+│  │ Height 0:        │ Height 0:        │ (Empty until    │  │
+│  │   Root CA (DER)  │   Root Key Hash  │  revocations)   │  │
+│  │ Height 1+:       │ Height 1+:       │                 │  │
+│  │   User Certs     │   Key Hashes     │                 │  │
+│  │                  │                  │                 │  │
+│  │ ▲ Encrypted with │ ▲ Encrypted with │ ▲ Encrypted     │  │
+│  │   app.key        │   Root CA key    │   with app.key  │  │
+│  └──────────────────┴──────────────────┴─────────────────┘  │
+│                    RocksDB Backend                          │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### Key Modules
+
+- **[main.rs](src/main.rs)**: Entry point; initializes logging, checks storage state, starts appropriate server
+- **[comm_protocol.rs](src/comm_protocol.rs)**: Unix socket server, framed request parsing, CA state machine, request dispatch
+  - `recv_request`: handles one request per connection, returns `anyhow::Result<()>`
+  - `handle_setup_request`: AddAdmin handler during `Initialized` state
+  - All errors logged via `tracing` and propagated with `?`
+- **[storage.rs](src/storage.rs)**: Type-state blockchain storage
+  - Three separate blockchains (certificates, keys, CRL)
+  - In-memory subject name index for fast lookups
+  - Transactional operations with rollback
+- **[pki_generator.rs](src/pki_generator.rs)**: Certificate generation — 4096-bit RSA, SHA-256 signatures
+- **[encryption.rs](src/encryption.rs)**: Hybrid RSA-OAEP + AES-GCM-256
+- **[configs.rs](src/configs.rs)**: TOML configuration management
+
+### PKI Hierarchy
+
+```
+Root CA (self-signed, pathlen=1)
+  └── Intermediate CA (signed by Root, pathlen=0)
+      └── User Certificate (signed by Intermediate, CA=false)
+```
+
+### Storage Architecture
+
+**Blockchain Layer** (RocksDB):
+- **Certificate Chain**: X.509 certificates in DER format (encrypted with app.key)
+- **Private Key Chain**: Private keys encrypted, SHA-512 hashes + signatures
+  - Root CA: PKCS#8 PEM with password protection
+  - All others: Encrypted with app.key (RSA-OAEP + AES-GCM-256)
+- **CRL Chain**: Certificate Revocation Lists (encrypted with app.key)
+
+**In-Memory**:
+- Application key loaded from `key/app.key` (decrypts all blockchains and non-Root CA keys)
+- Certificate index: `HashMap<String, u64>` for O(1) lookups
+
+## Installation
+
+### Prerequisites
+
+- **Rust 1.70+**
+- **OpenSSL development libraries** (`libssl-dev` or `openssl-devel`)
+- **Linux/Unix system**
+
+### Build from Source
+
+```bash
+git clone https://github.com/jessethepro/pki-chain.git
+cd pki-chain
+
+# Generate application encryption key (FIRST RUN ONLY)
+./generate_app_keypair.sh
+# Creates key/app.key and certificate/app.crt
+
+cargo build --release
+./target/release/pki-chain
+```
+
+**Security Note**: `key/app.key` is the master encryption key. Keep it secure and backed up — loss means permanent loss of access to blockchain data.
+
+## Configuration
+
+All settings configured via `config.toml`:
+
+```toml
+[blockchains]
+certificate_path = "data/certificates"
+private_key_path = "data/private_keys"
+crl_path = "data/crl"
+
+[key_exports]
+app_key_path = "key/app.key"
+app_cert_path = "certificate/app.crt"
+root_key_name = "0.key.enc"
+key_export_directory_path = "exports/keystore"
+
+[server]
+comm_sock = "/tmp/pki-chain.sock"        # Main service socket
+setup_sock = "/tmp/pki-chain-setup.sock" # Setup socket (Initialized state only)
+
+[root_ca_defaults]
+root_ca_common_name = "MenaceLabs Root CA"
+root_ca_organization = "MenaceLabs"
+root_ca_organizational_unit = "CY"
+root_ca_locality = "Sao Jose dos Campos"
+root_ca_state = "SP"
+root_ca_country = "BR"
+root_ca_validity_days = 3650
+```
+
+## Logging
+
+All service activity is logged to `logs/pki_chain.log` with daily rotation and mirrored to stdout.
+
+Log level is controlled by the `RUST_LOG` environment variable (default: `info`):
+
+```bash
+RUST_LOG=debug ./target/release/pki-chain
+```
+
+Structured fields appear in log output:
+```
+2026-03-24T10:31:15Z INFO pki_chain: Storage initialized successfully
+2026-03-24T10:32:03Z INFO pki_chain::comm_protocol: Admin user added successfully
+2026-03-24T10:32:10Z ERROR pki_chain::comm_protocol: Failed to parse request JSON error=...
+```
+
+## Security Considerations
+
+1. **Protect `key/app.key`**: This file is loaded into memory at startup. Store it securely and back it up.
+2. **Root CA Private Key**: Stored as password-protected PKCS#8. Required for signing intermediate CAs only.
+3. **Revocation is immutable**: Revoked certificates cannot be un-revoked. Create a new certificate to restore user access.
+4. **Self-signed Root CA**: Root CA certificates are denied API access — only non-Root CA certs can make authenticated requests.
+5. **Socket permissions**: Secure the Unix socket paths using filesystem permissions appropriate to your deployment.
+
+## Development
+
+### Project Structure
+
+```
+pki-chain/
+├── src/
+│   ├── lib.rs                       # Library interface
+│   ├── main.rs                      # Entry point
+│   ├── comm_protocol.rs             # Unix socket server and request dispatch
+│   ├── storage.rs                   # Type-state blockchain storage
+│   ├── pki_generator.rs             # Certificate generation
+│   ├── encryption.rs                # Hybrid RSA + AES-GCM-256 encryption
+│   └── configs.rs                   # TOML configuration parsing
+├── .github/
+│   └── copilot-instructions.md      # AI coding assistant instructions
+├── API_README.md                    # API documentation
+├── config.toml                      # Configuration file
+├── generate_app_keypair.sh          # Application key generator
+├── logs/                            # Daily rotating service logs
+├── data/                            # Blockchain databases (RocksDB)
+│   ├── certificates/
+│   ├── private_keys/
+│   └── crl/
+└── exports/keystore/                # Encrypted private key storage
+```
+
+### Dependencies
+
+- [`libblockchain`](https://github.com/jessethepro/libblockchain) - Custom blockchain storage (RocksDB backend)
+- `openssl` - RSA-4096, X.509, SHA-256/SHA-512
+- `anyhow` - Error handling with context chains
+- `serde`/`serde_json` - JSON request/response serialization
+- `tracing` / `tracing-subscriber` / `tracing-appender` - Structured logging with daily rotation
+- `toml` - Configuration file parsing
+- `zeroize` - Secure memory clearing for cryptographic keys
+
+## Contributing
+
+1. Fork the repository
+2. Create a feature branch (`git checkout -b feature/amazing-feature`)
+3. Commit your changes (`git commit -m 'Add amazing feature'`)
+4. Push to the branch (`git push origin feature/amazing-feature`)
+5. Open a Pull Request
+
+## License
+
+This project is licensed under the MIT License - see the LICENSE file for details.
+
+## Acknowledgments
+
+- Built with [libblockchain](https://github.com/jessethepro/libblockchain) for tamper-proof storage
+- Uses OpenSSL for cryptographic operations
+- Tracing framework for structured logging
+
+## Contact
+
+- GitHub: [@jessethepro](https://github.com/jessethepro)
+- Repository: [pki-chain](https://github.com/jessethepro/pki-chain)
+
+---
+
+**Note**: This is a demonstration project. For production use, conduct a thorough security audit and implement additional access controls, monitoring, and hardening as required by your security policies.
+
 
 Built in Rust with enterprise-grade cryptography, PKI Chain provides a complete three-tier CA hierarchy (Root CA → Intermediate CA → User Certificates) with state-driven authentication, Maud HTML templates, and comprehensive logging. Features hybrid storage: certificates in blockchain (DER format), private keys encrypted with RSA+AES-GCM-256, and SHA-512 integrity hashes via [libblockchain](https://github.com/jessethepro/libblockchain).
 
