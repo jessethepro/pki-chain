@@ -11,7 +11,8 @@ const X509_VERSION_3: i32 = 2; // X509 version 3 is represented by 2
 const RSA_KEY_SIZE_DEFAULT: u32 = 4096;
 const ROOT_CA_PATH_LENGTH: u32 = 1;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum CertificateDataType {
     RootCA,
     IntermediateCA,
@@ -19,7 +20,7 @@ pub enum CertificateDataType {
     TlsCert,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Deserialize)]
 pub struct CertificateData {
     pub subject_common_name: String,
     pub issuer_common_name: String,

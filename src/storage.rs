@@ -1,6 +1,3 @@
-use keyutils::keytypes::encrypted;
-use openssl::encrypt;
-
 macro_rules! impl_app_key_funcs {
     ($state:ty) => {
         impl Storage<$state> {
@@ -96,33 +93,54 @@ pub struct Storage<State> {
 pub struct Empty {}
 
 impl Storage<Empty> {
-    pub fn create_storage(self) -> anyhow::Result<Storage<Created>> {
-        let certificate_chain = libblockchain::blockchain::open_read_write_chain(
-            match self.app_config.blockchains.certificate_path.to_str() {
-                Some(path) => path,
-                None => anyhow::bail!("Invalid certificate chain path"),
-            },
-        )?;
-        let private_key_chain = libblockchain::blockchain::open_read_write_chain(
-            match self.app_config.blockchains.private_key_path.to_str() {
-                Some(path) => path,
-                None => anyhow::bail!("Invalid private key chain path"),
-            },
-        )?;
-        let crl_chain = libblockchain::blockchain::open_read_write_chain(
-            match self.app_config.blockchains.crl_path.to_str() {
-                Some(path) => path,
-                None => anyhow::bail!("Invalid CRL chain path"),
-            },
-        )?;
-        Ok(Storage {
+    pub fn create_storage(self) -> Storage<Created> {
+        let certificate_chain = match libblockchain::blockchain::open_read_write_chain(
+            self.app_config
+                .blockchains
+                .certificate_path
+                .to_str()
+                .expect("Failed to parse certificate path from app_config"),
+        ) {
+            Ok(chain) => chain,
+            Err(e) => {
+                tracing::error!(error = %e, "Storage<Empty>: Failed to open certificate chain.");
+                std::process::exit(1);
+            }
+        };
+        let private_key_chain = match libblockchain::blockchain::open_read_write_chain(
+            self.app_config
+                .blockchains
+                .private_key_path
+                .to_str()
+                .expect("Failed to parse private key path from app_config"),
+        ) {
+            Ok(chain) => chain,
+            Err(e) => {
+                tracing::error!(error = %e, "Storage<Empty>: Failed to open private key chain.");
+                std::process::exit(1);
+            }
+        };
+        let crl_chain = match libblockchain::blockchain::open_read_write_chain(
+            self.app_config
+                .blockchains
+                .crl_path
+                .to_str()
+                .expect("Failed to parse CRL path from app_config"),
+        ) {
+            Ok(chain) => chain,
+            Err(e) => {
+                tracing::error!(error = %e, "Storage<Empty>: Failed to open CRL chain.");
+                std::process::exit(1);
+            }
+        };
+        Storage {
             state: Created {
                 certificate_chain,
                 private_key_chain,
                 crl_chain,
             },
             app_config: self.app_config,
-        })
+        }
     }
 }
 
@@ -133,11 +151,10 @@ pub struct Created {
 }
 
 impl Storage<Created> {
-    pub fn initialize_storage(self) -> anyhow::Result<Storage<Initialized>> {
-        let (private_key, cert) = || -> anyhow::Result<(openssl::pkey::PKey<openssl::pkey::Private>, openssl::x509::X509)> {
-            use crate::pki_generator::{generate_root_ca, CertificateData, CertificateDataType};
+    pub fn initialize_storage(self) -> Storage<Initialized> {
+        let (private_key, cert) = || -> (openssl::pkey::PKey<openssl::pkey::Private>, openssl::x509::X509) {
             let validity_days = 365 * 5;
-            let cert_data = CertificateData {
+            let cert_data = crate::pki_generator::CertificateData {
                 subject_common_name: self.app_config.root_ca_defaults.root_ca_common_name.clone(),
                 issuer_common_name: self.app_config.root_ca_defaults.root_ca_common_name.clone(),
                 organization: self
@@ -154,48 +171,100 @@ impl Storage<Created> {
                 state: self.app_config.root_ca_defaults.root_ca_state.clone(),
                 country: self.app_config.root_ca_defaults.root_ca_country.clone(),
                 validity_days,
-                cert_type: CertificateDataType::RootCA,
+                cert_type: crate::pki_generator::CertificateDataType::RootCA,
                 is_admin: false,
             };
-            Ok(generate_root_ca(cert_data)?)
-        }()?;
-        let app_public_key = self.get_app_public_key()?;
-        let encrypted_private_key = crate::encryption::encrypt_data(
-            &private_key.private_key_to_der()?,
+            match crate::pki_generator::generate_root_ca(cert_data) {
+                Ok((private_key, cert)) => (private_key, cert),
+                Err(e) => {
+                    tracing::error!(error = %e, "Storage<Created>: Failed to generate root CA.");
+                    std::process::exit(1);
+                }
+            }
+        }();
+        let app_public_key = match self.get_app_public_key() {
+            Ok(key) => key,
+            Err(e) => {
+                tracing::error!(error = %e, "Storage<Created>: Failed to get app public key.");
+                std::process::exit(1);
+            }
+        };
+        let encrypted_private_key = match crate::encryption::encrypt_data(
+            match &private_key.private_key_to_der() {
+                Ok(der) => der,
+                Err(e) => {
+                    tracing::error!(error = %e, "Storage<Created>: Failed to convert root private key to DER.");
+                    std::process::exit(1);
+                }
+            },
             app_public_key.clone(),
-        )?;
-        let encrypted_cert = crate::encryption::encrypt_data(&cert.to_der()?, app_public_key)?;
+        ) {
+            Ok(encrypted_key) => encrypted_key,
+            Err(e) => {
+                tracing::error!(error = %e, "Storage<Created>: Failed to encrypt root private key.");
+                std::process::exit(1);
+            }
+        };
+        let encrypted_cert = match crate::encryption::encrypt_data(
+            &match cert.to_der() {
+                Ok(der) => der,
+                Err(e) => {
+                    tracing::error!(error = %e, "Storage<Created>: Failed to convert root certificate to DER.");
+                    std::process::exit(1);
+                }
+            },
+            app_public_key,
+        ) {
+            Ok(encrypted_cert) => encrypted_cert,
+            Err(e) => {
+                tracing::error!(error = %e, "Storage<Created>: Failed to encrypt root certificate.");
+                std::process::exit(1);
+            }
+        };
 
-        let cert_height = self
-            .state
-            .certificate_chain
-            .put_block(encrypted_cert)
-            .or_else(|err| {
-                self.state.private_key_chain.delete_last_block()?;
-                Err(anyhow::anyhow!(err))
-            })?;
+        let cert_height = match self.state.certificate_chain.put_block(encrypted_cert) {
+            Ok(height) => height,
+            Err(e) => {
+                tracing::error!(error = %e, "Storage<Created>: Failed to put root certificate block.");
+                std::process::exit(1);
+            }
+        };
 
-        let key_height = self
+        let key_height = match self
             .state
             .private_key_chain
             .put_block(encrypted_private_key)
-            .or_else(|err| {
-                self.state.certificate_chain.delete_last_block()?;
-                Err(anyhow::anyhow!(err))
-            })?;
+        {
+            Ok(height) => height,
+            Err(e) => {
+                tracing::error!(error = %e, "Storage<Created>: Failed to put root private key block.");
+                std::process::exit(1);
+            }
+        };
+
         if key_height != cert_height {
-            self.state.certificate_chain.delete_last_block()?;
-            self.state.private_key_chain.delete_last_block()?;
-            anyhow::bail!("Failed to initialize storage: height mismatch");
-        } else {
-            Ok(Storage {
-                state: Initialized {
-                    certificate_chain: self.state.certificate_chain,
-                    private_key_chain: self.state.private_key_chain,
-                    crl_chain: self.state.crl_chain,
-                },
-                app_config: self.app_config,
-            })
+            match self.state.certificate_chain.delete_last_block() {
+                Ok(_) => (),
+                Err(e) => {
+                    tracing::error!(error = %e, "Storage<Created>: Failed to delete last certificate block.");
+                    std::process::exit(1);
+                }
+            }
+            match self.state.private_key_chain.delete_last_block() {
+                Ok(_) => (),
+                Err(e) => {
+                    tracing::error!(error = %e, "Storage<Created>: Failed to delete last private key block.");
+                    std::process::exit(1);
+                }
+            }
+        }
+        Storage {
+            state: Initialized {
+                certificate_chain: self.state.certificate_chain,
+                private_key_chain: self.state.private_key_chain,
+                crl_chain: self.state.crl_chain,
+            },
+            app_config: self.app_config,
         }
     }
 }
@@ -210,10 +279,19 @@ pub struct Initialized {
 
 impl Storage<Initialized> {
     pub fn add_admin_user(
-        self,
+        &self,
         admin_user_certificate_data: crate::pki_generator::CertificateData,
-    ) -> anyhow::Result<Storage<Ready>> {
-        let root_private_key = self.get_root_private_key()?;
+    ) -> (
+        openssl::x509::X509,
+        openssl::pkey::PKey<openssl::pkey::Private>,
+    ) {
+        let root_private_key = match self.get_root_private_key() {
+            Ok(key) => key,
+            Err(e) => {
+                tracing::error!(error = %e, "Storage<Initialized>: Failed to get root private key.");
+                std::process::exit(1);
+            }
+        };
         let admin_intermediate_certificate_data = crate::pki_generator::CertificateData {
             subject_common_name: "Admin Intermediate CA".to_string(),
             issuer_common_name: self.app_config.root_ca_defaults.root_ca_common_name.clone(),
@@ -235,164 +313,181 @@ impl Storage<Initialized> {
             is_admin: false,
         };
         let (admin_intermediate_key, admin_intermediate_cert) =
-            crate::pki_generator::generate_key_pair(
+            match crate::pki_generator::generate_key_pair(
                 admin_intermediate_certificate_data,
                 &root_private_key,
-            )?;
-        let app_pub_key = self.get_app_public_key()?;
-        let encrypted_admin_intermdiate_cert = crate::encryption::encrypt_data(
-            &admin_intermediate_cert.to_der()?,
+            ) {
+                Ok((key, cert)) => (key, cert),
+                Err(e) => {
+                    tracing::error!(error = %e, "Storage<Initialized>: Failed to generate admin intermediate key pair.");
+                    std::process::exit(1);
+                }
+            };
+        let app_pub_key = match self.get_app_public_key() {
+            Ok(key) => key,
+            Err(e) => {
+                tracing::error!(error = %e, "Storage<Initialized>: Failed to get app public key.");
+                std::process::exit(1);
+            }
+        };
+        let encrypted_admin_intermdiate_cert = match crate::encryption::encrypt_data(
+            &match admin_intermediate_cert.to_der() {
+                Ok(data) => data,
+                Err(e) => {
+                    tracing::error!(error = %e, "Storage<Initialized>: Failed to convert admin intermediate certificate to DER.");
+                    std::process::exit(1);
+                }
+            },
             app_pub_key.clone(),
-        )?;
-        let cert_height = self
+        ) {
+            Ok(data) => data,
+            Err(e) => {
+                tracing::error!(error = %e, "Storage<Initialized>: Failed to encrypt admin intermediate certificate.");
+                std::process::exit(1);
+            }
+        };
+        let cert_height = match self
             .state
             .certificate_chain
-            .put_block(encrypted_admin_intermdiate_cert)?;
-        let encrypted_admin_intermediate_key = crate::encryption::encrypt_data(
-            &admin_intermediate_key.private_key_to_der()?,
+            .put_block(encrypted_admin_intermdiate_cert)
+        {
+            Ok(height) => height,
+            Err(e) => {
+                tracing::error!(error = %e, "Storage<Initialized>: Failed to add admin intermediate certificate to chain.");
+                std::process::exit(1);
+            }
+        };
+        let encrypted_admin_intermediate_key = match crate::encryption::encrypt_data(
+            &match admin_intermediate_key.private_key_to_der() {
+                Ok(data) => data,
+                Err(e) => {
+                    tracing::error!(error = %e, "Storage<Initialized>: Failed to convert admin intermediate private key to DER.");
+                    std::process::exit(1);
+                }
+            },
             app_pub_key.clone(),
-        )?;
-        let key_height = self
+        ) {
+            Ok(data) => data,
+            Err(e) => {
+                tracing::error!(error = %e, "Storage<Initialized>: Failed to encrypt admin intermediate private key.");
+                std::process::exit(1);
+            }
+        };
+        let key_height = match self
             .state
             .private_key_chain
             .put_block(encrypted_admin_intermediate_key)
-            .or_else(|err| {
-                self.state.certificate_chain.delete_last_block()?;
-                Err(anyhow::anyhow!(err))
-            })?;
+        {
+            Ok(height) => height,
+            Err(e) => {
+                tracing::error!(error = %e, "Storage<Initialized>: Failed to add admin intermediate private key to chain.");
+                std::process::exit(1);
+            }
+        };
         if key_height != cert_height {
-            self.state.certificate_chain.delete_last_block()?;
-            self.state.private_key_chain.delete_last_block()?;
-            return Err(anyhow::anyhow!(
-                "Failed to add admin certificate and key: height mismatch"
-            ));
+            match self.state.certificate_chain.delete_last_block() {
+                Ok(_) => (),
+                Err(e) => {
+                    tracing::error!(error = %e, "Storage<Initialized>: Failed to delete last block from certificate chain.");
+                    std::process::exit(1);
+                }
+            }
+            match self.state.private_key_chain.delete_last_block() {
+                Ok(_) => (),
+                Err(e) => {
+                    tracing::error!(error = %e, "Storage<Initialized>: Failed to delete last block from private key chain.");
+                    std::process::exit(1);
+                }
+            }
         }
-        let (admin_user_key, admin_user_cert) = crate::pki_generator::generate_key_pair(
+        let (admin_user_key, admin_user_cert) = match crate::pki_generator::generate_key_pair(
             admin_user_certificate_data,
             &admin_intermediate_key,
-        )?;
-        let encrypted_admin_user_cert =
-            crate::encryption::encrypt_data(&admin_user_cert.to_der()?, app_pub_key.clone())?;
-        let encrypted_admin_user_key = crate::encryption::encrypt_data(
-            &admin_user_key.private_key_to_der()?,
+        ) {
+            Ok((key, cert)) => (key, cert),
+            Err(e) => {
+                tracing::error!(error = %e, "Storage<Initialized>: Failed to generate admin user key pair.");
+                std::process::exit(1);
+            }
+        };
+        let encrypted_admin_user_cert = match crate::encryption::encrypt_data(
+            &match admin_user_cert.to_der() {
+                Ok(data) => data,
+                Err(e) => {
+                    tracing::error!(error = %e, "Storage<Initialized>: Failed to convert admin user certificate to DER.");
+                    std::process::exit(1);
+                }
+            },
             app_pub_key.clone(),
-        )?;
-        let cert_height = self
+        ) {
+            Ok(data) => data,
+            Err(e) => {
+                tracing::error!(error = %e, "Storage<Initialized>: Failed to encrypt admin user certificate.");
+                std::process::exit(1);
+            }
+        };
+        let encrypted_admin_user_key = match crate::encryption::encrypt_data(
+            &match admin_user_key.private_key_to_der() {
+                Ok(data) => data,
+                Err(e) => {
+                    tracing::error!(error = %e, "Storage<Initialized>: Failed to convert admin user private key to DER.");
+                    std::process::exit(1);
+                }
+            },
+            app_pub_key.clone(),
+        ) {
+            Ok(data) => data,
+            Err(e) => {
+                tracing::error!(error = %e, "Storage<Initialized>: Failed to encrypt admin user private key.");
+                std::process::exit(1);
+            }
+        };
+        let cert_height = match self
             .state
             .certificate_chain
-            .put_block(encrypted_admin_user_cert)?;
-        let key_height = self
+            .put_block(encrypted_admin_user_cert)
+        {
+            Ok(height) => height,
+            Err(e) => {
+                tracing::error!(error = %e, "Storage<Initialized>: Failed to add admin user certificate to chain.");
+                std::process::exit(1);
+            }
+        };
+        let key_height = match self
             .state
             .private_key_chain
             .put_block(encrypted_admin_user_key)
-            .or_else(|err| {
-                self.state.certificate_chain.delete_last_block()?;
-                Err(anyhow::anyhow!(err))
-            })?;
-        if key_height != cert_height {
-            self.state.certificate_chain.delete_last_block()?;
-            self.state.private_key_chain.delete_last_block()?;
-            return Err(anyhow::anyhow!(
-                "Failed to add admin user certificate and key: height mismatch"
-            ));
-        } else {
-            Ok(Storage {
-                state: Ready {
-                    certificate_chain: self.state.certificate_chain,
-                    private_key_chain: self.state.private_key_chain,
-                    crl_chain: self.state.crl_chain,
-                },
-                app_config: self.app_config,
-            })
-        }
-    }
-    pub fn add_admin(
-        &self,
-        admin_cert: &openssl::x509::X509,
-        admin_key: &openssl::pkey::PKey<openssl::pkey::Private>,
-    ) -> anyhow::Result<()> {
-        let root_private_key = self.get_root_private_key()?;
-        let admin_intermediate_certificate_data = crate::pki_generator::CertificateData {
-            subject_common_name: "Admin Intermediate CA".to_string(),
-            issuer_common_name: self.app_config.root_ca_defaults.root_ca_common_name.clone(),
-            organization: self
-                .app_config
-                .root_ca_defaults
-                .root_ca_organization
-                .clone(),
-            organizational_unit: self
-                .app_config
-                .root_ca_defaults
-                .root_ca_organizational_unit
-                .clone(),
-            locality: self.app_config.root_ca_defaults.root_ca_locality.clone(),
-            state: self.app_config.root_ca_defaults.root_ca_state.clone(),
-            country: self.app_config.root_ca_defaults.root_ca_country.clone(),
-            validity_days: 365 * 3,
-            cert_type: crate::pki_generator::CertificateDataType::IntermediateCA,
-            is_admin: false,
+        {
+            Ok(height) => height,
+            Err(e) => {
+                match self.state.certificate_chain.delete_last_block() {
+                    Ok(_) => (),
+                    Err(e) => {
+                        tracing::error!(error = %e, "Storage<Initialized>: Failed to delete last block from certificate chain.");
+                        std::process::exit(1);
+                    }
+                }
+                tracing::error!(error = %e, "Storage<Initialized>: Failed to add admin user private key to chain.");
+                std::process::exit(1);
+            }
         };
-        let (admin_intermediate_key, admin_intermediate_cert) =
-            crate::pki_generator::generate_key_pair(
-                admin_intermediate_certificate_data,
-                &root_private_key,
-            )?;
-        let app_pub_key = self.get_app_public_key()?;
-        let encrypted_admin_intermdiate_cert = crate::encryption::encrypt_data(
-            &admin_intermediate_cert.to_der()?,
-            app_pub_key.clone(),
-        )?;
-        let cert_height = self
-            .state
-            .certificate_chain
-            .put_block(encrypted_admin_intermdiate_cert)?;
-        let encrypted_admin_intermediate_key = crate::encryption::encrypt_data(
-            &admin_intermediate_key.private_key_to_der()?,
-            app_pub_key.clone(),
-        )?;
-        let encrypted_admin_intermediate_key = crate::encryption::encrypt_data(
-            &admin_intermediate_key.private_key_to_der()?,
-            app_pub_key.clone(),
-        )?;
-        let key_height = self
-            .state
-            .private_key_chain
-            .put_block(encrypted_admin_intermediate_key)
-            .or_else(|err| {
-                self.state.certificate_chain.delete_last_block()?;
-                Err(anyhow::anyhow!(err))
-            })?;
         if key_height != cert_height {
-            self.state.certificate_chain.delete_last_block()?;
-            self.state.private_key_chain.delete_last_block()?;
-            return Err(anyhow::anyhow!(
-                "Failed to add admin certificate and key: height mismatch"
-            ));
+            match self.state.certificate_chain.delete_last_block() {
+                Ok(_) => (),
+                Err(e) => {
+                    tracing::error!(error = %e, "Storage<Initialized>: Failed to delete last block from certificate chain.");
+                    std::process::exit(1);
+                }
+            }
+            match self.state.private_key_chain.delete_last_block() {
+                Ok(_) => (),
+                Err(e) => {
+                    tracing::error!(error = %e, "Storage<Initialized>: Failed to delete last block from private key chain.");
+                    std::process::exit(1);
+                }
+            }
         }
-        let encrypted_admin_cert =
-            crate::encryption::encrypt_data(&admin_cert.to_der()?, app_pub_key.clone())?;
-        let cert_height = self
-            .state
-            .certificate_chain
-            .put_block(encrypted_admin_cert)?;
-        let encrypted_admin_key =
-            crate::encryption::encrypt_data(&admin_key.private_key_to_der()?, app_pub_key)?;
-        let key_height = self
-            .state
-            .private_key_chain
-            .put_block(encrypted_admin_key)
-            .or_else(|err| {
-                self.state.certificate_chain.delete_last_block()?;
-                Err(anyhow::anyhow!(err))
-            })?;
-        if key_height != cert_height {
-            self.state.certificate_chain.delete_last_block()?;
-            self.state.private_key_chain.delete_last_block()?;
-            return Err(anyhow::anyhow!(
-                "Failed to add admin certificate and key: height mismatch"
-            ));
-        }
-        Ok(())
+        (admin_user_cert, admin_user_key)
     }
 }
 
