@@ -1,6 +1,8 @@
 use anyhow::{anyhow, Result};
+use openssl::hash::MessageDigest;
 use openssl::pkey::PKey;
 use openssl::rsa::Padding;
+use openssl::sign::{Signer, Verifier};
 use openssl::symm::Cipher;
 
 /// Size of AES key length field in serialized format (u32 = 4 bytes)
@@ -13,6 +15,32 @@ pub const AES_GCM_NONCE_SIZE: usize = 12; // 96 bits
 pub const AES_GCM_TAG_SIZE: usize = 16; // 128 bits
 /// Size of data length field in serialized format (u32 = 4 bytes)
 pub const DATA_LEN_SIZE: usize = 4; // u32 for block length
+
+pub fn sign_data(data: &[u8], private_key: PKey<openssl::pkey::Private>) -> Result<Vec<u8>> {
+    let mut signer = Signer::new(MessageDigest::sha256(), &private_key)
+        .map_err(|e| anyhow!("Failed to create signer: {}", e))?;
+    signer
+        .update(data)
+        .map_err(|e| anyhow!("Failed to update signer with data: {}", e))?;
+    signer
+        .sign_to_vec()
+        .map_err(|e| anyhow!("Failed to generate signature: {}", e))
+}
+
+pub fn verify_signature(
+    data: &[u8],
+    signature: &[u8],
+    public_key: PKey<openssl::pkey::Public>,
+) -> Result<bool> {
+    let mut verifier = Verifier::new(MessageDigest::sha256(), &public_key)
+        .map_err(|e| anyhow!("Failed to create verifier: {}", e))?;
+    verifier
+        .update(data)
+        .map_err(|e| anyhow!("Failed to update verifier with data: {}", e))?;
+    verifier
+        .verify(signature)
+        .map_err(|e| anyhow!("Failed to verify signature: {}", e))
+}
 
 pub fn encrypt_data(data: &[u8], public_key: PKey<openssl::pkey::Public>) -> Result<Vec<u8>> {
     // Generate random AES-256 key (32 bytes)
@@ -174,4 +202,181 @@ pub fn decrypt_data(
     .map_err(|e| anyhow!("AES-GCM decryption failed: {}", e))?;
 
     Ok(decrypted_data)
+}
+
+pub fn encrypt_and_sign_data(
+    data: &[u8],
+    app_public_key: PKey<openssl::pkey::Public>,
+    cert_private_key: PKey<openssl::pkey::Private>,
+) -> Result<(Vec<u8>, Vec<u8>)> {
+    let encrypted_data = encrypt_data(data, app_public_key)?;
+    let signature = sign_data(&encrypted_data, cert_private_key)?;
+    Ok((encrypted_data, signature))
+}
+
+pub fn verify_and_decrypt_cert(
+    encrypted_data: &[u8],
+    signature: &[u8],
+    app_private_key: PKey<openssl::pkey::Private>,
+) -> (Result<openssl::x509::X509>, Result<bool>) {
+    let decrypted_data = match decrypt_data(encrypted_data, app_private_key) {
+        Ok(data) => data,
+        Err(e) => {
+            // If decryption fails, we can't verify the signature, but we can still report the error
+            return (Err(anyhow!("Decryption failed: {}", e)), Ok(false));
+        }
+    };
+    let cert = match openssl::x509::X509::from_der(&decrypted_data) {
+        Ok(cert) => cert,
+        Err(e) => {
+            return (
+                Err(anyhow!(
+                    "Failed to parse decrypted data as X509 certificate: {}",
+                    e
+                )),
+                Ok(false),
+            );
+        }
+    };
+    let public_key = match cert.public_key() {
+        Ok(key) => key,
+        Err(e) => {
+            return (
+                Err(anyhow!(
+                    "Failed to extract public key from certificate: {}",
+                    e
+                )),
+                Ok(false),
+            );
+        }
+    };
+    let verified = match verify_signature(encrypted_data, signature, public_key) {
+        Ok(valid) => valid,
+        Err(e) => {
+            return (
+                Ok(cert), // We can still return the cert even if signature verification fails
+                Err(anyhow!("Signature verification failed: {}", e)),
+            );
+        }
+    };
+    (Ok(cert), Ok(verified))
+}
+
+pub fn verify_priv_key_signature_with_cert(
+    data: &[u8],
+    signature: &[u8],
+    cert: &openssl::x509::X509,
+) -> Result<bool> {
+    let public_key = cert
+        .public_key()
+        .map_err(|e| anyhow!("Failed to extract public key from certificate: {}", e))?;
+    verify_signature(data, signature, public_key)
+}
+
+pub fn verify_and_decrypt_priv_key(
+    encrypted_data: &[u8],
+    signature: &[u8],
+    cert: &openssl::x509::X509,
+    app_private_key: PKey<openssl::pkey::Private>,
+) -> (
+    Result<openssl::pkey::PKey<openssl::pkey::Private>>,
+    Result<bool>,
+) {
+    let decrypted_data = match decrypt_data(encrypted_data, app_private_key) {
+        Ok(data) => data,
+        Err(e) => {
+            // If decryption fails, we can't verify the signature, but we can still report the error
+            return (Err(anyhow!("Decryption failed: {}", e)), Ok(false));
+        }
+    };
+
+    let verified = match verify_priv_key_signature_with_cert(encrypted_data, signature, cert) {
+        Ok(valid) => valid,
+        Err(e) => {
+            return (
+                Err(anyhow!("Signature verification failed: {}", e)),
+                Ok(false),
+            );
+        }
+    };
+    if !verified {
+        return (Err(anyhow!("Signature verification failed")), Ok(false));
+    }
+
+    let private_key = match openssl::pkey::PKey::private_key_from_der(&decrypted_data) {
+        Ok(key) => key,
+        Err(e) => {
+            return (
+                Err(anyhow!(
+                    "Failed to parse decrypted data as private key: {}",
+                    e
+                )),
+                Ok(verified),
+            );
+        }
+    };
+    (Ok(private_key), Ok(verified))
+}
+
+pub fn create_app_cert_and_key_pair() -> Result<(openssl::x509::X509, PKey<openssl::pkey::Private>)>
+{
+    let rsa = openssl::rsa::Rsa::generate(4096)
+        .map_err(|e| anyhow!("Failed to generate RSA key pair: {}", e))?;
+    let private_key = PKey::from_rsa(rsa)
+        .map_err(|e| anyhow!("Failed to create PKey from RSA key pair: {}", e))?;
+
+    let mut builder = openssl::x509::X509Builder::new()
+        .map_err(|e| anyhow!("Failed to create X509 builder: {}", e))?;
+    builder
+        .set_version(2)
+        .map_err(|e| anyhow!("Failed to set certificate version: {}", e))?;
+
+    let subject_name = openssl::x509::X509NameBuilder::new()
+        .and_then(|mut b| {
+            b.append_entry_by_text("CN", "App Certificate")
+                .map(|_| b.build())
+        })
+        .map_err(|e| anyhow!("Failed to build subject name: {}", e))?;
+
+    let issuer_name = openssl::x509::X509NameBuilder::new()
+        .and_then(|mut b| {
+            b.append_entry_by_text("CN", "App Certificate")
+                .map(|_| b.build())
+        })
+        .map_err(|e| anyhow!("Failed to build issuer name: {}", e))?;
+
+    builder
+        .set_subject_name(&subject_name)
+        .map_err(|e| anyhow!("Failed to set subject name: {}", e))?;
+    builder
+        .set_issuer_name(&issuer_name)
+        .map_err(|e| anyhow!("Failed to set issuer name: {}", e))?;
+    builder
+        .set_pubkey(&private_key)
+        .map_err(|e| anyhow!("Failed to set public key in certificate: {}", e))?;
+    builder
+        .sign(&private_key, MessageDigest::sha256())
+        .map_err(|e| anyhow!("Failed to sign certificate: {}", e))?;
+
+    Ok((builder.build(), private_key))
+}
+
+pub fn get_app_public_key(
+    app_config: &crate::configs::AppConfig,
+) -> anyhow::Result<openssl::pkey::PKey<openssl::pkey::Public>> {
+    let public_key_pem = std::fs::read(&app_config.key_exports.app_cert_path)
+        .map_err(|e| anyhow::anyhow!("Failed to read public key PEM file: {}", e))?;
+    let public_key = openssl::pkey::PKey::public_key_from_pem(public_key_pem.as_slice())
+        .map_err(|e| anyhow::anyhow!("Failed to load public key from PEM: {}", e))?;
+    Ok(public_key)
+}
+
+pub fn get_app_private_key(
+    app_config: &crate::configs::AppConfig,
+) -> anyhow::Result<openssl::pkey::PKey<openssl::pkey::Private>> {
+    let private_key_pem = std::fs::read(&app_config.key_exports.app_key_path)
+        .map_err(|e| anyhow::anyhow!("Failed to read private key PEM file: {}", e))?;
+    let private_key = openssl::pkey::PKey::private_key_from_pem(private_key_pem.as_slice())
+        .map_err(|e| anyhow::anyhow!("Failed to load private key from PEM: {}", e))?;
+    Ok(private_key)
 }

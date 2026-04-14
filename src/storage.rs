@@ -1,815 +1,871 @@
-macro_rules! impl_app_key_funcs {
-    ($state:ty) => {
-        impl Storage<$state> {
-            fn get_app_public_key(
-                &self,
-            ) -> anyhow::Result<openssl::pkey::PKey<openssl::pkey::Public>> {
-                let public_key_pem = std::fs::read(&self.app_config.key_exports.app_cert_path)
-                    .map_err(|e| anyhow::anyhow!("Failed to read public key PEM file: {}", e))?;
-                let public_key = openssl::pkey::PKey::public_key_from_pem(
-                    public_key_pem.as_slice(),
-                )
-                .map_err(|e| anyhow::anyhow!("Failed to load public key from PEM: {}", e))?;
-                Ok(public_key)
-            }
-
-            fn get_app_private_key(
-                &self,
-            ) -> anyhow::Result<openssl::pkey::PKey<openssl::pkey::Private>> {
-                let private_key_pem = std::fs::read(&self.app_config.key_exports.app_key_path)
-                    .map_err(|e| anyhow::anyhow!("Failed to read private key PEM file: {}", e))?;
-                let private_key = openssl::pkey::PKey::private_key_from_pem(
-                    private_key_pem.as_slice(),
-                )
-                .map_err(|e| anyhow::anyhow!("Failed to load private key from PEM: {}", e))?;
-                Ok(private_key)
-            }
-        }
+pub fn get_root_private_key(
+    private_key_chain: &libblockchain::blockchain::BlockChain,
+    app_private_key: openssl::pkey::PKey<openssl::pkey::Private>,
+) -> anyhow::Result<openssl::pkey::PKey<openssl::pkey::Private>> {
+    let block_count = private_key_chain.block_count()?;
+    if block_count == 0 {
+        anyhow::bail!("No private keys found in the chain");
+    }
+    let encrypted_root_key_block = match private_key_chain.get_block_by_height(0) {
+        (Ok(block), Ok(_)) => block,
+        _ => anyhow::bail!("No private keys found in the chain"),
     };
+    let decrypted_root_key_der = crate::encryption::decrypt_data(
+        encrypted_root_key_block.block_data().as_slice(),
+        app_private_key,
+    )?;
+    Ok(openssl::pkey::PKey::private_key_from_der(
+        &decrypted_root_key_der,
+    )?)
 }
 
-macro_rules! impl_root_key_funcs {
+pub fn get_root_certificate(
+    certificate_chain: &libblockchain::blockchain::BlockChain,
+    app_private_key: openssl::pkey::PKey<openssl::pkey::Private>,
+) -> anyhow::Result<openssl::x509::X509> {
+    let block_count = certificate_chain.block_count()?;
+    if block_count == 0 {
+        anyhow::bail!("No certificates found in the chain");
+    }
+    let encrypted_root_cert_block = match certificate_chain.get_block_by_height(0) {
+        (Ok(block), Ok(_)) => block,
+        _ => anyhow::bail!("No certificates found in the chain"),
+    };
+    let decrypted_root_cert_der = crate::encryption::decrypt_data(
+        encrypted_root_cert_block.block_data().as_slice(),
+        app_private_key,
+    )?;
+    let root_cert = openssl::x509::X509::from_der(&decrypted_root_cert_der)?;
+    Ok(root_cert)
+}
+
+#[derive(serde::Serialize, Debug, Clone)]
+pub struct ValidationResult {
+    pub cert_height: u64,
+    pub key_height: u64,
+    pub cert_blockchain_valid: Option<bool>,
+    pub key_blockchain_valid: Option<bool>,
+    pub cert_signatures_validation_results: Option<std::collections::HashMap<u64, bool>>,
+    pub key_signatures_validation_results: Option<std::collections::HashMap<u64, bool>>,
+    pub error_message: Option<String>,
+}
+macro_rules! validate_storage {
     ($state: ty) => {
         impl Storage<$state> {
-            fn get_root_private_key(
-                &self,
-            ) -> anyhow::Result<openssl::pkey::PKey<openssl::pkey::Private>> {
-                let block_count = self.state.private_key_chain.block_count()?;
-                if block_count == 0 {
-                    anyhow::bail!("No private keys found in the chain");
+            pub fn validate_storage(&self) -> ValidationResult {
+                let cert_block_count = match self.state.certificate_chain.block_count() {
+                    Ok(count) => count,
+                    Err(e) => {
+                        tracing::error!(error = %e, "Storage<Admin>: Failed to get certificate block count.");
+                        return ValidationResult {
+                            cert_height: 0,
+                            key_height: 0,
+                            cert_blockchain_valid: None,
+                            key_blockchain_valid: None,
+                            cert_signatures_validation_results: None,
+                            key_signatures_validation_results: None,
+                            error_message: Some(format!("Failed to get certificate block count: {}", e)),
+                        };
+                    }
+                };
+                let key_block_count = match self.state.private_key_chain.block_count() {
+                    Ok(count) => count,
+                    Err(e) => {
+                        tracing::error!(error = %e, "Storage<Admin>: Failed to get private key block count.");
+                        return ValidationResult {
+                            cert_height: 0,
+                            key_height: 0,
+                            cert_blockchain_valid: None,
+                            key_blockchain_valid: None,
+                            cert_signatures_validation_results: None,
+                            key_signatures_validation_results: None,
+                            error_message: Some(format!("Failed to get private key block count: {}", e)),
+                        };
+                    }
+                };
+                let mut validation_result = ValidationResult {
+                    cert_height: 0,
+                    key_height: 0,
+                    cert_blockchain_valid: None,
+                    key_blockchain_valid: None,
+                    cert_signatures_validation_results: Some(std::collections::HashMap::new()),
+                    key_signatures_validation_results: Some(std::collections::HashMap::new()),
+                    error_message: None,
+                };
+                if cert_block_count == 0 && key_block_count == 0 {
+                    return ValidationResult {
+                        cert_height: 0,
+                        key_height: 0,
+                        cert_blockchain_valid: Some(true),
+                        key_blockchain_valid: Some(true),
+                        cert_signatures_validation_results: None,
+                        key_signatures_validation_results: None,
+                        error_message: None,
+                    };
                 }
-                let encrypted_root_key_block =
-                    self.state.private_key_chain.get_block_by_height(0)?;
-                let app_private_key =
-                    || -> anyhow::Result<openssl::pkey::PKey<openssl::pkey::Private>> {
-                        let key_pem =
-                            std::fs::read(self.app_config.key_exports.app_key_path.clone())?;
-                        Ok(openssl::pkey::PKey::private_key_from_pem(&key_pem)?)
-                    }()?;
-                let decrypted_root_key_der = crate::encryption::decrypt_data(
-                    encrypted_root_key_block.block_data().as_slice(),
-                    app_private_key,
-                )?;
-                Ok(openssl::pkey::PKey::private_key_from_der(
-                    &decrypted_root_key_der,
-                )?)
-            }
-
-            fn get_root_public_key(
-                &self,
-            ) -> anyhow::Result<openssl::pkey::PKey<openssl::pkey::Public>> {
-                let block_count = self.state.certificate_chain.block_count()?;
-                if block_count == 0 {
-                    anyhow::bail!("No certificates found in the chain");
+                validation_result.cert_blockchain_valid = match self.state.certificate_chain.validate() {
+                    Ok(()) => Some(true),
+                    Err(e) => {
+                        tracing::error!(error = %e, "Storage<Admin>: Failed to validate certificate blockchain.");
+                        validation_result.error_message =
+                            Some(format!("Failed to validate certificate blockchain: {}", e));
+                        Some(false)
+                    }
+                };
+                validation_result.key_blockchain_valid = match self.state.private_key_chain.validate() {
+                    Ok(()) => Some(true),
+                    Err(e) => {
+                        tracing::error!(error = %e, "Storage<Admin>: Failed to validate private key blockchain.");
+                        validation_result.error_message =
+                            Some(format!("Failed to validate private key blockchain: {}", e));
+                        Some(false)
+                    }
+                };
+                if validation_result.cert_blockchain_valid == Some(false)
+                    || validation_result.key_blockchain_valid == Some(false)
+                {
+                    validation_result.error_message = Some(format!(
+                        "Blockchain validation failed: cert_blockchain_valid={}, key_blockchain_valid={}",
+                        validation_result.cert_blockchain_valid.unwrap_or(false),
+                        validation_result.key_blockchain_valid.unwrap_or(false)
+                    ));
+                    return validation_result;
                 }
-                let encrypted_root_cert_block =
-                    self.state.certificate_chain.get_block_by_height(0)?;
-                let app_private_key =
-                    || -> anyhow::Result<openssl::pkey::PKey<openssl::pkey::Private>> {
-                        let key_pem =
-                            std::fs::read(self.app_config.key_exports.app_key_path.clone())?;
-                        Ok(openssl::pkey::PKey::private_key_from_pem(&key_pem)?)
-                    }()?;
-                let decrypted_root_cert_der = crate::encryption::decrypt_data(
-                    encrypted_root_cert_block.block_data().as_slice(),
-                    app_private_key,
-                )?;
-                let root_cert = openssl::x509::X509::from_der(&decrypted_root_cert_der)?;
-                Ok(root_cert.public_key()?)
+                if cert_block_count != key_block_count {
+                    tracing::error!(
+                        cert_block_count,
+                        key_block_count,
+                        "Storage<Admin>: Certificate and private key block counts do not match."
+                    );
+                    validation_result.error_message = Some(format!(
+                        "Certificate and private key block counts do not match: cert_block_count={}, key_block_count={}",
+                        cert_block_count, key_block_count
+                    ));
+                    return validation_result;
+                }
+                for i in 1..cert_block_count - 1 {
+                    validation_result.cert_height = i;
+                    validation_result.key_height = i;
+                    let (cert_block, cert_signature) = match self
+                        .state
+                        .certificate_chain
+                        .get_block_by_height(i)
+                    {
+                        (Ok(block), Ok(signature)) => (block, signature),
+                        (Err(e), _) | (_, Err(e)) => {
+                            tracing::error!(error = %e, "Storage<Admin>: Failed to get certificate block at height {}.", i);
+                            validation_result.error_message = Some(format!(
+                                "Failed to get certificate block at height {}: {}",
+                                i, e
+                            ));
+                            return validation_result;
+                        }
+                    };
+                    let (cert, verified) = match crate::encryption::verify_and_decrypt_cert(
+                        cert_block.block_data().as_slice(),
+                        cert_signature.as_slice(),
+                        match crate::encryption::get_app_private_key(&self.app_config.clone()) {
+                            Ok(key) => key,
+                            Err(e) => {
+                                tracing::error!(error = %e, "Storage<Admin>: Failed to get app private key for signature verification of certificate block at height {}.", i);
+                                validation_result.error_message = Some(format!(
+                                    "Failed to get app private key for signature verification of certificate block at height {}: {}",
+                                    i, e
+                                ));
+                                return validation_result;
+                            }
+                        },
+                    ) {
+                        (Ok(cert), Ok(verified)) => (cert, verified),
+                        (Err(e), _) | (_, Err(e)) => {
+                            tracing::error!(error = %e, "Storage<Admin>: Failed to verify and decrypt certificate block at height {}.", i);
+                            validation_result.error_message = Some(format!(
+                                "Failed to verify and decrypt certificate block at height {}: {}",
+                                i, e
+                            ));
+                            return validation_result;
+                        }
+                    };
+                    validation_result
+                        .cert_signatures_validation_results
+                        .as_mut()
+                        .unwrap()
+                        .insert(i, verified);
+                    let (key_block, key_signature) = match self
+                        .state
+                        .private_key_chain
+                        .get_block_by_height(i)
+                    {
+                        (Ok(block), Ok(signature)) => (block, signature),
+                        (Err(e), _) | (_, Err(e)) => {
+                            tracing::error!(error = %e, "Storage<Admin>: Failed to get private key block at height {}.", i);
+                            validation_result.error_message = Some(format!(
+                                "Failed to get private key block at height {}: {}",
+                                i, e
+                            ));
+                            return validation_result;
+                        }
+                    };
+                    let key_sig_verified = match crate::encryption::verify_priv_key_signature_with_cert(
+                        key_block.block_data().as_slice(),
+                        key_signature.as_slice(),
+                        &cert,
+                    ) {
+                        Ok(verified) => verified,
+                        Err(e) => {
+                            tracing::error!(error = %e, "Storage<Admin>: Failed to verify signature of private key block at height {}.", i);
+                            validation_result.error_message = Some(format!(
+                                "Failed to verify signature of private key block at height {}: {}",
+                                i, e
+                            ));
+                            return validation_result;
+                        }
+                    };
+                    validation_result
+                        .key_signatures_validation_results
+                        .as_mut()
+                        .unwrap()
+                        .insert(i, key_sig_verified);
+                }
+                return validation_result;
             }
         }
     };
 }
 
-impl_app_key_funcs!(Initialized);
-impl_app_key_funcs!(Created);
-impl_root_key_funcs!(Initialized);
+validate_storage!(crate::storage_created::Created);
+validate_storage!(crate::storage_admin::Admin);
 
 pub struct Storage<State> {
     pub state: State,
     pub app_config: crate::configs::AppConfig,
 }
 
-pub struct Empty {}
-
-impl Storage<Empty> {
-    pub fn create_storage(self) -> Storage<Created> {
-        let certificate_chain = match libblockchain::blockchain::open_read_write_chain(
-            self.app_config
-                .blockchains
-                .certificate_path
-                .to_str()
-                .expect("Failed to parse certificate path from app_config"),
-        ) {
-            Ok(chain) => chain,
-            Err(e) => {
-                tracing::error!(error = %e, "Storage<Empty>: Failed to open certificate chain.");
-                std::process::exit(1);
-            }
-        };
-        let private_key_chain = match libblockchain::blockchain::open_read_write_chain(
-            self.app_config
-                .blockchains
-                .private_key_path
-                .to_str()
-                .expect("Failed to parse private key path from app_config"),
-        ) {
-            Ok(chain) => chain,
-            Err(e) => {
-                tracing::error!(error = %e, "Storage<Empty>: Failed to open private key chain.");
-                std::process::exit(1);
-            }
-        };
-        let crl_chain = match libblockchain::blockchain::open_read_write_chain(
-            self.app_config
-                .blockchains
-                .crl_path
-                .to_str()
-                .expect("Failed to parse CRL path from app_config"),
-        ) {
-            Ok(chain) => chain,
-            Err(e) => {
-                tracing::error!(error = %e, "Storage<Empty>: Failed to open CRL chain.");
-                std::process::exit(1);
-            }
-        };
-        Storage {
-            state: Created {
-                certificate_chain,
-                private_key_chain,
-                crl_chain,
-            },
-            app_config: self.app_config,
-        }
-    }
-}
-
-pub struct Created {
-    certificate_chain: libblockchain::blockchain::BlockChain<libblockchain::blockchain::ReadWrite>,
-    private_key_chain: libblockchain::blockchain::BlockChain<libblockchain::blockchain::ReadWrite>,
-    crl_chain: libblockchain::blockchain::BlockChain<libblockchain::blockchain::ReadWrite>,
-}
-
-impl Storage<Created> {
-    pub fn initialize_storage(self) -> Storage<Initialized> {
-        let (private_key, cert) = || -> (openssl::pkey::PKey<openssl::pkey::Private>, openssl::x509::X509) {
-            let validity_days = 365 * 5;
-            let cert_data = crate::pki_generator::CertificateData {
-                subject_common_name: self.app_config.root_ca_defaults.root_ca_common_name.clone(),
-                issuer_common_name: self.app_config.root_ca_defaults.root_ca_common_name.clone(),
-                organization: self
-                    .app_config
-                    .root_ca_defaults
-                    .root_ca_organization
-                    .clone(),
-                organizational_unit: self
-                    .app_config
-                    .root_ca_defaults
-                    .root_ca_organizational_unit
-                    .clone(),
-                locality: self.app_config.root_ca_defaults.root_ca_locality.clone(),
-                state: self.app_config.root_ca_defaults.root_ca_state.clone(),
-                country: self.app_config.root_ca_defaults.root_ca_country.clone(),
-                validity_days,
-                cert_type: crate::pki_generator::CertificateDataType::RootCA,
-                is_admin: false,
-            };
-            match crate::pki_generator::generate_root_ca(cert_data) {
-                Ok((private_key, cert)) => (private_key, cert),
-                Err(e) => {
-                    tracing::error!(error = %e, "Storage<Created>: Failed to generate root CA.");
-                    std::process::exit(1);
-                }
-            }
-        }();
-        let app_public_key = match self.get_app_public_key() {
-            Ok(key) => key,
-            Err(e) => {
-                tracing::error!(error = %e, "Storage<Created>: Failed to get app public key.");
-                std::process::exit(1);
-            }
-        };
-        let encrypted_private_key = match crate::encryption::encrypt_data(
-            match &private_key.private_key_to_der() {
-                Ok(der) => der,
-                Err(e) => {
-                    tracing::error!(error = %e, "Storage<Created>: Failed to convert root private key to DER.");
-                    std::process::exit(1);
-                }
-            },
-            app_public_key.clone(),
-        ) {
-            Ok(encrypted_key) => encrypted_key,
-            Err(e) => {
-                tracing::error!(error = %e, "Storage<Created>: Failed to encrypt root private key.");
-                std::process::exit(1);
-            }
-        };
-        let encrypted_cert = match crate::encryption::encrypt_data(
-            &match cert.to_der() {
-                Ok(der) => der,
-                Err(e) => {
-                    tracing::error!(error = %e, "Storage<Created>: Failed to convert root certificate to DER.");
-                    std::process::exit(1);
-                }
-            },
-            app_public_key,
-        ) {
-            Ok(encrypted_cert) => encrypted_cert,
-            Err(e) => {
-                tracing::error!(error = %e, "Storage<Created>: Failed to encrypt root certificate.");
-                std::process::exit(1);
-            }
-        };
-
-        let cert_height = match self.state.certificate_chain.put_block(encrypted_cert) {
-            Ok(height) => height,
-            Err(e) => {
-                tracing::error!(error = %e, "Storage<Created>: Failed to put root certificate block.");
-                std::process::exit(1);
-            }
-        };
-
-        let key_height = match self
-            .state
-            .private_key_chain
-            .put_block(encrypted_private_key)
-        {
-            Ok(height) => height,
-            Err(e) => {
-                tracing::error!(error = %e, "Storage<Created>: Failed to put root private key block.");
-                std::process::exit(1);
-            }
-        };
-
-        if key_height != cert_height {
-            match self.state.certificate_chain.delete_last_block() {
-                Ok(_) => (),
-                Err(e) => {
-                    tracing::error!(error = %e, "Storage<Created>: Failed to delete last certificate block.");
-                    std::process::exit(1);
-                }
-            }
-            match self.state.private_key_chain.delete_last_block() {
-                Ok(_) => (),
-                Err(e) => {
-                    tracing::error!(error = %e, "Storage<Created>: Failed to delete last private key block.");
-                    std::process::exit(1);
-                }
-            }
-        }
-        Storage {
-            state: Initialized {
-                certificate_chain: self.state.certificate_chain,
-                private_key_chain: self.state.private_key_chain,
-                crl_chain: self.state.crl_chain,
-            },
-            app_config: self.app_config,
-        }
-    }
-}
-
-pub struct Initialized {
-    pub certificate_chain:
-        libblockchain::blockchain::BlockChain<libblockchain::blockchain::ReadWrite>,
-    pub private_key_chain:
-        libblockchain::blockchain::BlockChain<libblockchain::blockchain::ReadWrite>,
-    pub crl_chain: libblockchain::blockchain::BlockChain<libblockchain::blockchain::ReadWrite>,
-}
-
-impl Storage<Initialized> {
-    pub fn add_admin_user(
-        &self,
-        admin_user_certificate_data: crate::pki_generator::CertificateData,
-    ) -> (
-        openssl::x509::X509,
-        openssl::pkey::PKey<openssl::pkey::Private>,
-    ) {
-        let root_private_key = match self.get_root_private_key() {
-            Ok(key) => key,
-            Err(e) => {
-                tracing::error!(error = %e, "Storage<Initialized>: Failed to get root private key.");
-                std::process::exit(1);
-            }
-        };
-        let admin_intermediate_certificate_data = crate::pki_generator::CertificateData {
-            subject_common_name: "Admin Intermediate CA".to_string(),
-            issuer_common_name: self.app_config.root_ca_defaults.root_ca_common_name.clone(),
-            organization: self
-                .app_config
-                .root_ca_defaults
-                .root_ca_organization
-                .clone(),
-            organizational_unit: self
-                .app_config
-                .root_ca_defaults
-                .root_ca_organizational_unit
-                .clone(),
-            locality: self.app_config.root_ca_defaults.root_ca_locality.clone(),
-            state: self.app_config.root_ca_defaults.root_ca_state.clone(),
-            country: self.app_config.root_ca_defaults.root_ca_country.clone(),
-            validity_days: 365 * 3,
-            cert_type: crate::pki_generator::CertificateDataType::IntermediateCA,
-            is_admin: false,
-        };
-        let (admin_intermediate_key, admin_intermediate_cert) =
-            match crate::pki_generator::generate_key_pair(
-                admin_intermediate_certificate_data,
-                &root_private_key,
-            ) {
-                Ok((key, cert)) => (key, cert),
-                Err(e) => {
-                    tracing::error!(error = %e, "Storage<Initialized>: Failed to generate admin intermediate key pair.");
-                    std::process::exit(1);
-                }
-            };
-        let app_pub_key = match self.get_app_public_key() {
-            Ok(key) => key,
-            Err(e) => {
-                tracing::error!(error = %e, "Storage<Initialized>: Failed to get app public key.");
-                std::process::exit(1);
-            }
-        };
-        let encrypted_admin_intermdiate_cert = match crate::encryption::encrypt_data(
-            &match admin_intermediate_cert.to_der() {
-                Ok(data) => data,
-                Err(e) => {
-                    tracing::error!(error = %e, "Storage<Initialized>: Failed to convert admin intermediate certificate to DER.");
-                    std::process::exit(1);
-                }
-            },
-            app_pub_key.clone(),
-        ) {
-            Ok(data) => data,
-            Err(e) => {
-                tracing::error!(error = %e, "Storage<Initialized>: Failed to encrypt admin intermediate certificate.");
-                std::process::exit(1);
-            }
-        };
-        let cert_height = match self
-            .state
-            .certificate_chain
-            .put_block(encrypted_admin_intermdiate_cert)
-        {
-            Ok(height) => height,
-            Err(e) => {
-                tracing::error!(error = %e, "Storage<Initialized>: Failed to add admin intermediate certificate to chain.");
-                std::process::exit(1);
-            }
-        };
-        let encrypted_admin_intermediate_key = match crate::encryption::encrypt_data(
-            &match admin_intermediate_key.private_key_to_der() {
-                Ok(data) => data,
-                Err(e) => {
-                    tracing::error!(error = %e, "Storage<Initialized>: Failed to convert admin intermediate private key to DER.");
-                    std::process::exit(1);
-                }
-            },
-            app_pub_key.clone(),
-        ) {
-            Ok(data) => data,
-            Err(e) => {
-                tracing::error!(error = %e, "Storage<Initialized>: Failed to encrypt admin intermediate private key.");
-                std::process::exit(1);
-            }
-        };
-        let key_height = match self
-            .state
-            .private_key_chain
-            .put_block(encrypted_admin_intermediate_key)
-        {
-            Ok(height) => height,
-            Err(e) => {
-                tracing::error!(error = %e, "Storage<Initialized>: Failed to add admin intermediate private key to chain.");
-                std::process::exit(1);
-            }
-        };
-        if key_height != cert_height {
-            match self.state.certificate_chain.delete_last_block() {
-                Ok(_) => (),
-                Err(e) => {
-                    tracing::error!(error = %e, "Storage<Initialized>: Failed to delete last block from certificate chain.");
-                    std::process::exit(1);
-                }
-            }
-            match self.state.private_key_chain.delete_last_block() {
-                Ok(_) => (),
-                Err(e) => {
-                    tracing::error!(error = %e, "Storage<Initialized>: Failed to delete last block from private key chain.");
-                    std::process::exit(1);
-                }
-            }
-        }
-        let (admin_user_key, admin_user_cert) = match crate::pki_generator::generate_key_pair(
-            admin_user_certificate_data,
-            &admin_intermediate_key,
-        ) {
-            Ok((key, cert)) => (key, cert),
-            Err(e) => {
-                tracing::error!(error = %e, "Storage<Initialized>: Failed to generate admin user key pair.");
-                std::process::exit(1);
-            }
-        };
-        let encrypted_admin_user_cert = match crate::encryption::encrypt_data(
-            &match admin_user_cert.to_der() {
-                Ok(data) => data,
-                Err(e) => {
-                    tracing::error!(error = %e, "Storage<Initialized>: Failed to convert admin user certificate to DER.");
-                    std::process::exit(1);
-                }
-            },
-            app_pub_key.clone(),
-        ) {
-            Ok(data) => data,
-            Err(e) => {
-                tracing::error!(error = %e, "Storage<Initialized>: Failed to encrypt admin user certificate.");
-                std::process::exit(1);
-            }
-        };
-        let encrypted_admin_user_key = match crate::encryption::encrypt_data(
-            &match admin_user_key.private_key_to_der() {
-                Ok(data) => data,
-                Err(e) => {
-                    tracing::error!(error = %e, "Storage<Initialized>: Failed to convert admin user private key to DER.");
-                    std::process::exit(1);
-                }
-            },
-            app_pub_key.clone(),
-        ) {
-            Ok(data) => data,
-            Err(e) => {
-                tracing::error!(error = %e, "Storage<Initialized>: Failed to encrypt admin user private key.");
-                std::process::exit(1);
-            }
-        };
-        let cert_height = match self
-            .state
-            .certificate_chain
-            .put_block(encrypted_admin_user_cert)
-        {
-            Ok(height) => height,
-            Err(e) => {
-                tracing::error!(error = %e, "Storage<Initialized>: Failed to add admin user certificate to chain.");
-                std::process::exit(1);
-            }
-        };
-        let key_height = match self
-            .state
-            .private_key_chain
-            .put_block(encrypted_admin_user_key)
-        {
-            Ok(height) => height,
-            Err(e) => {
-                match self.state.certificate_chain.delete_last_block() {
-                    Ok(_) => (),
-                    Err(e) => {
-                        tracing::error!(error = %e, "Storage<Initialized>: Failed to delete last block from certificate chain.");
-                        std::process::exit(1);
-                    }
-                }
-                tracing::error!(error = %e, "Storage<Initialized>: Failed to add admin user private key to chain.");
-                std::process::exit(1);
-            }
-        };
-        if key_height != cert_height {
-            match self.state.certificate_chain.delete_last_block() {
-                Ok(_) => (),
-                Err(e) => {
-                    tracing::error!(error = %e, "Storage<Initialized>: Failed to delete last block from certificate chain.");
-                    std::process::exit(1);
-                }
-            }
-            match self.state.private_key_chain.delete_last_block() {
-                Ok(_) => (),
-                Err(e) => {
-                    tracing::error!(error = %e, "Storage<Initialized>: Failed to delete last block from private key chain.");
-                    std::process::exit(1);
-                }
-            }
-        }
-        (admin_user_cert, admin_user_key)
-    }
-}
-
-pub struct Ready {
-    certificate_chain: libblockchain::blockchain::BlockChain<libblockchain::blockchain::ReadWrite>,
-    private_key_chain: libblockchain::blockchain::BlockChain<libblockchain::blockchain::ReadWrite>,
-    crl_chain: libblockchain::blockchain::BlockChain<libblockchain::blockchain::ReadWrite>,
-}
-
-pub struct API {
-    certificate_chain: libblockchain::blockchain::BlockChain<libblockchain::blockchain::ReadOnly>,
-    private_key_chain: libblockchain::blockchain::BlockChain<libblockchain::blockchain::ReadOnly>,
-    crl_chain: libblockchain::blockchain::BlockChain<libblockchain::blockchain::ReadOnly>,
-}
-
-impl_app_key_funcs!(API);
-
-impl Storage<API> {
-    pub fn get_certificate_by_serial(
-        &self,
-        cert_serial: openssl::bn::BigNum,
-    ) -> anyhow::Result<(openssl::x509::X509, u64)> {
-        let app_key = self.get_app_private_key()?;
-        let block_count = self.state.certificate_chain.block_count()?;
-        for i in 1..block_count {
-            let cert_block = self.state.certificate_chain.get_block_by_height(i)?;
-            let decrypted_cert_der = crate::encryption::decrypt_data(
-                cert_block.block_data().as_slice(),
-                app_key.clone(),
-            )?;
-            let cert = openssl::x509::X509::from_der(&decrypted_cert_der)?;
-            if cert.serial_number().to_bn()? == cert_serial {
-                return Ok((cert, i));
-            }
-        }
-        Err(anyhow::anyhow!(
-            "Certificate with serial number {} not found",
-            cert_serial.to_dec_str()?
-        ))
-    }
-
-    pub fn get_certificate_by_common_name(
-        &self,
-        common_name: &str,
-    ) -> anyhow::Result<(openssl::x509::X509, u64)> {
-        let app_key = self.get_app_private_key()?;
-        let block_count = self.state.certificate_chain.block_count()?;
-        for i in 1..block_count {
-            let cert_block = self.state.certificate_chain.get_block_by_height(i)?;
-            let decrypted_cert_der = crate::encryption::decrypt_data(
-                cert_block.block_data().as_slice(),
-                app_key.clone(),
-            )?;
-            let cert = openssl::x509::X509::from_der(&decrypted_cert_der)?;
-            if cert
-                .subject_name()
-                .entries_by_nid(openssl::nid::Nid::COMMONNAME)
-                .any(|entry| {
-                    entry
-                        .data()
-                        .as_utf8()
-                        .map_or(false, |data| data.to_string() == common_name)
-                })
-            {
-                return Ok((cert, i));
-            }
-        }
-        Err(anyhow::anyhow!(
-            "Certificate with common name '{}' not found",
-            common_name
-        ))
-    }
-}
-
-pub struct Admin {
-    certificate_chain: libblockchain::blockchain::BlockChain<libblockchain::blockchain::ReadWrite>,
-    private_key_chain: libblockchain::blockchain::BlockChain<libblockchain::blockchain::ReadWrite>,
-    crl_chain: libblockchain::blockchain::BlockChain<libblockchain::blockchain::ReadWrite>,
-}
-
-impl Storage<Admin> {
-    pub fn open(self, storage: Storage<Ready>) -> anyhow::Result<Storage<Admin>> {
-        Ok(Storage {
-            state: Admin {
-                certificate_chain: storage.state.certificate_chain,
-                private_key_chain: storage.state.private_key_chain,
-                crl_chain: storage.state.crl_chain,
-            },
-            app_config: self.app_config,
-        })
-    }
-    pub fn close(self) -> anyhow::Result<Storage<Ready>> {
-        Ok(Storage {
-            state: Ready {
-                certificate_chain: self.state.certificate_chain,
-                private_key_chain: self.state.private_key_chain,
-                crl_chain: self.state.crl_chain,
-            },
-            app_config: self.app_config,
-        })
-    }
-}
-
-#[derive(PartialEq, Eq, Debug)]
+#[derive(serde::Serialize, Debug, Clone)]
 pub enum StorageState {
-    NotFound,
     Empty,
     Created,
     Initialized,
     Ready,
     Inconsistent,
 }
-
-fn validate_blockchain_store(path: &std::path::Path) -> anyhow::Result<StorageState> {
-    match path.exists() {
-        true => match path.is_dir() {
-            true => {
-                let mut entries = std::fs::read_dir(path)?.peekable();
-                if entries.peek().is_some() {
-                    Ok(StorageState::Created)
-                } else {
-                    Ok(StorageState::Empty)
-                }
-            }
-            false => Ok(StorageState::NotFound),
-        },
-        false => Ok(StorageState::NotFound),
-    }
+#[derive(serde::Serialize, Debug, Clone)]
+pub struct StorageStatusResults {
+    pub app_cert_exists: Option<bool>,
+    pub app_key_exists: Option<bool>,
+    pub cert_path_exists: Option<bool>,
+    pub key_path_exists: Option<bool>,
+    pub crl_path_exists: Option<bool>,
+    pub cert_chain_openable: Option<bool>,
+    pub key_chain_openable: Option<bool>,
+    pub crl_chain_openable: Option<bool>,
+    pub validation_result: Option<ValidationResult>,
+    pub storage_state: StorageState,
+    pub error_message: Option<String>,
 }
 
-pub fn get_storage_state(app_config: &crate::configs::AppConfig) -> anyhow::Result<StorageState> {
-    let cert_store_state = validate_blockchain_store(&app_config.blockchains.certificate_path)?;
-    let key_store_state = validate_blockchain_store(&app_config.blockchains.private_key_path)?;
-    let crl_store_state = validate_blockchain_store(&app_config.blockchains.crl_path)?;
-    if cert_store_state == key_store_state && key_store_state == crl_store_state {
-        match cert_store_state {
-            StorageState::NotFound => Ok(StorageState::NotFound),
-            StorageState::Empty => Ok(StorageState::Empty),
-            StorageState::Created => {
-                let cert_chain = libblockchain::blockchain::BlockChain::open_read_only(
-                    match app_config.blockchains.certificate_path.to_str() {
-                        Some(path) => path,
-                        None => anyhow::bail!("Invalid certificate chain path"),
-                    },
-                )?;
-                let private_key_chain = libblockchain::blockchain::BlockChain::open_read_only(
-                    match app_config.blockchains.private_key_path.to_str() {
-                        Some(path) => path,
-                        None => anyhow::bail!("Invalid private key chain path"),
-                    },
-                )?;
-                let crl_chain = libblockchain::blockchain::BlockChain::open_read_only(
-                    match app_config.blockchains.crl_path.to_str() {
-                        Some(path) => path,
-                        None => anyhow::bail!("Invalid CRL chain path"),
-                    },
-                )?;
-                let cert_count = cert_chain.block_count()?;
-                let private_key_count = private_key_chain.block_count()?;
-                let crl_count = crl_chain.block_count()?;
-                if cert_count == 0 && private_key_count == 0 && crl_count >= 0 {
-                    Ok(StorageState::Empty)
-                } else if cert_count == 1 && private_key_count == 1 && crl_count >= 0 {
-                    Ok(StorageState::Initialized)
-                } else if cert_count == private_key_count && crl_count >= 0 {
-                    Ok(StorageState::Ready)
-                } else {
-                    Ok(StorageState::Inconsistent)
-                }
-            }
-            _ => Ok(StorageState::Inconsistent), // Should never happen since all three states are the same
-        }
-    } else {
-        Ok(StorageState::Inconsistent)
-    }
-}
-
-pub fn get_api_storage(app_config: crate::configs::AppConfig) -> anyhow::Result<Storage<API>> {
-    match get_storage_state(&app_config)? {
-        StorageState::NotFound => anyhow::bail!("Storage not found"),
-        StorageState::Empty => anyhow::bail!("Storage is empty, initialization required"),
-        StorageState::Created => anyhow::bail!("Storage created but not initialized"),
-        StorageState::Initialized => anyhow::bail!("Storage initialized but not ready"),
-        StorageState::Inconsistent => anyhow::bail!("Storage is in an inconsistent state"),
-        StorageState::Ready => (),
-    }
-    Ok(Storage {
-        state: API {
-            certificate_chain: libblockchain::blockchain::open_read_only_chain(
+pub fn get_state(
+    app_config: &crate::configs::AppConfig,
+    execution_count: u32,
+) -> StorageStatusResults {
+    let mut storage_status = StorageStatusResults {
+        app_cert_exists: None,
+        app_key_exists: None,
+        cert_path_exists: None,
+        key_path_exists: None,
+        crl_path_exists: None,
+        cert_chain_openable: None,
+        key_chain_openable: None,
+        crl_chain_openable: None,
+        validation_result: None,
+        storage_state: StorageState::Inconsistent,
+        error_message: None,
+    };
+    storage_status.app_cert_exists = Some(app_config.blockchains.certificate_path.exists());
+    storage_status.app_key_exists = Some(app_config.blockchains.private_key_path.exists());
+    storage_status.cert_path_exists = Some(app_config.blockchains.certificate_path.exists());
+    storage_status.key_path_exists = Some(app_config.blockchains.private_key_path.exists());
+    storage_status.crl_path_exists = Some(app_config.blockchains.crl_path.exists());
+    if storage_status.cert_path_exists == Some(true) {
+        storage_status.cert_chain_openable = Some(
+            match libblockchain::blockchain::open_chain(
                 match app_config.blockchains.certificate_path.to_str() {
                     Some(path) => path,
-                    None => anyhow::bail!("Invalid certificate chain path"),
+                    None => {
+                        storage_status.error_message =
+                            Some("Failed to parse certificate path from app_config".to_string());
+                        return storage_status;
+                    }
                 },
-            )?,
-            private_key_chain: libblockchain::blockchain::open_read_only_chain(
+            ) {
+                Ok(_) => true,
+                Err(e) => {
+                    tracing::error!(error = %e, "Failed to open certificate blockchain.");
+                    storage_status.error_message =
+                        Some(format!("Failed to open certificate blockchain: {}", e));
+                    false
+                }
+            },
+        );
+    }
+    if storage_status.key_path_exists == Some(true) {
+        storage_status.key_chain_openable = Some(
+            match libblockchain::blockchain::open_chain(
                 match app_config.blockchains.private_key_path.to_str() {
                     Some(path) => path,
-                    None => anyhow::bail!("Invalid private key chain path"),
+                    None => {
+                        storage_status.error_message =
+                            Some("Failed to parse private key path from app_config".to_string());
+                        return storage_status;
+                    }
                 },
-            )?,
-            crl_chain: libblockchain::blockchain::open_read_only_chain(
+            ) {
+                Ok(_) => true,
+                Err(e) => {
+                    tracing::error!(error = %e, "Failed to open private key blockchain.");
+                    storage_status.error_message =
+                        Some(format!("Failed to open private key blockchain: {}", e));
+                    false
+                }
+            },
+        );
+    }
+    if storage_status.crl_path_exists == Some(true) {
+        storage_status.crl_chain_openable = Some(
+            match libblockchain::blockchain::open_chain(
                 match app_config.blockchains.crl_path.to_str() {
                     Some(path) => path,
-                    None => anyhow::bail!("Invalid CRL chain path"),
+                    None => {
+                        storage_status.error_message =
+                            Some("Failed to parse CRL path from app_config".to_string());
+                        return storage_status;
+                    }
                 },
-            )?,
+            ) {
+                Ok(_) => true,
+                Err(e) => {
+                    tracing::error!(error = %e, "Failed to open CRL blockchain.");
+                    storage_status.error_message =
+                        Some(format!("Failed to open CRL blockchain: {}", e));
+                    false
+                }
+            },
+        );
+    }
+    if !storage_status.app_cert_exists.unwrap_or(false)
+        && !storage_status.app_key_exists.unwrap_or(false)
+        && !storage_status.cert_path_exists.unwrap_or(false)
+        && !storage_status.key_path_exists.unwrap_or(false)
+        && !storage_status.crl_path_exists.unwrap_or(false)
+    {
+        let (app_cert, app_key) = match crate::encryption::create_app_cert_and_key_pair() {
+            Ok((cert, key)) => (cert, key),
+            Err(e) => {
+                tracing::error!(error = %e, "Failed to generate app certificate and key.");
+                storage_status.error_message =
+                    Some(format!("Failed to generate app certificate and key: {}", e));
+                return storage_status;
+            }
+        };
+        if let Some(cert_parent_dir) = app_config.key_exports.app_cert_path.parent() {
+            if let Err(e) = std::fs::create_dir_all(cert_parent_dir) {
+                tracing::error!(error = %e, "Failed to create parent directory for app certificate.");
+                storage_status.error_message = Some(format!(
+                    "Failed to create parent directory for app certificate: {}",
+                    e
+                ));
+                return storage_status;
+            }
+        }
+        if let Some(key_parent_dir) = app_config.key_exports.app_key_path.parent() {
+            if let Err(e) = std::fs::create_dir_all(key_parent_dir) {
+                tracing::error!(error = %e, "Failed to create parent directory for app private key.");
+                storage_status.error_message = Some(format!(
+                    "Failed to create parent directory for app private key: {}",
+                    e
+                ));
+                return storage_status;
+            }
+        }
+        match std::fs::write(
+            &app_config.key_exports.app_cert_path,
+            match app_cert.to_pem() {
+                Ok(pem) => pem,
+                Err(e) => {
+                    tracing::error!(error = %e, "Failed to convert app certificate to PEM.");
+                    storage_status.error_message =
+                        Some(format!("Failed to convert app certificate to PEM: {}", e));
+                    return storage_status;
+                }
+            },
+        ) {
+            Ok(_) => (),
+            Err(e) => {
+                tracing::error!(error = %e, "Failed to write app certificate to file.");
+                storage_status.error_message =
+                    Some(format!("Failed to write app certificate to file: {}", e));
+                return storage_status;
+            }
+        };
+        match std::fs::write(
+            &app_config.key_exports.app_key_path,
+            match app_key.private_key_to_pem_pkcs8() {
+                Ok(pem) => pem,
+                Err(e) => {
+                    tracing::error!(error = %e, "Failed to convert app private key to PEM.");
+                    storage_status.error_message =
+                        Some(format!("Failed to convert app private key to PEM: {}", e));
+                    return storage_status;
+                }
+            },
+        ) {
+            Ok(_) => (),
+            Err(e) => {
+                tracing::error!(error = %e, "Failed to write app private key to file.");
+                storage_status.error_message =
+                    Some(format!("Failed to write app private key to file: {}", e));
+                return storage_status;
+            }
+        };
+        let storage = Storage::<crate::storage_empty::Empty> {
+            state: crate::storage_empty::Empty {},
+            app_config: app_config.clone(),
+        };
+        let storage = storage.create_storage();
+        storage.initialize_storage();
+        if execution_count > 4 {
+            storage_status.error_message = Some(format!(
+                "Storage state check has been attempted {} times. Manual intervention may be required.",
+                execution_count
+            ));
+            return storage_status;
+        }
+        get_state(app_config, execution_count + 1);
+    }
+    if !storage_status.app_cert_exists.unwrap_or(false)
+        || !storage_status.app_key_exists.unwrap_or(false)
+        || !storage_status.cert_path_exists.unwrap_or(false)
+        || !storage_status.key_path_exists.unwrap_or(false)
+        || !storage_status.crl_path_exists.unwrap_or(false)
+    {
+        storage_status.storage_state = StorageState::Inconsistent;
+        storage_status.error_message = Some(
+            "Storage is in an inconsistent state: some files exist while others do not."
+                .to_string(),
+        );
+        return storage_status;
+    }
+    if storage_status.cert_chain_openable == Some(true)
+        && storage_status.key_chain_openable == Some(true)
+        && storage_status.crl_chain_openable == Some(true)
+    {
+        storage_status.storage_state = StorageState::Created;
+        let storage = Storage::<crate::storage_created::Created> {
+            state: crate::storage_created::Created {
+                certificate_chain: match libblockchain::blockchain::open_chain(
+                    match app_config.blockchains.certificate_path.to_str() {
+                        Some(path) => path,
+                        None => {
+                            storage_status.error_message = Some(
+                                "Failed to parse certificate path from app_config".to_string(),
+                            );
+                            return storage_status;
+                        }
+                    },
+                ) {
+                    Ok(chain) => chain,
+                    Err(e) => {
+                        tracing::error!(error = %e, "Failed to open certificate blockchain.");
+                        storage_status.error_message =
+                            Some(format!("Failed to open certificate blockchain: {}", e));
+                        return storage_status;
+                    }
+                },
+                private_key_chain: match libblockchain::blockchain::open_chain(
+                    match app_config.blockchains.private_key_path.to_str() {
+                        Some(path) => path,
+                        None => {
+                            storage_status.error_message = Some(
+                                "Failed to parse private key path from app_config".to_string(),
+                            );
+                            return storage_status;
+                        }
+                    },
+                ) {
+                    Ok(chain) => chain,
+                    Err(e) => {
+                        tracing::error!(error = %e, "Failed to open private key blockchain.");
+                        storage_status.error_message =
+                            Some(format!("Failed to open private key blockchain: {}", e));
+                        return storage_status;
+                    }
+                },
+                crl_chain: match libblockchain::blockchain::open_chain(
+                    match app_config.blockchains.crl_path.to_str() {
+                        Some(path) => path,
+                        None => {
+                            storage_status.error_message =
+                                Some("Failed to parse CRL path from app_config".to_string());
+                            return storage_status;
+                        }
+                    },
+                ) {
+                    Ok(chain) => chain,
+                    Err(e) => {
+                        tracing::error!(error = %e, "Failed to open CRL blockchain.");
+                        storage_status.error_message =
+                            Some(format!("Failed to open CRL blockchain: {}", e));
+                        return storage_status;
+                    }
+                },
+            },
+            app_config: app_config.clone(),
+        };
+        storage_status.validation_result = Some(storage.validate_storage());
+        if storage_status
+            .validation_result
+            .as_ref()
+            .unwrap()
+            .error_message
+            .is_some()
+        {
+            storage_status.storage_state = StorageState::Inconsistent;
+            return storage_status;
+        }
+        if storage_status
+            .validation_result
+            .as_ref()
+            .unwrap()
+            .cert_height
+            == 0
+            && storage_status
+                .validation_result
+                .as_ref()
+                .unwrap()
+                .key_height
+                == 0
+            && storage_status
+                .validation_result
+                .as_ref()
+                .unwrap()
+                .cert_blockchain_valid
+                == Some(true)
+            && storage_status
+                .validation_result
+                .as_ref()
+                .unwrap()
+                .key_blockchain_valid
+                == Some(true)
+        {
+            storage.initialize_storage();
+            get_state(app_config, execution_count + 1);
+        }
+        if storage_status
+            .validation_result
+            .as_ref()
+            .unwrap()
+            .cert_height
+            == 1
+            && storage_status
+                .validation_result
+                .as_ref()
+                .unwrap()
+                .key_height
+                == 1
+            && storage_status
+                .validation_result
+                .as_ref()
+                .unwrap()
+                .cert_blockchain_valid
+                == Some(true)
+            && storage_status
+                .validation_result
+                .as_ref()
+                .unwrap()
+                .key_blockchain_valid
+                == Some(true)
+        {
+            storage_status.storage_state = StorageState::Initialized;
+            return storage_status;
+        }
+        if storage_status
+            .validation_result
+            .as_ref()
+            .unwrap()
+            .cert_height
+            > 1
+            && storage_status
+                .validation_result
+                .as_ref()
+                .unwrap()
+                .key_height
+                > 1
+            && storage_status
+                .validation_result
+                .as_ref()
+                .unwrap()
+                .cert_blockchain_valid
+                == Some(true)
+            && storage_status
+                .validation_result
+                .as_ref()
+                .unwrap()
+                .key_blockchain_valid
+                == Some(true)
+        {
+            if storage_status
+                .validation_result
+                .as_ref()
+                .unwrap()
+                .cert_signatures_validation_results
+                .as_ref()
+                .unwrap()
+                .values()
+                .any(|&valid| !valid)
+                || storage_status
+                    .validation_result
+                    .as_ref()
+                    .unwrap()
+                    .key_signatures_validation_results
+                    .as_ref()
+                    .unwrap()
+                    .values()
+                    .any(|&valid| !valid)
+            {
+                storage_status.storage_state = StorageState::Inconsistent;
+                storage_status.error_message = Some(
+                    "Storage is in an inconsistent state: some blocks failed signature validation."
+                        .to_string(),
+                );
+                return storage_status;
+            }
+            storage_status.storage_state = StorageState::Ready;
+            return storage_status;
+        }
+    }
+    storage_status
+}
+
+pub fn get_api_storage(
+    storage: Storage<crate::storage_ready::Ready>,
+) -> anyhow::Result<Storage<crate::storage_api::API>> {
+    Ok(Storage {
+        state: crate::storage_api::API {
+            certificate_chain: storage.state.certificate_chain,
+            private_key_chain: storage.state.private_key_chain,
+            crl_chain: storage.state.crl_chain,
         },
-        app_config,
+        app_config: storage.app_config.clone(),
     })
 }
 
-pub fn get_storage_empty(app_config: crate::configs::AppConfig) -> anyhow::Result<Storage<Empty>> {
-    match get_storage_state(&app_config) {
-        Ok(StorageState::NotFound) | Ok(StorageState::Empty) => (),
-        Ok(StorageState::Created) | Ok(StorageState::Initialized) | Ok(StorageState::Ready) => {
-            anyhow::bail!("Storage already exists, cannot create new storage")
-        }
-        Ok(StorageState::Inconsistent) => {
-            anyhow::bail!("Storage is in an inconsistent state, manual intervention required")
-        }
-        Err(e) => {
-            anyhow::bail!("Failed to determine storage state: {}", e);
-        }
-    }
+pub fn get_admin_storage(
+    storage: Storage<crate::storage_ready::Ready>,
+) -> anyhow::Result<Storage<crate::storage_admin::Admin>> {
     Ok(Storage {
-        state: Empty {},
-        app_config,
+        state: crate::storage_admin::Admin {
+            certificate_chain: storage.state.certificate_chain,
+            private_key_chain: storage.state.private_key_chain,
+            crl_chain: storage.state.crl_chain,
+        },
+        app_config: storage.app_config.clone(),
     })
 }
 
-pub fn get_storage_created(
-    app_config: crate::configs::AppConfig,
-) -> anyhow::Result<Storage<Created>> {
-    match get_storage_state(&app_config) {
-        Ok(StorageState::NotFound) | Ok(StorageState::Empty) => {
-            anyhow::bail!("Storage not found or empty, cannot open existing storage")
-        }
-        Ok(StorageState::Created) => (),
-        Ok(StorageState::Initialized) | Ok(StorageState::Ready) => {
-            anyhow::bail!("Storage already initialized, cannot open in created state")
-        }
-        Ok(StorageState::Inconsistent) => {
-            anyhow::bail!("Storage is in an inconsistent state, manual intervention required")
-        }
-        Err(e) => {
-            anyhow::bail!("Failed to determine storage state: {}", e);
-        }
-    }
-    Ok(Storage {
-        state: Created {
-            certificate_chain: libblockchain::blockchain::open_read_write_chain(match app_config
-                .blockchains
-                .certificate_path
-                .to_str()
-            {
-                Some(path) => path,
-                None => anyhow::bail!("Invalid certificate chain path"),
-            })?,
-            private_key_chain: libblockchain::blockchain::open_read_write_chain(match app_config
-                .blockchains
-                .private_key_path
-                .to_str()
-            {
-                Some(path) => path,
-                None => anyhow::bail!("Invalid private key chain path"),
-            })?,
-            crl_chain: libblockchain::blockchain::open_read_write_chain(
-                match app_config.blockchains.crl_path.to_str() {
-                    Some(path) => path,
-                    None => anyhow::bail!("Invalid CRL chain path"),
-                },
-            )?,
+pub fn get_initialized_storage(
+    app_config: &crate::configs::AppConfig,
+) -> anyhow::Result<Storage<crate::storage_initialized::Initialized>> {
+    let certificate_chain = match libblockchain::blockchain::open_chain(
+        match app_config.blockchains.certificate_path.to_str() {
+            Some(path) => path,
+            None => {
+                return Err(anyhow::anyhow!(
+                    "Failed to parse certificate path from app_config"
+                ))
+            }
         },
-        app_config,
+    ) {
+        Ok(chain) => chain,
+        Err(e) => {
+            tracing::error!(error = %e, "Failed to open certificate blockchain.");
+            return Err(anyhow::anyhow!(
+                "Failed to open certificate blockchain: {}",
+                e
+            ));
+        }
+    };
+    let private_key_chain = match libblockchain::blockchain::open_chain(
+        match app_config.blockchains.private_key_path.to_str() {
+            Some(path) => path,
+            None => {
+                return Err(anyhow::anyhow!(
+                    "Failed to parse private key path from app_config"
+                ))
+            }
+        },
+    ) {
+        Ok(chain) => chain,
+        Err(e) => {
+            tracing::error!(error = %e, "Failed to open private key blockchain.");
+            return Err(anyhow::anyhow!(
+                "Failed to open private key blockchain: {}",
+                e
+            ));
+        }
+    };
+    let crl_chain = match libblockchain::blockchain::open_chain(
+        match app_config.blockchains.crl_path.to_str() {
+            Some(path) => path,
+            None => return Err(anyhow::anyhow!("Failed to parse CRL path from app_config")),
+        },
+    ) {
+        Ok(chain) => chain,
+        Err(e) => {
+            tracing::error!(error = %e, "Failed to open CRL blockchain.");
+            return Err(anyhow::anyhow!("Failed to open CRL blockchain: {}", e));
+        }
+    };
+    Ok(Storage {
+        state: crate::storage_initialized::Initialized {
+            certificate_chain,
+            private_key_chain,
+            crl_chain,
+        },
+        app_config: app_config.clone(),
     })
 }
 
-pub fn get_storage_initialized(
-    app_config: crate::configs::AppConfig,
-) -> anyhow::Result<Storage<Initialized>> {
-    match get_storage_state(&app_config) {
-        Ok(StorageState::NotFound) | Ok(StorageState::Empty) | Ok(StorageState::Created) => {
-            anyhow::bail!(
-                "Storage not found, empty, or not initialized, cannot open in initialized state"
-            )
-        }
-        Ok(StorageState::Initialized) => (),
-        Ok(StorageState::Ready) => {
-            anyhow::bail!("Storage already ready, cannot open in initialized state")
-        }
-        Ok(StorageState::Inconsistent) => {
-            anyhow::bail!("Storage is in an inconsistent state, manual intervention required")
-        }
-        Err(e) => {
-            anyhow::bail!("Failed to determine storage state: {}", e);
-        }
-    }
-    Ok(Storage {
-        state: Initialized {
-            certificate_chain: libblockchain::blockchain::open_read_write_chain(match app_config
-                .blockchains
-                .certificate_path
-                .to_str()
-            {
-                Some(path) => path,
-                None => anyhow::bail!("Invalid certificate chain path"),
-            })?,
-            private_key_chain: libblockchain::blockchain::open_read_write_chain(match app_config
-                .blockchains
-                .private_key_path
-                .to_str()
-            {
-                Some(path) => path,
-                None => anyhow::bail!("Invalid private key chain path"),
-            })?,
-            crl_chain: libblockchain::blockchain::open_read_write_chain(
-                match app_config.blockchains.crl_path.to_str() {
-                    Some(path) => path,
-                    None => anyhow::bail!("Invalid CRL chain path"),
-                },
-            )?,
+pub fn get_created_storage(
+    app_config: &crate::configs::AppConfig,
+) -> anyhow::Result<Storage<crate::storage_created::Created>> {
+    let certificate_chain = match libblockchain::blockchain::open_chain(
+        match app_config.blockchains.certificate_path.to_str() {
+            Some(path) => path,
+            None => {
+                return Err(anyhow::anyhow!(
+                    "Failed to parse certificate path from app_config"
+                ))
+            }
         },
-        app_config,
+    ) {
+        Ok(chain) => chain,
+        Err(e) => {
+            tracing::error!(error = %e, "Failed to open certificate blockchain.");
+            return Err(anyhow::anyhow!(
+                "Failed to open certificate blockchain: {}",
+                e
+            ));
+        }
+    };
+    let private_key_chain = match libblockchain::blockchain::open_chain(
+        match app_config.blockchains.private_key_path.to_str() {
+            Some(path) => path,
+            None => {
+                return Err(anyhow::anyhow!(
+                    "Failed to parse private key path from app_config"
+                ))
+            }
+        },
+    ) {
+        Ok(chain) => chain,
+        Err(e) => {
+            tracing::error!(error = %e, "Failed to open private key blockchain.");
+            return Err(anyhow::anyhow!(
+                "Failed to open private key blockchain: {}",
+                e
+            ));
+        }
+    };
+    let crl_chain = match libblockchain::blockchain::open_chain(
+        match app_config.blockchains.crl_path.to_str() {
+            Some(path) => path,
+            None => return Err(anyhow::anyhow!("Failed to parse CRL path from app_config")),
+        },
+    ) {
+        Ok(chain) => chain,
+        Err(e) => {
+            tracing::error!(error = %e, "Failed to open CRL blockchain.");
+            return Err(anyhow::anyhow!("Failed to open CRL blockchain: {}", e));
+        }
+    };
+    Ok(Storage {
+        state: crate::storage_created::Created {
+            certificate_chain,
+            private_key_chain,
+            crl_chain,
+        },
+        app_config: app_config.clone(),
+    })
+}
+
+pub fn get_empty_storage(
+    app_config: &crate::configs::AppConfig,
+) -> Storage<crate::storage_empty::Empty> {
+    Storage {
+        state: crate::storage_empty::Empty {},
+        app_config: app_config.clone(),
+    }
+}
+
+pub fn get_ready_storage(
+    app_config: &crate::configs::AppConfig,
+) -> anyhow::Result<Storage<crate::storage_ready::Ready>> {
+    let certificate_chain = match libblockchain::blockchain::open_chain(
+        match app_config.blockchains.certificate_path.to_str() {
+            Some(path) => path,
+            None => {
+                return Err(anyhow::anyhow!(
+                    "Failed to parse certificate path from app_config"
+                ))
+            }
+        },
+    ) {
+        Ok(chain) => chain,
+        Err(e) => {
+            tracing::error!(error = %e, "Failed to open certificate blockchain.");
+            return Err(anyhow::anyhow!(
+                "Failed to open certificate blockchain: {}",
+                e
+            ));
+        }
+    };
+    let private_key_chain = match libblockchain::blockchain::open_chain(
+        match app_config.blockchains.private_key_path.to_str() {
+            Some(path) => path,
+            None => {
+                return Err(anyhow::anyhow!(
+                    "Failed to parse private key path from app_config"
+                ))
+            }
+        },
+    ) {
+        Ok(chain) => chain,
+        Err(e) => {
+            tracing::error!(error = %e, "Failed to open private key blockchain.");
+            return Err(anyhow::anyhow!(
+                "Failed to open private key blockchain: {}",
+                e
+            ));
+        }
+    };
+    let crl_chain = match libblockchain::blockchain::open_chain(
+        match app_config.blockchains.crl_path.to_str() {
+            Some(path) => path,
+            None => return Err(anyhow::anyhow!("Failed to parse CRL path from app_config")),
+        },
+    ) {
+        Ok(chain) => chain,
+        Err(e) => {
+            tracing::error!(error = %e, "Failed to open CRL blockchain.");
+            return Err(anyhow::anyhow!("Failed to open CRL blockchain: {}", e));
+        }
+    };
+    Ok(Storage {
+        state: crate::storage_ready::Ready {
+            certificate_chain,
+            private_key_chain,
+            crl_chain,
+        },
+        app_config: app_config.clone(),
     })
 }

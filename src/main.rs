@@ -1,4 +1,6 @@
+use pki_chain::comm_protocol::{start_api_server, start_repair_server, start_setup_server};
 use pki_chain::configs::AppConfig;
+use pki_chain::storage::{get_state, StorageState, StorageStatusResults, ValidationResult};
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 
@@ -25,48 +27,32 @@ fn main() {
             return;
         }
     };
-    // Initialize storage based on its current state
-    match pki_chain::storage::get_storage_state(&app_config.clone()) {
-        Ok(pki_chain::storage::StorageState::NotFound)
-        | Ok(pki_chain::storage::StorageState::Empty) => {
-            tracing::info!("Storage not ready. Initializing storage...");
-            match pki_chain::storage::get_storage_empty(app_config.clone()) {
-                Ok(storage) => {
-                    storage.create_storage().initialize_storage();
-                    tracing::info!("Storage initialized successfully.");
-                }
-                Err(e) => {
-                    tracing::error!(error = %e, "Failed to open empty storage");
-                }
+    let mut storage_status = get_state(&app_config, 1);
+    while storage_status.error_message.is_none() {
+        match storage_status.storage_state {
+            StorageState::Ready => {
+                tracing::info!(
+                    "Storage is ready. Storage Status Results: {:?}",
+                    storage_status
+                );
+                storage_status = start_api_server(&app_config, storage_status);
             }
-        }
-        Ok(pki_chain::storage::StorageState::Created) => {
-            tracing::info!("Storage created but not initialized. Initializing storage...");
-            match pki_chain::storage::get_storage_created(app_config.clone()) {
-                Ok(storage) => {
-                    storage.initialize_storage();
-                    tracing::info!("Storage initialized successfully.");
-                }
-                Err(e) => {
-                    tracing::error!(error = %e, "Failed to open created storage");
-                }
+            StorageState::Inconsistent => {
+                tracing::warn!(
+                    "Storage is inconsistent. Storage Status Results: {:?}",
+                    storage_status
+                );
+                storage_status = start_repair_server(&app_config, storage_status);
             }
-        }
-
-        Ok(pki_chain::storage::StorageState::Initialized) => {
-            tracing::info!("Existing storage found and initialized. Starting socket server for adding first admin.");
-        }
-        Ok(pki_chain::storage::StorageState::Ready) => {
-            tracing::info!("Storage is ready.");
-        }
-        Ok(pki_chain::storage::StorageState::Inconsistent) => {
-            tracing::error!("Storage is in an inconsistent state. Please check the storage and resolve any issues before restarting the application.");
-            return;
-        }
-        Err(e) => {
-            tracing::error!(error = %e, "Failed to get storage state");
-            return;
+            _ => {
+                tracing::warn!(
+                    "Storage is in a setup state or is inconsistent. Storage Status Results: {:?}",
+                    storage_status
+                );
+                storage_status = start_setup_server(&app_config, storage_status);
+            }
         }
     }
-    pki_chain::comm_protocol::start_comm_server(app_config);
+    tracing::error!(error = %storage_status.error_message.as_ref().unwrap(), "There are errors in the storage system");
+    tracing::info!("Storage status: {:?}", storage_status);
 }

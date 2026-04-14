@@ -1,6 +1,14 @@
-use std::io::{Read, Write};
+use base64::Engine;
+use std::{
+    any,
+    f32::consts::E,
+    io::{Read, Write},
+};
 
-use crate::pki_generator::{self, CertificateData};
+use crate::{
+    pki_generator::{self, CertificateData},
+    storage::{self, get_api_storage},
+};
 
 struct CAClientRequest {
     from_socket: std::os::unix::net::UnixStream,
@@ -54,8 +62,72 @@ fn send_response(
         tracing::error!(socket = ?response_socket, error = %e, "Failed to send response");
     }
 }
+struct ClientRequest {
+    version: Option<u32>,
+    json_value: Option<serde_json::Value>,
+    error_message: Option<String>,
+}
 
-fn recv_request(mut stream: std::os::unix::net::UnixStream, app_config: crate::configs::AppConfig) {
+fn get_client_request(mut stream: std::os::unix::net::UnixStream) -> ClientRequest {
+    let mut client_request = ClientRequest {
+        version: None,
+        json_value: None,
+        error_message: None,
+    };
+    let mut version_buffer = [0u8; 4];
+    let mut length_buffer = [0u8; 4];
+    match stream.read_exact(&mut version_buffer) {
+        Ok(_) => client_request.version = Some(u32::from_le_bytes(version_buffer)),
+        Err(e) => {
+            tracing::error!(error = %e, "Failed to read protocol version");
+            client_request.error_message = Some(format!("Failed to read protocol version: {}", e));
+            return client_request;
+        }
+    }
+    match stream.read_exact(&mut length_buffer) {
+        Ok(_) => {}
+        Err(e) => {
+            tracing::error!(error = %e, "Failed to read payload length");
+            client_request.error_message = Some(format!("Failed to read payload length: {}", e));
+            return client_request;
+        }
+    }
+    let payload_length = u32::from_le_bytes(length_buffer) as usize;
+    if payload_length > 10 * 1024 * 1024 {
+        tracing::error!(
+            payload_length,
+            "Payload length exceeds maximum allowed size"
+        );
+        client_request.error_message =
+            Some("Payload length exceeds maximum allowed size".to_string());
+        return client_request;
+    }
+    let mut payload_buffer = vec![0u8; payload_length];
+    match stream.read_exact(&mut payload_buffer) {
+        Ok(_) => {}
+        Err(e) => {
+            tracing::error!(error = %e, "Failed to read payload data");
+            client_request.error_message = Some(format!("Failed to read payload data: {}", e));
+            return client_request;
+        }
+    }
+    match serde_json::from_slice(&payload_buffer) {
+        Ok(json) => {
+            client_request.json_value = Some(json);
+            client_request
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "Failed to parse request JSON");
+            client_request.error_message = Some(format!("Failed to parse request JSON: {}", e));
+            client_request
+        }
+    }
+}
+
+fn handle_api_request(
+    mut stream: std::os::unix::net::UnixStream,
+    storage: &crate::storage::Storage<crate::storage_api::API>,
+) {
     let mut version_buffer = [0u8; 4];
     let mut length_buffer = [0u8; 4];
     if let Err(e) = stream.read_exact(&mut version_buffer) {
@@ -127,150 +199,27 @@ fn recv_request(mut stream: std::os::unix::net::UnixStream, app_config: crate::c
             // Handle LoginAdmin request
         }
         "GetState" => {
-            let storage_state = match crate::storage::get_storage_state(&app_config) {
-                Ok(s) => s,
-                Err(e) => {
-                    tracing::error!(error = %e, "Failed to get Storage state");
-                    send_response(
-                        response_socket,
-                        &serde_json::json!({
-                            "status": "error",
-                            "message": "Failed to get Storage state",
-                        }),
-                    );
-                    return;
-                }
-            };
-            match storage_state {
-                crate::storage::StorageState::NotFound | crate::storage::StorageState::Empty => {
-                    send_response(
-                        response_socket,
-                        &serde_json::json!({
-                            "status": "success",
-                            "message": "Storage not found. Please initialize the storage or check the configuration.",
-                            "data": {
-                                "state": "NotFound",
-                                "cert_path": app_config.blockchains.certificate_path.to_str().unwrap_or("N/A"),
-                                "key_path": app_config.blockchains.private_key_path.to_str().unwrap_or("N/A"),
-                                "crl_path": app_config.blockchains.crl_path.to_str().unwrap_or("N/A"),
-                                "Root CA Defaults": {
-                                    "common_name": app_config.root_ca_defaults.root_ca_common_name,
-                                    "organization": app_config.root_ca_defaults.root_ca_organization,
-                                    "organizational_unit": app_config.root_ca_defaults.root_ca_organizational_unit,
-                                    "locality": app_config.root_ca_defaults.root_ca_locality,
-                                    "state": app_config.root_ca_defaults.root_ca_state,
-                                    "country": app_config.root_ca_defaults.root_ca_country,
-                                    "validity_days": app_config.root_ca_defaults.root_ca_validity_days,
-                                }
-                            },
-                        }),
-                    );
-                }
-                crate::storage::StorageState::Created => {
-                    send_response(
-                        response_socket,
-                        &serde_json::json!({
-                            "status": "success",
-                            "message": "Storage created but not initialized. Please initialize the storage.",
-                            "data": {
-                                "cert_path": app_config.blockchains.certificate_path.to_str().unwrap_or("N/A"),
-                                "state": "Created",
-                                "key_path": app_config.blockchains.private_key_path.to_str().unwrap_or("N/A"),
-                                "crl_path": app_config.blockchains.crl_path.to_str().unwrap_or("N/A"),
-                                "Root CA Defaults": {
-                                    "common_name": app_config.root_ca_defaults.root_ca_common_name,
-                                    "organization": app_config.root_ca_defaults.root_ca_organization,
-                                    "organizational_unit": app_config.root_ca_defaults.root_ca_organizational_unit,
-                                    "locality": app_config.root_ca_defaults.root_ca_locality,
-                                    "state": app_config.root_ca_defaults.root_ca_state,
-                                    "country": app_config.root_ca_defaults.root_ca_country,
-                                    "validity_days": app_config.root_ca_defaults.root_ca_validity_days,
-                                }
-                            },
-                        }),
-                    );
-                }
-                crate::storage::StorageState::Initialized => {
-                    send_response(
-                        response_socket,
-                        &serde_json::json!({
-                            "status": "success",
-                            "message": "Storage initialized. Please create the first admin user certificate and private key.",
-                            "data": {
-                                "state": "Initialized",
-                                "cert_path": app_config.blockchains.certificate_path.to_str().unwrap_or("N/A"),
-                                "key_path": app_config.blockchains.private_key_path.to_str().unwrap_or("N/A"),
-                                "crl_path": app_config.blockchains.crl_path.to_str().unwrap_or("N/A"),
-                                "Root CA Defaults": {
-                                    "common_name": app_config.root_ca_defaults.root_ca_common_name,
-                                    "organization": app_config.root_ca_defaults.root_ca_organization,
-                                    "organizational_unit": app_config.root_ca_defaults.root_ca_organizational_unit,
-                                    "locality": app_config.root_ca_defaults.root_ca_locality,
-                                    "state": app_config.root_ca_defaults.root_ca_state,
-                                    "country": app_config.root_ca_defaults.root_ca_country,
-                                    "validity_days": app_config.root_ca_defaults.root_ca_validity_days,
-                                }
-                            },
-                        }),
-                    );
-                }
-                crate::storage::StorageState::Ready => {
-                    send_response(
-                        response_socket,
-                        &serde_json::json!({
-                            "status": "success",
-                            "message": "Storage is ready. All operations are available.",
-                            "data": {
-                                "state": "Ready"
-                            }
-                        }),
-                    );
-                }
-                crate::storage::StorageState::Inconsistent => {
-                    send_response(
-                        response_socket,
-                        &serde_json::json!({
-                            "status": "error",
-                            "message": "Storage is in an inconsistent state. Please check the storage files and configuration.",
-                            "data": {
-                                "state": "Inconsistent"
-                            }
-                        }),
-                    );
-                }
-            }
+            let storage_state = crate::storage::get_state(&storage.app_config, 1);
+            send_response(
+                response_socket,
+                &serde_json::json!({
+                    "status": "success",
+                    "message": "Storage state retrieved successfully",
+                    "data": {
+                        "storage_state": serde_json::to_value(&storage_state).unwrap_or(serde_json::Value::Null),
+                    },
+                }),
+            );
         }
         _ => {}
     }
 }
 
-pub fn start_comm_server(app_config: crate::configs::AppConfig) {
-    let _ = std::fs::remove_file(&app_config.server.comm_sock); // Remove existing socket file if it exists
-    let listener = std::os::unix::net::UnixListener::bind(&app_config.server.comm_sock)
-        .expect("Failed to bind to socket");
-    println!(
-        "Communication server started at {}",
-        app_config.server.comm_sock.to_str().unwrap_or("N/A")
-    );
-    for stream in listener.incoming() {
-        match stream {
-            Ok(stream) => {
-                let app_config = app_config.clone();
-                std::thread::spawn(move || {
-                    recv_request(stream, app_config.clone());
-                });
-            }
-            Err(e) => {
-                eprintln!("Failed to accept connection: {}", e);
-            }
-        }
-    }
-}
-
 fn handle_setup_request(
     mut stream: std::os::unix::net::UnixStream,
-    storage: &crate::storage::Storage<crate::storage::Initialized>,
-) {
+    app_config: &crate::configs::AppConfig,
+    mut storage_status: crate::storage::StorageStatusResults,
+) -> anyhow::Result<crate::storage::StorageStatusResults> {
     let mut version_buffer = [0u8; 4];
     let mut length_buffer = [0u8; 4];
     match stream
@@ -278,14 +227,14 @@ fn handle_setup_request(
         .inspect_err(|e| tracing::error!(error = %e, "Failed to read version"))
     {
         Ok(_) => {}
-        Err(_) => return,
+        Err(_) => return Err(anyhow::anyhow!("Failed to read version")),
     }
     match stream
         .read_exact(&mut length_buffer)
         .inspect_err(|e| tracing::error!(error = %e, "Failed to read payload length"))
     {
         Ok(_) => {}
-        Err(_) => return,
+        Err(_) => return Err(anyhow::anyhow!("Failed to read payload length")),
     }
     let payload_length = u32::from_le_bytes(length_buffer) as usize;
     if payload_length > 10 * 1024 * 1024 {
@@ -293,7 +242,9 @@ fn handle_setup_request(
             payload_length,
             "Payload length exceeds maximum allowed size"
         );
-        return;
+        return Err(anyhow::anyhow!(
+            "Payload length exceeds maximum allowed size"
+        ));
     }
     let mut payload_buffer = vec![0u8; payload_length];
     match stream
@@ -301,19 +252,21 @@ fn handle_setup_request(
         .inspect_err(|e| tracing::error!(error = %e, "Failed to read payload data"))
     {
         Ok(_) => {}
-        Err(_) => return,
+        Err(_) => return Err(anyhow::anyhow!("Failed to read payload data")),
     }
     let request_json: serde_json::Value = match serde_json::from_slice(&payload_buffer)
         .inspect_err(|e| tracing::error!(error = %e, "Failed to parse request JSON"))
     {
         Ok(json) => json,
-        Err(_) => return,
+        Err(_) => return Err(anyhow::anyhow!("Failed to parse request JSON")),
     };
     let request_type = match request_json.get("request_type").and_then(|v| v.as_str()) {
         Some(rt) => rt,
         None => {
             tracing::error!("Request missing required field: request_type");
-            return;
+            return Err(anyhow::anyhow!(
+                "Request missing required field: request_type"
+            ));
         }
     };
     let response_sock = match request_json.get("response_socket").and_then(|v| v.as_str()) {
@@ -321,216 +274,282 @@ fn handle_setup_request(
             |e| tracing::error!(socket = s, error = %e, "Failed to connect to response socket"),
         ) {
             Ok(sock) => sock,
-            Err(_) => return,
+            Err(_) => return Err(anyhow::anyhow!("Failed to connect to response socket")),
         },
         None => {
             tracing::error!("Request missing required field: response_socket");
-            return;
+            return Err(anyhow::anyhow!(
+                "Request missing required field: response_socket"
+            ));
         }
     };
-    match request_type {
-        "AddAdmin" => {
-            let admin_cert_data = CertificateData {
-                subject_common_name: match request_json
-                    .pointer("/cert_data/subject_common_name")
-                    .and_then(|v| v.as_str())
-                {
-                    Some(s) => s.to_string(),
-                    None => {
-                        tracing::error!(
-                            "AddAdmin request missing required field: subject_common_name"
-                        );
-                        send_response(
-                            response_sock,
-                            &serde_json::json!({
-                                "status": "error",
-                                "message": "AddAdmin request missing required field: subject_common_name",
-                            }),
-                        );
-                        return;
-                    }
-                },
-                issuer_common_name: "Admin Intermediate CA".to_string(),
-                organization: match request_json
-                    .pointer("/cert_data/organization")
-                    .and_then(|v| v.as_str())
-                {
-                    Some(s) => s.to_string(),
-                    None => {
-                        tracing::error!("AddAdmin request missing required field: organization");
-                        send_response(
-                            response_sock,
-                            &serde_json::json!({
-                                "status": "error",
-                                "message": "AddAdmin request missing required field: organization",
-                            }),
-                        );
-                        return;
-                    }
-                },
-                organizational_unit: match request_json
-                    .pointer("/cert_data/organizational_unit")
-                    .and_then(|v| v.as_str())
-                {
-                    Some(s) => s.to_string(),
-                    None => {
-                        tracing::error!(
-                            "AddAdmin request missing required field: organizational_unit"
-                        );
-                        send_response(
-                            response_sock,
-                            &serde_json::json!({
-                                "status": "error",
-                                "message": "AddAdmin request missing required field: organizational_unit",
-                            }),
-                        );
-                        return;
-                    }
-                },
-                locality: match request_json
-                    .pointer("/cert_data/locality")
-                    .and_then(|v| v.as_str())
-                {
-                    Some(s) => s.to_string(),
-                    None => {
-                        tracing::error!("AddAdmin request missing required field: locality");
-                        send_response(
-                            response_sock,
-                            &serde_json::json!({
-                                "status": "error",
-                                "message": "AddAdmin request missing required field: locality",
-                            }),
-                        );
-                        return;
-                    }
-                },
-                state: match request_json
-                    .pointer("/cert_data/state")
-                    .and_then(|v| v.as_str())
-                {
-                    Some(s) => s.to_string(),
-                    None => {
-                        tracing::error!("AddAdmin request missing required field: state");
-                        send_response(
-                            response_sock,
-                            &serde_json::json!({
-                                "status": "error",
-                                "message": "AddAdmin request missing required field: state",
-                            }),
-                        );
-                        return;
-                    }
-                },
-                country: match request_json
-                    .pointer("/cert_data/country")
-                    .and_then(|v| v.as_str())
-                {
-                    Some(s) => s.to_string(),
-                    None => {
-                        tracing::error!("AddAdmin request missing required field: country");
-                        send_response(
-                            response_sock,
-                            &serde_json::json!({
-                                "status": "error",
-                                "message": "AddAdmin request missing required field: country",
-                            }),
-                        );
-                        return;
-                    }
-                },
-                validity_days: match request_json
-                    .pointer("/cert_data/validity_days")
-                    .and_then(|v| v.as_u64())
-                {
-                    Some(v) => v as u32,
-                    None => {
-                        tracing::error!("AddAdmin request missing required field: validity_days");
-                        send_response(
-                            response_sock,
-                            &serde_json::json!({
-                                "status": "error",
-                                "message": "AddAdmin request missing required field: validity_days",
-                            }),
-                        );
-                        return;
-                    }
-                },
-                cert_type: pki_generator::CertificateDataType::UserCert,
-                is_admin: true,
-            };
-            let (admin_cert, admin_key) = storage.add_admin_user(admin_cert_data);
-            let admin_cert_pem = match admin_cert.to_pem() {
-                Ok(pem) => pem,
-                Err(e) => {
-                    tracing::error!(error = %e, "Failed to convert admin certificate to PEM");
+    match storage_status.storage_state {
+        crate::storage::StorageState::Empty => {
+            tracing::info!("Storage state is Empty, proceeding to create and initialize storage");
+            match request_type {
+                "CreateAndInitialize" => {
+                    // Handle CreateAndInitialize request
+                    let storage = crate::storage::Storage {
+                        state: crate::storage_empty::Empty {},
+                        app_config: app_config.clone(),
+                    };
+                    storage.create_storage().initialize_storage();
+                    tracing::info!("Storage created and initialized successfully during setup");
+                    send_response(
+                        response_sock,
+                        &serde_json::json!({
+                            "status": "success",
+                            "message": "Storage created and initialized successfully",
+                        }),
+                    );
+                    storage_status.storage_state = crate::storage::StorageState::Initialized;
+                    return Ok(storage_status);
+                }
+                _ => {
+                    tracing::error!("Invalid request type for setup server: {}", request_type);
                     send_response(
                         response_sock,
                         &serde_json::json!({
                             "status": "error",
-                            "message": "Failed to convert admin certificate to PEM",
+                            "message": format!("Invalid request type for setup server: {}", request_type),
                         }),
                     );
-                    return;
+                    return Err(anyhow::anyhow!(
+                        "Invalid request type for setup server: {}",
+                        request_type
+                    ));
+                }
+            }
+        }
+        crate::storage::StorageState::Created => {
+            let storage = match crate::storage::get_created_storage(app_config) {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::error!(error = %e, "Failed to get created storage");
+                    return Err(anyhow::anyhow!("Failed to get created storage: {}", e));
                 }
             };
-            let admin_key_pem = match admin_key.private_key_to_pem_pkcs8() {
-                Ok(pem) => pem,
+            tracing::info!("Storage state is Created, proceeding to initialize storage");
+            let storage = match storage::get_created_storage(&storage.app_config) {
+                Ok(s) => s,
                 Err(e) => {
-                    tracing::error!(error = %e, "Failed to convert admin private key to PEM");
+                    tracing::error!(error = %e, "Failed to get created storage");
+                    return Err(anyhow::anyhow!("Failed to get created storage: {}", e));
+                }
+            };
+            match request_type {
+                "Initialize" => {
+                    // Handle Initialize request
+                    storage.initialize_storage();
+                    tracing::info!("Storage initialized successfully during setup");
+                    send_response(
+                        response_sock,
+                        &serde_json::json!({
+                            "status": "success",
+                            "message": "Storage initialized successfully",
+                        }),
+                    );
+                    storage_status.storage_state = crate::storage::StorageState::Initialized;
+                    return Ok(storage_status);
+                }
+                _ => {
+                    tracing::error!("Invalid request type for setup server: {}", request_type);
                     send_response(
                         response_sock,
                         &serde_json::json!({
                             "status": "error",
-                            "message": "Failed to convert admin private key to PEM",
+                            "message": format!("Invalid request type for setup server: {}", request_type),
                         }),
                     );
-                    return;
+                    return Err(anyhow::anyhow!(
+                        "Invalid request type for setup server: {}",
+                        request_type
+                    ));
                 }
-            };
+            }
+        }
+        crate::storage::StorageState::Inconsistent => {
+            tracing::error!("Storage state is Inconsistent, setup cannot proceed");
             send_response(
                 response_sock,
                 &serde_json::json!({
-                    "status": "success",
-                    "message": "Admin user certificate and private key created successfully",
-                    "data": {
-                        "certificate": String::from_utf8(admin_cert_pem).unwrap_or_else(|e| {
-                            tracing::error!(error = %e, "Failed to convert admin certificate PEM to string");
-                            "Failed to convert certificate PEM to string".to_string()
-                        }),
-                        "private_key": String::from_utf8(admin_key_pem).unwrap_or_else(|e| {
-                            tracing::error!(error = %e, "Failed to convert admin private key PEM to string");
-                            "Failed to convert private key PEM to string".to_string()
-                        }),
-                    },
+                    "status": "error",
+                    "message": "Storage state is Inconsistent, setup cannot proceed",
                 }),
             );
+            return Err(anyhow::anyhow!(
+                "Storage state is Inconsistent, setup cannot proceed"
+            ));
         }
-        _ => {
+        crate::storage::StorageState::Ready => {
             tracing::error!(
-                "In the Initialized state only AddAdmin request is allowed: {}",
-                request_type
+                "Setup functions cannot be performed in current storage state: {:?}",
+                storage_status.storage_state
             );
+            send_response(
+                response_sock,
+                &serde_json::json!({
+                    "status": "error",
+                    "message": format!("Setup functions cannot be performed in current storage state: {:?}. Please log in as the admin user to perform admin functions.", storage_status.storage_state)}),
+            );
+            return Err(anyhow::anyhow!(
+                "Cannot add admin user in current storage state"
+            ));
+        }
+        crate::storage::StorageState::Initialized => {
+            tracing::info!("Storage state is Initialized, proceeding to add admin user");
+            match request_type {
+                "AddFirstAdmin" => {
+                    // Handle AddFirstAdmin request
+                    let admin_cert_data = match pki_generator::parse_certificate_data_from_json(
+                        request_json.clone(),
+                    ) {
+                        Ok(data) => data,
+                        Err(e) => {
+                            tracing::error!(error = %e, "Failed to parse certificate data from JSON");
+                            return Err(anyhow::anyhow!(
+                                "Failed to parse certificate data from JSON: {}",
+                                e
+                            ));
+                        }
+                    };
+                    let storage = match crate::storage::get_initialized_storage(app_config) {
+                        Ok(s) => s,
+                        Err(e) => {
+                            tracing::error!(error = %e, "Failed to get initialized storage");
+                            return Err(anyhow::anyhow!(
+                                "Failed to get initialized storage: {}",
+                                e
+                            ));
+                        }
+                    };
+                    let (admin_cert, admin_key) = storage.add_admin_user(admin_cert_data);
+                    tracing::info!("Admin user added successfully during setup");
+                    send_response(
+                        response_sock,
+                        &serde_json::json!({
+                            "status": "success",
+                            "message": "Admin user added successfully",
+                            "data": {
+                                "admin_certificate": base64::engine::general_purpose::STANDARD.encode(admin_cert.to_der().unwrap_or_default()),
+                                "admin_private_key": base64::engine::general_purpose::STANDARD.encode(admin_key.private_key_to_der().unwrap_or_default()),
+                            },
+                        }),
+                    );
+                    storage_status.storage_state = crate::storage::StorageState::Ready;
+                    return Ok(storage_status);
+                }
+                _ => {
+                    tracing::error!("Invalid request type for setup server: {}", request_type);
+                    send_response(
+                        response_sock,
+                        &serde_json::json!({
+                            "status": "error",
+                            "message": format!("Invalid request type for setup server: {}", request_type),
+                        }),
+                    );
+                    return Err(anyhow::anyhow!(
+                        "Invalid request type for setup server: {}",
+                        request_type
+                    ));
+                }
+            }
         }
     }
 }
 
+pub fn start_api_server(
+    app_config: &crate::configs::AppConfig,
+    storage_status: crate::storage::StorageStatusResults,
+) -> crate::storage::StorageStatusResults {
+    let _ = std::fs::remove_file(&app_config.server.comm_sock); // Remove existing socket file if it exists
+    let listener = std::os::unix::net::UnixListener::bind(&app_config.server.comm_sock)
+        .expect("Failed to bind to socket");
+    println!(
+        "Communication server started at {}",
+        app_config.server.comm_sock.to_str().unwrap_or("N/A")
+    );
+    let storage = match crate::storage::get_ready_storage(app_config) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::error!(error = %e, "Failed to get ready storage");
+            std::process::exit(1);
+        }
+    };
+    let storage = get_api_storage(storage).expect("Failed to get API storage");
+    for stream in listener.incoming() {
+        match stream {
+            Ok(stream) => {
+                handle_api_request(stream, &storage);
+            }
+            Err(e) => {
+                eprintln!("Failed to accept connection: {}", e);
+            }
+        }
+    }
+    storage_status
+}
 pub fn start_setup_server(
-    app_config: crate::configs::AppConfig,
-    storage: &crate::storage::Storage<crate::storage::Initialized>,
-) {
-    let _ = std::fs::remove_file(&app_config.server.comm_sock);
-    let listener = std::os::unix::net::UnixListener::bind(&app_config.server.setup_sock)
+    app_config: &crate::configs::AppConfig,
+    storage_status: crate::storage::StorageStatusResults,
+) -> crate::storage::StorageStatusResults {
+    let _ = std::fs::remove_file(app_config.server.comm_sock.clone());
+    let listener = std::os::unix::net::UnixListener::bind(app_config.server.setup_sock.clone())
         .expect("Failed to bind to setup socket");
     tracing::info!(
         socket = app_config.server.setup_sock.to_str().unwrap_or("N/A"),
         "Setup server started"
     );
+    if storage_status.error_message.is_some() {
+        tracing::error!(
+            error = storage_status
+                .error_message
+                .as_ref()
+                .unwrap_or(&"Unknown error".to_string()),
+            "Failed to get storage state during setup"
+        );
+        return storage_status;
+    }
     for stream in listener.incoming() {
         match stream {
-            Ok(stream) => handle_setup_request(stream, storage),
+            Ok(stream) => {
+                let storage_status =
+                    match handle_setup_request(stream, app_config, storage_status.clone()) {
+                        Ok(status) => status,
+                        Err(e) => {
+                            tracing::error!(error = %e, "Failed to handle setup request");
+                            continue;
+                        }
+                    };
+                if storage_status.error_message.is_some() {
+                    tracing::error!(
+                        error = storage_status
+                            .error_message
+                            .as_ref()
+                            .unwrap_or(&"Unknown error".to_string()),
+                        "Error occurred during setup request handling"
+                    );
+                } else {
+                    tracing::info!(
+                        "Setup request handled successfully, updated storage status: {:?}",
+                        storage_status.storage_state
+                    );
+                    return storage_status;
+                }
+            }
             Err(e) => {
-                tracing::error!(error = %e, "Failed to accept connection");
+                tracing::error!(error = %e, "Failed to accept connection on setup socket");
             }
         }
     }
+    storage_status
+}
+
+pub fn start_repair_server(
+    app_config: &crate::configs::AppConfig,
+    storage_status: crate::storage::StorageStatusResults,
+) -> crate::storage::StorageStatusResults {
+    // For now, we will just log that the repair server is not implemented and return the same storage status
+    tracing::warn!("Repair server is not implemented yet, returning current storage status");
+    storage_status
 }
