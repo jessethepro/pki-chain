@@ -3,7 +3,10 @@ use openssl::hash::MessageDigest;
 use openssl::pkey::PKey;
 use openssl::rsa::Padding;
 use openssl::sign::{Signer, Verifier};
+use openssl::stack::Stack;
 use openssl::symm::Cipher;
+use openssl::x509::store::{X509Store, X509StoreBuilder};
+use openssl::x509::{X509PurposeId, X509StoreContext};
 
 /// Size of AES key length field in serialized format (u32 = 4 bytes)
 pub const AES_KEY_LEN_SIZE: usize = 4; // u32 for AES key length
@@ -379,4 +382,73 @@ pub fn get_app_private_key(
     let private_key = openssl::pkey::PKey::private_key_from_pem(private_key_pem.as_slice())
         .map_err(|e| anyhow::anyhow!("Failed to load private key from PEM: {}", e))?;
     Ok(private_key)
+}
+
+pub fn verify_certificate_signature(
+    user_cert: &openssl::x509::X509,
+    ca_cert: &openssl::x509::X509,
+) -> anyhow::Result<bool> {
+    let ca_public_key = ca_cert
+        .public_key()
+        .map_err(|e| anyhow::anyhow!("Failed to extract public key from CA certificate: {}", e))?;
+
+    verify_signature(
+        user_cert
+            .to_der()
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "Failed to serialize user certificate for signature verification: {}",
+                    e
+                )
+            })?
+            .as_slice(),
+        user_cert.signature().as_slice(),
+        ca_public_key,
+    )
+    .map_err(|e| anyhow::anyhow!("Signature verification failed: {}", e))
+}
+
+pub fn verify_client_auth_cert_chain(
+    store: &X509Store,
+    chain: &Stack<openssl::x509::X509>,
+    user_cert: &openssl::x509::X509,
+) -> bool {
+    let mut store_ctx = match X509StoreContext::new() {
+        Ok(ctx) => ctx,
+        Err(_) => return false,
+    };
+
+    store_ctx
+        .init(store, user_cert, chain, |ctx| ctx.verify_cert())
+        .unwrap_or(false)
+}
+
+pub fn add_intermediate_ca_to_stack(
+    intermediate_cert: &openssl::x509::X509,
+    mut chain: Stack<openssl::x509::X509>,
+) -> anyhow::Result<Stack<openssl::x509::X509>> {
+    chain
+        .push(intermediate_cert.to_owned())
+        .map_err(|e| anyhow!("Failed to add intermediate certificate to chain: {}", e))?;
+    Ok(chain)
+}
+
+pub fn build_client_auth_store_from_root_ca(
+    root_cert: &openssl::x509::X509,
+) -> anyhow::Result<X509Store> {
+    let mut store_builder = X509StoreBuilder::new()
+        .map_err(|e| anyhow!("Failed to create X509 store builder: {}", e))?;
+    store_builder
+        .set_purpose(X509PurposeId::SSL_CLIENT)
+        .map_err(|e| {
+            anyhow!(
+                "Failed to set certificate validation purpose to SSL client: {}",
+                e
+            )
+        })?;
+    store_builder
+        .add_cert(root_cert.to_owned())
+        .map_err(|e| anyhow!("Failed to add root certificate to trust store: {}", e))?;
+
+    Ok(store_builder.build())
 }

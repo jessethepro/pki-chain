@@ -241,7 +241,7 @@ pub struct Storage<State> {
     pub app_config: crate::configs::AppConfig,
 }
 
-#[derive(serde::Serialize, Debug, Clone)]
+#[derive(serde::Serialize, Debug, Clone, PartialEq, Eq)]
 pub enum StorageState {
     Empty,
     Created,
