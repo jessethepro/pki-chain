@@ -649,11 +649,19 @@ pub fn get_state(
 pub fn get_api_storage(
     storage: Storage<crate::storage_ready::Ready>,
 ) -> anyhow::Result<Storage<crate::storage_api::API>> {
+    let cert_store =
+        crate::encryption::build_client_auth_store_from_root_ca(&get_root_certificate(
+            &storage.state.certificate_chain,
+            crate::encryption::get_app_private_key(&storage.app_config)?,
+        )?)?;
     Ok(Storage {
         state: crate::storage_api::API {
             certificate_chain: storage.state.certificate_chain,
             private_key_chain: storage.state.private_key_chain,
             crl_chain: storage.state.crl_chain,
+            cert_store,
+            cert_user_intermediate_stack: openssl::stack::Stack::new()?,
+            cert_admin_intermediate_stack: openssl::stack::Stack::new()?,
         },
         app_config: storage.app_config.clone(),
     })

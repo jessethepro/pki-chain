@@ -408,6 +408,27 @@ pub fn verify_certificate_signature(
     .map_err(|e| anyhow::anyhow!("Signature verification failed: {}", e))
 }
 
+pub fn validate_intermediate_ca_against_root_ca(
+    intermediate_cert: &openssl::x509::X509,
+    root_cert: &openssl::x509::X509,
+) -> anyhow::Result<bool> {
+    if intermediate_cert
+        .issuer_name()
+        .try_cmp(root_cert.subject_name())
+        .map_err(|e| {
+            anyhow!(
+                "Failed to compare intermediate issuer with root subject: {}",
+                e
+            )
+        })?
+        != std::cmp::Ordering::Equal
+    {
+        return Ok(false);
+    }
+
+    verify_certificate_signature(intermediate_cert, root_cert)
+}
+
 pub fn verify_client_auth_cert_chain(
     store: &X509Store,
     chain: &Stack<openssl::x509::X509>,
