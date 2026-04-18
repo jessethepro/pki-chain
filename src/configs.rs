@@ -1,4 +1,4 @@
-use anyhow::{Context, Result};
+use anyhow::Result;
 use serde::Deserialize;
 use std::fs;
 use std::path::PathBuf;
@@ -44,12 +44,27 @@ pub struct RootCADefaults {
 impl AppConfig {
     /// Load configuration from a TOML file
     pub fn from_file(path: &str) -> Result<Self> {
-        let config_str =
-            fs::read_to_string(path).context(format!("Failed to read config file: {}", path))?;
+        let config_str = match fs::read_to_string(path) {
+            Ok(content) => content,
+            Err(e) => {
+                return Err(anyhow::anyhow!(
+                    "from_file -> Failed to read config file: {}: {}",
+                    path,
+                    e
+                ));
+            }
+        };
 
-        let config: AppConfig =
-            toml::from_str(&config_str).context("Failed to parse config file")?;
-
+        let config: AppConfig = match toml::from_str(&config_str) {
+            Ok(config) => config,
+            Err(e) => {
+                return Err(anyhow::anyhow!(
+                    "from_file -> Failed to parse config file: {}: {}",
+                    path,
+                    e
+                ));
+            }
+        };
         Ok(config)
     }
 

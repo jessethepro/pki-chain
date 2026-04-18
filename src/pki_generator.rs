@@ -45,10 +45,10 @@ pub fn parse_certificate_data_from_json(
             Some(s) => s.to_string(),
             None => {
                 tracing::error!(
-                    "AddFirstAdmin request missing required field: subject_common_name"
+                    "AddFirstAdmin -> request missing required field: subject_common_name"
                 );
                 return Err(anyhow::anyhow!(
-                    "AddFirstAdmin request missing required field: subject_common_name"
+                    "AddFirstAdmin -> request missing required field: subject_common_name"
                 ));
             }
         };
@@ -58,18 +58,20 @@ pub fn parse_certificate_data_from_json(
         {
             Some(s) => s.to_string(),
             None => {
-                tracing::error!("AddFirstAdmin request missing required field: issuer_common_name");
+                tracing::error!(
+                    "AddFirstAdmin -> request missing required field: issuer_common_name"
+                );
                 return Err(anyhow::anyhow!(
-                    "AddFirstAdmin request missing required field: issuer_common_name"
+                    "AddFirstAdmin -> request missing required field: issuer_common_name"
                 ));
             }
         };
         let organization = match request_json.get("organization").and_then(|v| v.as_str()) {
             Some(s) => s.to_string(),
             None => {
-                tracing::error!("AddFirstAdmin request missing required field: organization");
+                tracing::error!("AddFirstAdmin -> request missing required field: organization");
                 return Err(anyhow::anyhow!(
-                    "AddFirstAdmin request missing required field: organization"
+                    "AddFirstAdmin -> request missing required field: organization"
                 ));
             }
         };
@@ -80,46 +82,46 @@ pub fn parse_certificate_data_from_json(
             Some(s) => s.to_string(),
             None => {
                 tracing::error!(
-                    "AddFirstAdmin request missing required field: organizational_unit"
+                    "AddFirstAdmin -> request missing required field: organizational_unit"
                 );
                 return Err(anyhow::anyhow!(
-                    "AddFirstAdmin request missing required field: organizational_unit"
+                    "AddFirstAdmin -> request missing required field: organizational_unit"
                 ));
             }
         };
         let locality = match request_json.get("locality").and_then(|v| v.as_str()) {
             Some(s) => s.to_string(),
             None => {
-                tracing::error!("AddFirstAdmin request missing required field: locality");
+                tracing::error!("AddFirstAdmin -> request missing required field: locality");
                 return Err(anyhow::anyhow!(
-                    "AddFirstAdmin request missing required field: locality"
+                    "AddFirstAdmin -> request missing required field: locality"
                 ));
             }
         };
         let state = match request_json.get("state").and_then(|v| v.as_str()) {
             Some(s) => s.to_string(),
             None => {
-                tracing::error!("AddFirstAdmin request missing required field: state");
+                tracing::error!("AddFirstAdmin -> request missing required field: state");
                 return Err(anyhow::anyhow!(
-                    "AddFirstAdmin request missing required field: state"
+                    "AddFirstAdmin -> request missing required field: state"
                 ));
             }
         };
         let country = match request_json.get("country").and_then(|v| v.as_str()) {
             Some(s) => s.to_string(),
             None => {
-                tracing::error!("AddFirstAdmin request missing required field: country");
+                tracing::error!("AddFirstAdmin -> request missing required field: country");
                 return Err(anyhow::anyhow!(
-                    "AddFirstAdmin request missing required field: country"
+                    "AddFirstAdmin -> request missing required field: country"
                 ));
             }
         };
         let validity_days = match request_json.get("validity_days").and_then(|v| v.as_u64()) {
             Some(vd) => vd as u32,
             None => {
-                tracing::error!("AddFirstAdmin request missing required field: validity_days");
+                tracing::error!("AddFirstAdmin -> request missing required field: validity_days");
                 return Err(anyhow::anyhow!(
-                    "AddFirstAdmin request missing required field: validity_days"
+                    "AddFirstAdmin -> request missing required field: validity_days"
                 ));
             }
         };
@@ -138,16 +140,38 @@ pub fn parse_certificate_data_from_json(
     }();
     match admin_cert_data {
         Ok(data) => Ok(data),
-        Err(e) => Err(anyhow!("Failed to parse certificate data from JSON: {}", e)),
+        Err(e) => {
+            tracing::error!(error = %e, "AddFirstAdmin -> Failed to parse certificate data from JSON");
+            Err(anyhow!(
+                "AddFirstAdmin -> Failed to parse certificate data from JSON: {}",
+                e
+            ))
+        }
     }
 }
 
 pub fn generate_root_ca(cert_data: CertificateData) -> Result<(PKey<Private>, X509)> {
     // Generate RSA key pair
-    let rsa = openssl::rsa::Rsa::generate(RSA_KEY_SIZE_DEFAULT)
-        .map_err(|e| anyhow!("Failed to generate RSA keypair: {}", e))?;
-    let private_key =
-        PKey::from_rsa(rsa).map_err(|e| anyhow!("Failed to create private key: {}", e))?;
+    let rsa = match openssl::rsa::Rsa::generate(RSA_KEY_SIZE_DEFAULT) {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::error!(error = %e, "generate_root_ca -> Failed to generate RSA keypair");
+            return Err(anyhow!(
+                "generate_root_ca -> Failed to generate RSA keypair: {}",
+                e
+            ));
+        }
+    };
+    let private_key = match PKey::from_rsa(rsa) {
+        Ok(pk) => pk,
+        Err(e) => {
+            tracing::error!(error = %e, "generate_root_ca -> Failed to create private key");
+            return Err(anyhow!(
+                "generate_root_ca -> Failed to create private key: {}",
+                e
+            ));
+        }
+    };
 
     generate_key_pair(cert_data, &private_key)
 }
@@ -160,111 +184,319 @@ pub fn generate_key_pair(
         CertificateDataType::RootCA => signing_key.clone(), // Self signed. Private key is the signing key
         _ => {
             // Generate RSA key pair
-            let rsa = openssl::rsa::Rsa::generate(RSA_KEY_SIZE_DEFAULT)
-                .map_err(|e| anyhow!("Failed to generate RSA keypair: {}", e))?;
-            PKey::from_rsa(rsa).map_err(|e| anyhow!("Failed to create private key: {}", e))?
+            let rsa = match openssl::rsa::Rsa::generate(RSA_KEY_SIZE_DEFAULT) {
+                Ok(r) => r,
+                Err(e) => {
+                    tracing::error!(error = %e, "generate_key_pair -> Failed to generate RSA keypair");
+                    return Err(anyhow!(
+                        "generate_key_pair -> Failed to generate RSA keypair: {}",
+                        e
+                    ));
+                }
+            };
+            match PKey::from_rsa(rsa) {
+                Ok(pk) => pk,
+                Err(e) => {
+                    tracing::error!(error = %e, "generate_key_pair -> Failed to create private key");
+                    return Err(anyhow!(
+                        "generate_key_pair -> Failed to create private key: {}",
+                        e
+                    ));
+                }
+            }
         }
     };
     // Build X509 certificate
-    let mut builder =
-        X509::builder().map_err(|e| anyhow!("Failed to create X509 builder: {}", e))?;
+    let mut builder = match X509::builder() {
+        Ok(b) => b,
+        Err(e) => {
+            tracing::error!(error = %e, "generate_key_pair -> Failed to create X509 builder");
+            return Err(anyhow!(
+                "generate_key_pair -> Failed to create X509 builder: {}",
+                e
+            ));
+        }
+    };
 
-    builder
-        .set_version(X509_VERSION_3)
-        .map_err(|e| anyhow!("Failed to set version: {}", e))?;
+    match builder.set_version(X509_VERSION_3) {
+        Ok(_) => {}
+        Err(e) => {
+            tracing::error!(error = %e, "generate_key_pair -> Failed to set version");
+            return Err(anyhow!("generate_key_pair -> Failed to set version: {}", e));
+        }
+    }
 
     // Generate random 128-bit (16-byte) serial number
-    let mut serial = BigNum::new()?;
-    serial.rand(128, MsbOption::MAYBE_ZERO, false)?;
-    let asn1_serial = serial.to_asn1_integer()?;
-    builder.set_serial_number(&asn1_serial)?;
+    let mut serial = match BigNum::new() {
+        Ok(bn) => bn,
+        Err(e) => {
+            tracing::error!(error = %e, "generate_key_pair -> Failed to create BigNum");
+            return Err(anyhow!(
+                "generate_key_pair -> Failed to create BigNum: {}",
+                e
+            ));
+        }
+    };
+    if let Err(e) = serial.rand(128, MsbOption::MAYBE_ZERO, false) {
+        tracing::error!(error = %e, "generate_key_pair -> Failed to generate random serial number");
+        return Err(anyhow!(
+            "generate_key_pair -> Failed to generate random serial number: {}",
+            e
+        ));
+    }
+    let asn1_serial = match serial.to_asn1_integer() {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::error!(error = %e, "generate_key_pair -> Failed to convert serial number to ASN1 integer");
+            return Err(anyhow!(
+                "generate_key_pair -> Failed to convert serial number to ASN1 integer: {}",
+                e
+            ));
+        }
+    };
+    if let Err(e) = builder.set_serial_number(&asn1_serial) {
+        tracing::error!(error = %e, "generate_key_pair -> Failed to set serial number");
+        return Err(anyhow!(
+            "generate_key_pair -> Failed to set serial number: {}",
+            e
+        ));
+    }
 
     // Build subject/issuer name
-    let mut name_builder = openssl::x509::X509Name::builder()
-        .map_err(|e| anyhow!("Failed to create name builder: {}", e))?;
-    name_builder
-        .append_entry_by_nid(
-            openssl::nid::Nid::COMMONNAME,
-            &cert_data.subject_common_name,
-        )
-        .map_err(|e| anyhow!("Failed to set CN: {}", e))?;
-
-    name_builder
+    let mut name_builder = match openssl::x509::X509Name::builder() {
+        Ok(b) => b,
+        Err(e) => {
+            tracing::error!(error = %e, "generate_key_pair -> Failed to create name builder");
+            return Err(anyhow!(
+                "generate_key_pair -> Failed to create name builder: {}",
+                e
+            ));
+        }
+    };
+    match name_builder.append_entry_by_nid(
+        openssl::nid::Nid::COMMONNAME,
+        &cert_data.subject_common_name,
+    ) {
+        Ok(_) => {}
+        Err(e) => {
+            tracing::error!(error = %e, "generate_key_pair -> Failed to set common name");
+            return Err(anyhow!(
+                "generate_key_pair -> Failed to set common name: {}",
+                e
+            ));
+        }
+    }
+    match name_builder
         .append_entry_by_nid(openssl::nid::Nid::ORGANIZATIONNAME, &cert_data.organization)
-        .map_err(|e| anyhow!("Failed to set organization: {}", e))?;
+    {
+        Ok(_) => {}
+        Err(e) => {
+            tracing::error!(error = %e, "generate_key_pair -> Failed to set organization");
+            return Err(anyhow!(
+                "generate_key_pair -> Failed to set organization: {}",
+                e
+            ));
+        }
+    }
+    match name_builder.append_entry_by_nid(
+        openssl::nid::Nid::ORGANIZATIONALUNITNAME,
+        &cert_data.organizational_unit,
+    ) {
+        Ok(_) => {}
+        Err(e) => {
+            tracing::error!(error = %e, "generate_key_pair -> Failed to set organizational unit");
+            return Err(anyhow!(
+                "generate_key_pair -> Failed to set organizational unit: {}",
+                e
+            ));
+        }
+    }
 
-    name_builder
-        .append_entry_by_nid(
-            openssl::nid::Nid::ORGANIZATIONALUNITNAME,
-            &cert_data.organizational_unit,
-        )
-        .map_err(|e| anyhow!("Failed to set organizational unit: {}", e))?;
-
-    name_builder
-        .append_entry_by_nid(openssl::nid::Nid::LOCALITYNAME, &cert_data.locality)
-        .map_err(|e| anyhow!("Failed to set locality: {}", e))?;
-
-    name_builder
-        .append_entry_by_nid(openssl::nid::Nid::STATEORPROVINCENAME, &cert_data.state)
-        .map_err(|e| anyhow!("Failed to set state/province: {}", e))?;
-
-    name_builder
-        .append_entry_by_nid(openssl::nid::Nid::COUNTRYNAME, &cert_data.country)
-        .map_err(|e| anyhow!("Failed to set country: {}", e))?;
+    match name_builder.append_entry_by_nid(openssl::nid::Nid::LOCALITYNAME, &cert_data.locality) {
+        Ok(_) => {}
+        Err(e) => {
+            tracing::error!(error = %e, "generate_key_pair -> Failed to set locality");
+            return Err(anyhow!(
+                "generate_key_pair -> Failed to set locality: {}",
+                e
+            ));
+        }
+    }
+    match name_builder.append_entry_by_nid(openssl::nid::Nid::STATEORPROVINCENAME, &cert_data.state)
+    {
+        Ok(_) => {}
+        Err(e) => {
+            tracing::error!(error = %e, "generate_key_pair -> Failed to set state/province");
+            return Err(anyhow!(
+                "generate_key_pair -> Failed to set state/province: {}",
+                e
+            ));
+        }
+    }
+    match name_builder.append_entry_by_nid(openssl::nid::Nid::COUNTRYNAME, &cert_data.country) {
+        Ok(_) => {}
+        Err(e) => {
+            tracing::error!(error = %e, "generate_key_pair -> Failed to set country");
+            return Err(anyhow!("generate_key_pair -> Failed to set country: {}", e));
+        }
+    }
 
     let subject_name = name_builder.build();
 
     builder
         .set_subject_name(&subject_name)
-        .map_err(|e| anyhow!("Failed to set subject: {}", e))?;
+        .map_err(|e| anyhow!("AddFirstAdmin -> Failed to set subject: {}", e))?;
 
     // Build issuer name (different from subject unless self-signed)
-    let mut issuer_name_builder = openssl::x509::X509Name::builder()
-        .map_err(|e| anyhow!("Failed to create issuer name builder: {}", e))?;
-    issuer_name_builder
+    let mut issuer_name_builder = match openssl::x509::X509Name::builder() {
+        Ok(b) => b,
+        Err(e) => {
+            tracing::error!(error = %e, "generate_key_pair -> Failed to create issuer name builder");
+            return Err(anyhow!(
+                "generate_key_pair -> Failed to create issuer name builder: {}",
+                e
+            ));
+        }
+    };
+    match issuer_name_builder
         .append_entry_by_nid(openssl::nid::Nid::COMMONNAME, &cert_data.issuer_common_name)
-        .map_err(|e| anyhow!("Failed to set issuer CN: {}", e))?;
-    issuer_name_builder
+    {
+        Ok(_) => {}
+        Err(e) => {
+            tracing::error!(error = %e, "generate_key_pair -> Failed to set issuer CN");
+            return Err(anyhow!(
+                "generate_key_pair -> Failed to set issuer CN: {}",
+                e
+            ));
+        }
+    }
+    match issuer_name_builder
         .append_entry_by_nid(openssl::nid::Nid::ORGANIZATIONNAME, &cert_data.organization)
-        .map_err(|e| anyhow!("Failed to set issuer organization: {}", e))?;
-    issuer_name_builder
-        .append_entry_by_nid(
-            openssl::nid::Nid::ORGANIZATIONALUNITNAME,
-            &cert_data.organizational_unit,
-        )
-        .map_err(|e| anyhow!("Failed to set issuer organizational unit: {}", e))?;
-    issuer_name_builder
+    {
+        Ok(_) => {}
+        Err(e) => {
+            tracing::error!(error = %e, "generate_key_pair -> Failed to set issuer organization");
+            return Err(anyhow!(
+                "generate_key_pair -> Failed to set issuer organization: {}",
+                e
+            ));
+        }
+    }
+    match issuer_name_builder.append_entry_by_nid(
+        openssl::nid::Nid::ORGANIZATIONALUNITNAME,
+        &cert_data.organizational_unit,
+    ) {
+        Ok(_) => {}
+        Err(e) => {
+            tracing::error!(error = %e, "generate_key_pair -> Failed to set issuer organizational unit");
+            return Err(anyhow!(
+                "generate_key_pair -> Failed to set issuer organizational unit: {}",
+                e
+            ));
+        }
+    }
+    match issuer_name_builder
         .append_entry_by_nid(openssl::nid::Nid::LOCALITYNAME, &cert_data.locality)
-        .map_err(|e| anyhow!("Failed to set issuer locality: {}", e))?;
-    issuer_name_builder
+    {
+        Ok(_) => {}
+        Err(e) => {
+            tracing::error!(error = %e, "generate_key_pair -> Failed to set issuer locality");
+            return Err(anyhow!(
+                "generate_key_pair -> Failed to set issuer locality: {}",
+                e
+            ));
+        }
+    }
+    match issuer_name_builder
         .append_entry_by_nid(openssl::nid::Nid::STATEORPROVINCENAME, &cert_data.state)
-        .map_err(|e| anyhow!("Failed to set issuer state/province: {}", e))?;
-    issuer_name_builder
+    {
+        Ok(_) => {}
+        Err(e) => {
+            tracing::error!(error = %e, "generate_key_pair -> Failed to set issuer state/province");
+            return Err(anyhow!(
+                "generate_key_pair -> Failed to set issuer state/province: {}",
+                e
+            ));
+        }
+    }
+    match issuer_name_builder
         .append_entry_by_nid(openssl::nid::Nid::COUNTRYNAME, &cert_data.country)
-        .map_err(|e| anyhow!("Failed to set issuer country: {}", e))?;
-
+    {
+        Ok(_) => {}
+        Err(e) => {
+            tracing::error!(error = %e, "generate_key_pair -> Failed to set issuer country");
+            return Err(anyhow!(
+                "generate_key_pair -> Failed to set issuer country: {}",
+                e
+            ));
+        }
+    }
     let issuer_name = issuer_name_builder.build();
-    builder
-        .set_issuer_name(&issuer_name)
-        .map_err(|e| anyhow!("Failed to set issuer: {}", e))?;
+    match builder.set_issuer_name(&issuer_name) {
+        Ok(_) => {}
+        Err(e) => {
+            tracing::error!(error = %e, "generate_key_pair -> Failed to set issuer name");
+            return Err(anyhow!(
+                "generate_key_pair -> Failed to set issuer name: {}",
+                e
+            ));
+        }
+    }
 
     // Set validity period
-    let not_before = openssl::asn1::Asn1Time::days_from_now(0)
-        .map_err(|e| anyhow!("Failed to create not_before: {}", e))?;
-    builder
-        .set_not_before(&not_before)
-        .map_err(|e| anyhow!("Failed to set not_before: {}", e))?;
+    let not_before = match openssl::asn1::Asn1Time::days_from_now(0) {
+        Ok(time) => time,
+        Err(e) => {
+            tracing::error!(error = %e, "generate_key_pair -> Failed to create not_before");
+            return Err(anyhow!(
+                "generate_key_pair -> Failed to create not_before: {}",
+                e
+            ));
+        }
+    };
+    match builder.set_not_before(&not_before) {
+        Ok(_) => {}
+        Err(e) => {
+            tracing::error!(error = %e, "generate_key_pair -> Failed to set not_before");
+            return Err(anyhow!(
+                "generate_key_pair -> Failed to set not_before: {}",
+                e
+            ));
+        }
+    }
 
-    let not_after = openssl::asn1::Asn1Time::days_from_now(cert_data.validity_days)
-        .map_err(|e| anyhow!("Failed to create not_after: {}", e))?;
-    builder
-        .set_not_after(&not_after)
-        .map_err(|e| anyhow!("Failed to set not_after: {}", e))?;
+    let not_after = match openssl::asn1::Asn1Time::days_from_now(cert_data.validity_days) {
+        Ok(time) => time,
+        Err(e) => {
+            tracing::error!(error = %e, "generate_key_pair -> Failed to create not_after");
+            return Err(anyhow!(
+                "generate_key_pair -> Failed to create not_after: {}",
+                e
+            ));
+        }
+    };
+    match builder.set_not_after(&not_after) {
+        Ok(_) => {}
+        Err(e) => {
+            tracing::error!(error = %e, "generate_key_pair -> Failed to set not_after");
+            return Err(anyhow!(
+                "generate_key_pair -> Failed to set not_after: {}",
+                e
+            ));
+        }
+    }
 
     // Set public key (extracted from private_key automatically)
-    builder
-        .set_pubkey(&private_key)
-        .map_err(|e| anyhow!("Failed to set public key: {}", e))?;
+    match builder.set_pubkey(&private_key) {
+        Ok(_) => {}
+        Err(e) => {
+            tracing::error!(error = %e, "generate_key_pair -> Failed to set public key");
+            return Err(anyhow!(
+                "generate_key_pair -> Failed to set public key: {}",
+                e
+            ));
+        }
+    }
 
     // Add Basic Constraints extension
     match cert_data.cert_type {
@@ -280,27 +512,62 @@ pub fn generate_key_pair(
                 }
                 _ => {}
             }
-            let extension = bc
-                .build()
-                .map_err(|e| anyhow!("Failed to build BasicConstraints: {}", e))?;
-            builder
-                .append_extension(extension)
-                .map_err(|e| anyhow!("Failed to add BasicConstraints: {}", e))?;
+            let extension = match bc.build() {
+                Ok(ext) => ext,
+                Err(e) => {
+                    tracing::error!(error = %e, "generate_key_pair -> Failed to build BasicConstraints");
+                    return Err(anyhow!(
+                        "generate_key_pair -> Failed to build BasicConstraints: {}",
+                        e
+                    ));
+                }
+            };
+            match builder.append_extension(extension) {
+                Ok(_) => {}
+                Err(e) => {
+                    tracing::error!(error = %e, "generate_key_pair -> Failed to add BasicConstraints");
+                    return Err(anyhow!(
+                        "generate_key_pair -> Failed to add BasicConstraints: {}",
+                        e
+                    ));
+                }
+            }
             // Add Key Usage extension
             let mut ku = KeyUsage::new();
             ku.critical();
             ku.key_cert_sign();
             ku.crl_sign();
             ku.digital_signature();
-            let ku_extension = ku
-                .build()
-                .map_err(|e| anyhow!("Failed to build KeyUsage: {}", e))?;
-            builder
-                .append_extension(ku_extension)
-                .map_err(|e| anyhow!("Failed to add KeyUsage: {}", e))?;
-            builder
-                .sign(&signing_key, MessageDigest::sha256())
-                .map_err(|e| anyhow!("Failed to sign certificate: {}", e))?;
+            let ku_extension = match ku.build() {
+                Ok(ext) => ext,
+                Err(e) => {
+                    tracing::error!(error = %e, "generate_key_pair -> Failed to build KeyUsage");
+                    return Err(anyhow!(
+                        "generate_key_pair -> Failed to build KeyUsage: {}",
+                        e
+                    ));
+                }
+            };
+            match builder.append_extension(ku_extension) {
+                Ok(_) => {}
+                Err(e) => {
+                    tracing::error!(error = %e, "generate_key_pair -> Failed to add KeyUsage");
+                    return Err(anyhow!(
+                        "generate_key_pair -> Failed to add KeyUsage: {}",
+                        e
+                    ));
+                }
+            }
+            match builder.sign(&signing_key, MessageDigest::sha256()) {
+                Ok(_) => {}
+                Err(e) => {
+                    tracing::error!(error = %e, "generate_key_pair -> Failed to sign certificate");
+                    return Err(anyhow!(
+                        "generate_key_pair -> Failed to sign certificate: {}",
+                        e
+                    ));
+                }
+            }
         }
         CertificateDataType::UserCert => {
             let mut bc = BasicConstraints::new();
@@ -311,46 +578,106 @@ pub fn generate_key_pair(
             ku.non_repudiation(); // For non-repudiation
             ku.key_encipherment(); // For encrypting symmetric keys
             ku.data_encipherment(); // For encrypting data directly
-            let ku_extension = ku
-                .build()
-                .map_err(|e| anyhow!("Failed to build KeyUsage: {}", e))?;
-            builder
-                .append_extension(ku_extension)
-                .map_err(|e| anyhow!("Failed to add KeyUsage: {}", e))?;
+            let ku_extension = match ku.build() {
+                Ok(ext) => ext,
+                Err(e) => {
+                    tracing::error!(error = %e, "generate_key_pair -> Failed to build KeyUsage");
+                    return Err(anyhow!(
+                        "generate_key_pair -> Failed to build KeyUsage: {}",
+                        e
+                    ));
+                }
+            };
+            match builder.append_extension(ku_extension) {
+                Ok(_) => {}
+                Err(e) => {
+                    tracing::error!(error = %e, "generate_key_pair -> Failed to add KeyUsage");
+                    return Err(anyhow!(
+                        "generate_key_pair -> Failed to add KeyUsage: {}",
+                        e
+                    ));
+                }
+            }
 
             // Admin status is encoded in the OU field during certificate creation
             // Admin certificates have " Admin" suffix in their OU field
             // This is checked during login in webserver.rs
 
-            builder
-                .sign(&signing_key, MessageDigest::sha256())
-                .map_err(|e| anyhow!("Failed to sign certificate: {}", e))?;
+            match builder.sign(&signing_key, MessageDigest::sha256()) {
+                Ok(_) => {}
+                Err(e) => {
+                    tracing::error!(error = %e, "generate_key_pair -> Failed to sign certificate");
+                    return Err(anyhow!(
+                        "generate_key_pair -> Failed to sign certificate: {}",
+                        e
+                    ));
+                }
+            }
         }
         CertificateDataType::TlsCert => {
             // Add Key Usage extension for TLS/HTTPS server certificate
-            let ku = KeyUsage::new()
+            let ku = match KeyUsage::new()
                 .critical()
                 .digital_signature() // For TLS handshakes and signatures
                 .key_encipherment() // For RSA key exchange in TLS
                 .build()
-                .map_err(|e| anyhow!("Failed to build KeyUsage: {}", e))?;
-            builder
-                .append_extension(ku)
-                .map_err(|e| anyhow!("Failed to add KeyUsage: {}", e))?;
+            {
+                Ok(ext) => ext,
+                Err(e) => {
+                    tracing::error!(error = %e, "generate_key_pair -> Failed to build KeyUsage");
+                    return Err(anyhow!(
+                        "generate_key_pair -> Failed to build KeyUsage: {}",
+                        e
+                    ));
+                }
+            };
+            match builder.append_extension(ku) {
+                Ok(_) => {}
+                Err(e) => {
+                    tracing::error!(error = %e, "generate_key_pair -> Failed to add KeyUsage");
+                    return Err(anyhow!(
+                        "generate_key_pair -> Failed to add KeyUsage: {}",
+                        e
+                    ));
+                }
+            }
 
             // Add Extended Key Usage: serverAuth (required for TLS/HTTPS servers)
-            let eku = ExtendedKeyUsage::new()
+            let eku = match ExtendedKeyUsage::new()
                 .server_auth() // Explicitly mark as TLS server certificate
                 .build()
-                .map_err(|e| anyhow!("Failed to build ExtendedKeyUsage: {}", e))?;
-            builder
-                .append_extension(eku)
-                .map_err(|e| anyhow!("Failed to add ExtendedKeyUsage: {}", e))?;
+            {
+                Ok(ext) => ext,
+                Err(e) => {
+                    tracing::error!(error = %e, "generate_key_pair -> Failed to build ExtendedKeyUsage");
+                    return Err(anyhow!(
+                        "generate_key_pair -> Failed to build ExtendedKeyUsage: {}",
+                        e
+                    ));
+                }
+            };
+            match builder.append_extension(eku) {
+                Ok(_) => {}
+                Err(e) => {
+                    tracing::error!(error = %e, "generate_key_pair -> Failed to add ExtendedKeyUsage");
+                    return Err(anyhow!(
+                        "generate_key_pair -> Failed to add ExtendedKeyUsage: {}",
+                        e
+                    ));
+                }
+            }
 
             // Sign with intermediate CA's private key
-            builder
-                .sign(&signing_key, MessageDigest::sha256())
-                .map_err(|e| anyhow!("Failed to sign certificate: {}", e))?;
+            match builder.sign(&signing_key, MessageDigest::sha256()) {
+                Ok(_) => {}
+                Err(e) => {
+                    tracing::error!(error = %e, "generate_key_pair -> Failed to sign certificate");
+                    return Err(anyhow!(
+                        "generate_key_pair -> Failed to sign certificate: {}",
+                        e
+                    ));
+                }
+            }
         }
     }
     let x509_certificate = builder.build();

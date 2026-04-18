@@ -15,7 +15,7 @@ impl crate::storage::Storage<Initialized> {
         let app_key = match crate::encryption::get_app_private_key(&self.app_config) {
             Ok(key) => key,
             Err(e) => {
-                tracing::error!(error = %e, "Storage<Initialized>: Failed to get app private key.");
+                tracing::error!(error = %e, "add_admin_user -> Failed to get app private key.");
                 std::process::exit(1);
             }
         };
@@ -25,7 +25,7 @@ impl crate::storage::Storage<Initialized> {
         ) {
             Ok(key) => key,
             Err(e) => {
-                tracing::error!(error = %e, "Storage<Initialized>: Failed to get root private key.");
+                tracing::error!(error = %e, "add_admin_user -> Failed to get root private key.");
                 std::process::exit(1);
             }
         };
@@ -56,14 +56,14 @@ impl crate::storage::Storage<Initialized> {
             ) {
                 Ok((key, cert)) => (key, cert),
                 Err(e) => {
-                    tracing::error!(error = %e, "Storage<Initialized>: Failed to generate admin intermediate key pair.");
+                    tracing::error!(error = %e, "add_admin_user -> Failed to generate admin intermediate key pair.");
                     std::process::exit(1);
                 }
             };
         let app_pub_key = match crate::encryption::get_app_public_key(&self.app_config.clone()) {
             Ok(key) => key,
             Err(e) => {
-                tracing::error!(error = %e, "Storage<Initialized>: Failed to get app public key.");
+                tracing::error!(error = %e, "add_admin_user -> Failed to get app public key.");
                 std::process::exit(1);
             }
         };
@@ -72,7 +72,7 @@ impl crate::storage::Storage<Initialized> {
                 &match admin_intermediate_cert.to_der() {
                     Ok(data) => data,
                     Err(e) => {
-                        tracing::error!(error = %e, "Storage<Initialized>: Failed to convert admin intermediate certificate to DER.");
+                        tracing::error!(error = %e, "add_admin_user -> Failed to convert admin intermediate certificate to DER.");
                         std::process::exit(1);
                     }
                 },
@@ -81,7 +81,7 @@ impl crate::storage::Storage<Initialized> {
             ) {
                 Ok(data) => data,
                 Err(e) => {
-                    tracing::error!(error = %e, "Storage<Initialized>: Failed to encrypt admin intermediate certificate.");
+                    tracing::error!(error = %e, "add_admin_user -> Failed to encrypt admin intermediate certificate.");
                     std::process::exit(1);
                 }
             };
@@ -91,7 +91,7 @@ impl crate::storage::Storage<Initialized> {
         ) {
             Ok(height) => height,
             Err(e) => {
-                tracing::error!(error = %e, "Storage<Initialized>: Failed to add admin intermediate certificate to chain.");
+                tracing::error!(error = %e, "add_admin_user -> Failed to add admin intermediate certificate to chain.");
                 std::process::exit(1);
             }
         };
@@ -99,7 +99,7 @@ impl crate::storage::Storage<Initialized> {
             &match admin_intermediate_key.private_key_to_der() {
                 Ok(data) => data,
                 Err(e) => {
-                    tracing::error!(error = %e, "Storage<Initialized>: Failed to convert admin intermediate private key to DER.");
+                    tracing::error!(error = %e, "add_admin_user -> Failed to convert admin intermediate private key to DER.");
                     std::process::exit(1);
                 }
             },
@@ -107,7 +107,7 @@ impl crate::storage::Storage<Initialized> {
         ) {
             Ok(data) => data,
             Err(e) => {
-                tracing::error!(error = %e, "Storage<Initialized>: Failed to encrypt admin intermediate private key.");
+                tracing::error!(error = %e, "add_admin_user -> Failed to encrypt admin intermediate private key.");
                 std::process::exit(1);
             }
         };
@@ -118,7 +118,7 @@ impl crate::storage::Storage<Initialized> {
         {
             Ok(height) => height,
             Err(e) => {
-                tracing::error!(error = %e, "Storage<Initialized>: Failed to add admin intermediate private key to chain.");
+                tracing::error!(error = %e, "add_admin_user -> Failed to add admin intermediate private key to chain.");
                 std::process::exit(1);
             }
         };
@@ -126,14 +126,14 @@ impl crate::storage::Storage<Initialized> {
             match self.state.certificate_chain.delete_last_block() {
                 Ok(_) => (),
                 Err(e) => {
-                    tracing::error!(error = %e, "Storage<Initialized>: Failed to delete last block from certificate chain.");
+                    tracing::error!(error = %e, "add_admin_user -> Failed to delete last block from certificate chain.");
                     std::process::exit(1);
                 }
             }
             match self.state.private_key_chain.delete_last_block() {
                 Ok(_) => (),
                 Err(e) => {
-                    tracing::error!(error = %e, "Storage<Initialized>: Failed to delete last block from private key chain.");
+                    tracing::error!(error = %e, "add_admin_user -> Failed to delete last block from private key chain.");
                     std::process::exit(1);
                 }
             }
@@ -144,7 +144,7 @@ impl crate::storage::Storage<Initialized> {
         ) {
             Ok((key, cert)) => (key, cert),
             Err(e) => {
-                tracing::error!(error = %e, "Storage<Initialized>: Failed to generate admin user key pair.");
+                tracing::error!(error = %e, "add_admin_user -> Failed to generate admin user key pair.");
                 std::process::exit(1);
             }
         };
@@ -153,7 +153,7 @@ impl crate::storage::Storage<Initialized> {
                 &match admin_user_cert.to_der() {
                     Ok(data) => data,
                     Err(e) => {
-                        tracing::error!(error = %e, "Storage<Initialized>: Failed to convert admin user certificate to DER.");
+                        tracing::error!(error = %e, "add_admin_user -> Failed to convert admin user certificate to DER.");
                         std::process::exit(1);
                     }
                 },
@@ -162,7 +162,7 @@ impl crate::storage::Storage<Initialized> {
             ) {
                 Ok(data) => data,
                 Err(e) => {
-                    tracing::error!(error = %e, "Storage<Initialized>: Failed to encrypt admin user certificate.");
+                    tracing::error!(error = %e, "add_admin_user -> Failed to encrypt admin user certificate.");
                     std::process::exit(1);
                 }
             };
@@ -170,7 +170,7 @@ impl crate::storage::Storage<Initialized> {
             &match admin_user_key.private_key_to_der() {
                 Ok(data) => data,
                 Err(e) => {
-                    tracing::error!(error = %e, "Storage<Initialized>: Failed to convert admin user private key to DER.");
+                    tracing::error!(error = %e, "add_admin_user -> Failed to convert admin user private key to DER.");
                     std::process::exit(1);
                 }
             },
@@ -178,7 +178,7 @@ impl crate::storage::Storage<Initialized> {
         ) {
             Ok(data) => data,
             Err(e) => {
-                tracing::error!(error = %e, "Storage<Initialized>: Failed to encrypt admin user private key.");
+                tracing::error!(error = %e, "add_admin_user -> Failed to encrypt admin user private key.");
                 std::process::exit(1);
             }
         };
@@ -189,7 +189,7 @@ impl crate::storage::Storage<Initialized> {
         {
             Ok(height) => height,
             Err(e) => {
-                tracing::error!(error = %e, "Storage<Initialized>: Failed to add admin user certificate to chain.");
+                tracing::error!(error = %e, "add_admin_user -> Failed to add admin user certificate to chain.");
                 std::process::exit(1);
             }
         };
@@ -203,11 +203,11 @@ impl crate::storage::Storage<Initialized> {
                 match self.state.certificate_chain.delete_last_block() {
                     Ok(_) => (),
                     Err(e) => {
-                        tracing::error!(error = %e, "Storage<Initialized>: Failed to delete last block from certificate chain.");
+                        tracing::error!(error = %e, "add_admin_user -> Failed to delete last block from certificate chain.");
                         std::process::exit(1);
                     }
                 }
-                tracing::error!(error = %e, "Storage<Initialized>: Failed to add admin user private key to chain.");
+                tracing::error!(error = %e, "add_admin_user -> Failed to add admin user private key to chain.");
                 std::process::exit(1);
             }
         };
@@ -215,14 +215,14 @@ impl crate::storage::Storage<Initialized> {
             match self.state.certificate_chain.delete_last_block() {
                 Ok(_) => (),
                 Err(e) => {
-                    tracing::error!(error = %e, "Storage<Initialized>: Failed to delete last block from certificate chain.");
+                    tracing::error!(error = %e, "add_admin_user -> Failed to delete last block from certificate chain.");
                     std::process::exit(1);
                 }
             }
             match self.state.private_key_chain.delete_last_block() {
                 Ok(_) => (),
                 Err(e) => {
-                    tracing::error!(error = %e, "Storage<Initialized>: Failed to delete last block from private key chain.");
+                    tracing::error!(error = %e, "add_admin_user -> Failed to delete last block from private key chain.");
                     std::process::exit(1);
                 }
             }

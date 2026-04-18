@@ -16,7 +16,7 @@ impl crate::storage::Storage<API> {
             (Ok(block), Ok(signature)) => (block, signature),
             (Err(e), _) | (_, Err(e)) => {
                 return Err(anyhow::anyhow!(
-                    "Failed to get block by height {}: {}",
+                    "initialize -> Failed to get block by height {}: {}",
                     0,
                     e
                 ))
@@ -30,25 +30,23 @@ impl crate::storage::Storage<API> {
             (Ok(data), Ok(verified)) => (data, verified),
             (Err(e), _) | (_, Err(e)) => {
                 return Err(anyhow::anyhow!(
-                    "Failed to verify and decrypt certificate: {}",
+                    "initialize -> Failed to verify and decrypt certificate: {}",
                     e
                 ))
             }
         };
         if !cert_verified {
             return Err(anyhow::anyhow!(
-                "Certificate at height {} failed signature verification",
+                "initialize -> Certificate at height {} failed signature verification",
                 0
             ));
         }
-        self.state.cert_store =
-            crate::encryption::build_client_auth_store_from_root_ca(&root_cert)?;
         let (cert_block, cert_signature) = match self.state.certificate_chain.get_block_by_height(1)
         {
             (Ok(block), Ok(signature)) => (block, signature),
             (Err(e), _) | (_, Err(e)) => {
                 return Err(anyhow::anyhow!(
-                    "Failed to get block by height {}: {}",
+                    "initialize -> Failed to get block by height {}: {}",
                     1,
                     e
                 ))
@@ -62,14 +60,14 @@ impl crate::storage::Storage<API> {
             (Ok(data), Ok(verified)) => (data, verified),
             (Err(e), _) | (_, Err(e)) => {
                 return Err(anyhow::anyhow!(
-                    "Failed to verify and decrypt certificate: {}",
+                    "initialize -> Failed to verify and decrypt certificate: {}",
                     e
                 ))
             }
         };
         if !cert_verified {
             return Err(anyhow::anyhow!(
-                "Certificate at height {} failed signature verification",
+                "initialize -> Certificate at height {} failed signature verification",
                 1
             ));
         }
@@ -83,7 +81,7 @@ impl crate::storage::Storage<API> {
                     (Ok(block), Ok(signature)) => (block, signature),
                     (Err(e), _) | (_, Err(e)) => {
                         return Err(anyhow::anyhow!(
-                            "Failed to get block by height {}: {}",
+                            "initialize -> Failed to get block by height {}: {}",
                             i,
                             e
                         ))
@@ -97,14 +95,14 @@ impl crate::storage::Storage<API> {
                 (Ok(data), Ok(verified)) => (data, verified),
                 (Err(e), _) | (_, Err(e)) => {
                     return Err(anyhow::anyhow!(
-                        "Failed to verify and decrypt certificate: {}",
+                        "initialize -> Failed to verify and decrypt certificate: {}",
                         e
                     ))
                 }
             };
             if !cert_verified {
                 return Err(anyhow::anyhow!(
-                    "Certificate at height {} failed signature verification",
+                    "initialize -> Certificate at height {} failed signature verification",
                     i
                 ));
             }
@@ -114,13 +112,16 @@ impl crate::storage::Storage<API> {
                         .cert_user_intermediate_stack
                         .push(cert.clone())
                         .map_err(|e| {
-                            anyhow::anyhow!("Failed to push admin intermediate cert: {}", e)
+                            anyhow::anyhow!(
+                                "initialize -> Failed to push admin intermediate cert: {}",
+                                e
+                            )
                         })?;
                 }
                 Ok(false) => continue, // Not a valid intermediate CA, skip it
                 Err(e) => {
                     return Err(anyhow::anyhow!(
-                        "Failed to validate intermediate CA against root CA: {}",
+                        "initialize -> Failed to validate intermediate CA against root CA: {}",
                         e
                     ))
                 }
@@ -140,7 +141,7 @@ impl crate::storage::Storage<API> {
                     (Ok(block), Ok(signature)) => (block, signature),
                     (Err(e), _) | (_, Err(e)) => {
                         return Err(anyhow::anyhow!(
-                            "Failed to get block by height {}: {}",
+                            "get_certificate_by_serial -> Failed to get block by height {}: {}",
                             i,
                             e
                         ))
@@ -154,14 +155,14 @@ impl crate::storage::Storage<API> {
                 (Ok(data), Ok(verified)) => (data, verified),
                 (Err(e), _) | (_, Err(e)) => {
                     return Err(anyhow::anyhow!(
-                        "Failed to verify and decrypt certificate: {}",
+                        "get_certificate_by_serial -> Failed to verify and decrypt certificate: {}",
                         e
                     ))
                 }
             };
             if !cert_verified {
                 return Err(anyhow::anyhow!(
-                    "Certificate at height {} failed signature verification",
+                    "get_certificate_by_serial -> Certificate at height {} failed signature verification",
                     i
                 ));
             }
@@ -170,7 +171,7 @@ impl crate::storage::Storage<API> {
             }
         }
         Err(anyhow::anyhow!(
-            "Certificate with serial number {} not found",
+            "get_certificate_by_serial -> Certificate with serial number {} not found",
             cert_serial.to_dec_str()?
         ))
     }
@@ -185,13 +186,11 @@ impl crate::storage::Storage<API> {
             let (cert_block, cert_signature) =
                 match self.state.certificate_chain.get_block_by_height(i) {
                     (Ok(block), Ok(signature)) => (block, signature),
-                    (Err(e), _) | (_, Err(e)) => {
-                        return Err(anyhow::anyhow!(
-                            "Failed to get block by height {}: {}",
-                            i,
-                            e
-                        ))
-                    }
+                    (Err(e), _) | (_, Err(e)) => return Err(anyhow::anyhow!(
+                        "get_certificate_by_common_name -> Failed to get block by height {}: {}",
+                        i,
+                        e
+                    )),
                 };
             let (cert, cert_verified) = match crate::encryption::verify_and_decrypt_cert(
                 cert_block.block_data().as_slice(),
@@ -201,14 +200,14 @@ impl crate::storage::Storage<API> {
                 (Ok(data), Ok(verified)) => (data, verified),
                 (Err(e), _) | (_, Err(e)) => {
                     return Err(anyhow::anyhow!(
-                        "Failed to verify and decrypt certificate: {}",
+                        "get_certificate_by_common_name -> Failed to verify and decrypt certificate: {}",
                         e
                     ))
                 }
             };
             if !cert_verified {
                 return Err(anyhow::anyhow!(
-                    "Certificate at height {} failed signature verification",
+                    "get_certificate_by_common_name -> Certificate at height {} failed signature verification",
                     i
                 ));
             }
@@ -226,7 +225,7 @@ impl crate::storage::Storage<API> {
             }
         }
         Err(anyhow::anyhow!(
-            "Certificate with common name '{}' not found",
+            "get_certificate_by_common_name -> Certificate with common name '{}' not found",
             common_name
         ))
     }

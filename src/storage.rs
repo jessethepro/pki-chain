@@ -4,11 +4,11 @@ pub fn get_root_private_key(
 ) -> anyhow::Result<openssl::pkey::PKey<openssl::pkey::Private>> {
     let block_count = private_key_chain.block_count()?;
     if block_count == 0 {
-        anyhow::bail!("No private keys found in the chain");
+        anyhow::bail!("get_root_private_key -> No private keys found in the chain");
     }
     let encrypted_root_key_block = match private_key_chain.get_block_by_height(0) {
         (Ok(block), Ok(_)) => block,
-        _ => anyhow::bail!("No private keys found in the chain"),
+        _ => anyhow::bail!("get_root_private_key -> No private keys found in the chain"),
     };
     let decrypted_root_key_der = crate::encryption::decrypt_data(
         encrypted_root_key_block.block_data().as_slice(),
@@ -25,11 +25,11 @@ pub fn get_root_certificate(
 ) -> anyhow::Result<openssl::x509::X509> {
     let block_count = certificate_chain.block_count()?;
     if block_count == 0 {
-        anyhow::bail!("No certificates found in the chain");
+        anyhow::bail!("get_root_certificate -> No certificates found in the chain");
     }
     let encrypted_root_cert_block = match certificate_chain.get_block_by_height(0) {
         (Ok(block), Ok(_)) => block,
-        _ => anyhow::bail!("No certificates found in the chain"),
+        _ => anyhow::bail!("get_root_certificate -> No certificates found in the chain"),
     };
     let decrypted_root_cert_der = crate::encryption::decrypt_data(
         encrypted_root_cert_block.block_data().as_slice(),
@@ -56,7 +56,7 @@ macro_rules! validate_storage {
                 let cert_block_count = match self.state.certificate_chain.block_count() {
                     Ok(count) => count,
                     Err(e) => {
-                        tracing::error!(error = %e, "Storage<Admin>: Failed to get certificate block count.");
+                        tracing::error!(error = %e, "validate_storage -> Failed to get certificate block count.");
                         return ValidationResult {
                             cert_height: 0,
                             key_height: 0,
@@ -64,14 +64,14 @@ macro_rules! validate_storage {
                             key_blockchain_valid: None,
                             cert_signatures_validation_results: None,
                             key_signatures_validation_results: None,
-                            error_message: Some(format!("Failed to get certificate block count: {}", e)),
+                            error_message: Some(format!("validate_storage -> Failed to get certificate block count: {}", e)),
                         };
                     }
                 };
                 let key_block_count = match self.state.private_key_chain.block_count() {
                     Ok(count) => count,
                     Err(e) => {
-                        tracing::error!(error = %e, "Storage<Admin>: Failed to get private key block count.");
+                        tracing::error!(error = %e, "validate_storage -> Failed to get private key block count.");
                         return ValidationResult {
                             cert_height: 0,
                             key_height: 0,
@@ -79,7 +79,7 @@ macro_rules! validate_storage {
                             key_blockchain_valid: None,
                             cert_signatures_validation_results: None,
                             key_signatures_validation_results: None,
-                            error_message: Some(format!("Failed to get private key block count: {}", e)),
+                            error_message: Some(format!("validate_storage -> Failed to get private key block count: {}", e)),
                         };
                     }
                 };
@@ -106,18 +106,18 @@ macro_rules! validate_storage {
                 validation_result.cert_blockchain_valid = match self.state.certificate_chain.validate() {
                     Ok(()) => Some(true),
                     Err(e) => {
-                        tracing::error!(error = %e, "Storage<Admin>: Failed to validate certificate blockchain.");
+                        tracing::error!(error = %e, "validate_storage -> Failed to validate certificate blockchain.");
                         validation_result.error_message =
-                            Some(format!("Failed to validate certificate blockchain: {}", e));
+                            Some(format!("validate_storage -> Failed to validate certificate blockchain: {}", e));
                         Some(false)
                     }
                 };
                 validation_result.key_blockchain_valid = match self.state.private_key_chain.validate() {
                     Ok(()) => Some(true),
                     Err(e) => {
-                        tracing::error!(error = %e, "Storage<Admin>: Failed to validate private key blockchain.");
+                        tracing::error!(error = %e, "validate_storage -> Failed to validate private key blockchain.");
                         validation_result.error_message =
-                            Some(format!("Failed to validate private key blockchain: {}", e));
+                            Some(format!("validate_storage -> Failed to validate private key blockchain: {}", e));
                         Some(false)
                     }
                 };
@@ -125,7 +125,7 @@ macro_rules! validate_storage {
                     || validation_result.key_blockchain_valid == Some(false)
                 {
                     validation_result.error_message = Some(format!(
-                        "Blockchain validation failed: cert_blockchain_valid={}, key_blockchain_valid={}",
+                        "validate_storage -> Blockchain validation failed: cert_blockchain_valid={}, key_blockchain_valid={}",
                         validation_result.cert_blockchain_valid.unwrap_or(false),
                         validation_result.key_blockchain_valid.unwrap_or(false)
                     ));
@@ -135,10 +135,10 @@ macro_rules! validate_storage {
                     tracing::error!(
                         cert_block_count,
                         key_block_count,
-                        "Storage<Admin>: Certificate and private key block counts do not match."
+                        "validate_storage -> Certificate and private key block counts do not match."
                     );
                     validation_result.error_message = Some(format!(
-                        "Certificate and private key block counts do not match: cert_block_count={}, key_block_count={}",
+                        "validate_storage -> Certificate and private key block counts do not match: cert_block_count={}, key_block_count={}",
                         cert_block_count, key_block_count
                     ));
                     return validation_result;
@@ -153,9 +153,9 @@ macro_rules! validate_storage {
                     {
                         (Ok(block), Ok(signature)) => (block, signature),
                         (Err(e), _) | (_, Err(e)) => {
-                            tracing::error!(error = %e, "Storage<Admin>: Failed to get certificate block at height {}.", i);
+                            tracing::error!(error = %e, "validate_storage -> Failed to get certificate block at height {}.", i);
                             validation_result.error_message = Some(format!(
-                                "Failed to get certificate block at height {}: {}",
+                                "validate_storage -> Failed to get certificate block at height {}: {}",
                                 i, e
                             ));
                             return validation_result;
@@ -167,9 +167,9 @@ macro_rules! validate_storage {
                         match crate::encryption::get_app_private_key(&self.app_config.clone()) {
                             Ok(key) => key,
                             Err(e) => {
-                                tracing::error!(error = %e, "Storage<Admin>: Failed to get app private key for signature verification of certificate block at height {}.", i);
+                                tracing::error!(error = %e, "validate_storage -> Failed to get app private key for signature verification of certificate block at height {}.", i);
                                 validation_result.error_message = Some(format!(
-                                    "Failed to get app private key for signature verification of certificate block at height {}: {}",
+                                    "validate_storage -> Failed to get app private key for signature verification of certificate block at height {}: {}",
                                     i, e
                                 ));
                                 return validation_result;
@@ -178,9 +178,9 @@ macro_rules! validate_storage {
                     ) {
                         (Ok(cert), Ok(verified)) => (cert, verified),
                         (Err(e), _) | (_, Err(e)) => {
-                            tracing::error!(error = %e, "Storage<Admin>: Failed to verify and decrypt certificate block at height {}.", i);
+                            tracing::error!(error = %e, "validate_storage -> Failed to verify and decrypt certificate block at height {}.", i);
                             validation_result.error_message = Some(format!(
-                                "Failed to verify and decrypt certificate block at height {}: {}",
+                                "validate_storage -> Failed to verify and decrypt certificate block at height {}: {}",
                                 i, e
                             ));
                             return validation_result;
@@ -198,9 +198,9 @@ macro_rules! validate_storage {
                     {
                         (Ok(block), Ok(signature)) => (block, signature),
                         (Err(e), _) | (_, Err(e)) => {
-                            tracing::error!(error = %e, "Storage<Admin>: Failed to get private key block at height {}.", i);
+                            tracing::error!(error = %e, "validate_storage -> Failed to get private key block at height {}.", i);
                             validation_result.error_message = Some(format!(
-                                "Failed to get private key block at height {}: {}",
+                                "validate_storage -> Failed to get private key block at height {}: {}",
                                 i, e
                             ));
                             return validation_result;
@@ -213,9 +213,9 @@ macro_rules! validate_storage {
                     ) {
                         Ok(verified) => verified,
                         Err(e) => {
-                            tracing::error!(error = %e, "Storage<Admin>: Failed to verify signature of private key block at height {}.", i);
+                            tracing::error!(error = %e, "validate_storage -> Failed to verify signature of private key block at height {}.", i);
                             validation_result.error_message = Some(format!(
-                                "Failed to verify signature of private key block at height {}: {}",
+                                "validate_storage -> Failed to verify signature of private key block at height {}: {}",
                                 i, e
                             ));
                             return validation_result;
@@ -300,9 +300,11 @@ pub fn get_state(
             ) {
                 Ok(_) => true,
                 Err(e) => {
-                    tracing::error!(error = %e, "Failed to open certificate blockchain.");
-                    storage_status.error_message =
-                        Some(format!("Failed to open certificate blockchain: {}", e));
+                    tracing::error!(error = %e, "validate_storage -> Failed to open certificate blockchain.");
+                    storage_status.error_message = Some(format!(
+                        "validate_storage -> Failed to open certificate blockchain: {}",
+                        e
+                    ));
                     false
                 }
             },
@@ -322,9 +324,11 @@ pub fn get_state(
             ) {
                 Ok(_) => true,
                 Err(e) => {
-                    tracing::error!(error = %e, "Failed to open private key blockchain.");
-                    storage_status.error_message =
-                        Some(format!("Failed to open private key blockchain: {}", e));
+                    tracing::error!(error = %e, "validate_storage -> Failed to open private key blockchain.");
+                    storage_status.error_message = Some(format!(
+                        "validate_storage -> Failed to open private key blockchain: {}",
+                        e
+                    ));
                     false
                 }
             },
@@ -344,9 +348,11 @@ pub fn get_state(
             ) {
                 Ok(_) => true,
                 Err(e) => {
-                    tracing::error!(error = %e, "Failed to open CRL blockchain.");
-                    storage_status.error_message =
-                        Some(format!("Failed to open CRL blockchain: {}", e));
+                    tracing::error!(error = %e, "validate_storage -> Failed to open CRL blockchain.");
+                    storage_status.error_message = Some(format!(
+                        "validate_storage -> Failed to open CRL blockchain: {}",
+                        e
+                    ));
                     false
                 }
             },
@@ -361,17 +367,19 @@ pub fn get_state(
         let (app_cert, app_key) = match crate::encryption::create_app_cert_and_key_pair() {
             Ok((cert, key)) => (cert, key),
             Err(e) => {
-                tracing::error!(error = %e, "Failed to generate app certificate and key.");
-                storage_status.error_message =
-                    Some(format!("Failed to generate app certificate and key: {}", e));
+                tracing::error!(error = %e, "validate_storage -> Failed to generate app certificate and key.");
+                storage_status.error_message = Some(format!(
+                    "validate_storage -> Failed to generate app certificate and key: {}",
+                    e
+                ));
                 return storage_status;
             }
         };
         if let Some(cert_parent_dir) = app_config.key_exports.app_cert_path.parent() {
             if let Err(e) = std::fs::create_dir_all(cert_parent_dir) {
-                tracing::error!(error = %e, "Failed to create parent directory for app certificate.");
+                tracing::error!(error = %e, "validate_storage -> Failed to create parent directory for app certificate.");
                 storage_status.error_message = Some(format!(
-                    "Failed to create parent directory for app certificate: {}",
+                    "validate_storage -> Failed to create parent directory for app certificate: {}",
                     e
                 ));
                 return storage_status;
@@ -379,9 +387,9 @@ pub fn get_state(
         }
         if let Some(key_parent_dir) = app_config.key_exports.app_key_path.parent() {
             if let Err(e) = std::fs::create_dir_all(key_parent_dir) {
-                tracing::error!(error = %e, "Failed to create parent directory for app private key.");
+                tracing::error!(error = %e, "validate_storage -> Failed to create parent directory for app private key.");
                 storage_status.error_message = Some(format!(
-                    "Failed to create parent directory for app private key: {}",
+                    "validate_storage -> Failed to create parent directory for app private key: {}",
                     e
                 ));
                 return storage_status;
@@ -392,18 +400,22 @@ pub fn get_state(
             match app_cert.to_pem() {
                 Ok(pem) => pem,
                 Err(e) => {
-                    tracing::error!(error = %e, "Failed to convert app certificate to PEM.");
-                    storage_status.error_message =
-                        Some(format!("Failed to convert app certificate to PEM: {}", e));
+                    tracing::error!(error = %e, "validate_storage -> Failed to convert app certificate to PEM.");
+                    storage_status.error_message = Some(format!(
+                        "validate_storage -> Failed to convert app certificate to PEM: {}",
+                        e
+                    ));
                     return storage_status;
                 }
             },
         ) {
             Ok(_) => (),
             Err(e) => {
-                tracing::error!(error = %e, "Failed to write app certificate to file.");
-                storage_status.error_message =
-                    Some(format!("Failed to write app certificate to file: {}", e));
+                tracing::error!(error = %e, "validate_storage -> Failed to write app certificate to file.");
+                storage_status.error_message = Some(format!(
+                    "validate_storage -> Failed to write app certificate to file: {}",
+                    e
+                ));
                 return storage_status;
             }
         };
@@ -412,18 +424,22 @@ pub fn get_state(
             match app_key.private_key_to_pem_pkcs8() {
                 Ok(pem) => pem,
                 Err(e) => {
-                    tracing::error!(error = %e, "Failed to convert app private key to PEM.");
-                    storage_status.error_message =
-                        Some(format!("Failed to convert app private key to PEM: {}", e));
+                    tracing::error!(error = %e, "validate_storage -> Failed to convert app private key to PEM.");
+                    storage_status.error_message = Some(format!(
+                        "validate_storage -> Failed to convert app private key to PEM: {}",
+                        e
+                    ));
                     return storage_status;
                 }
             },
         ) {
             Ok(_) => (),
             Err(e) => {
-                tracing::error!(error = %e, "Failed to write app private key to file.");
-                storage_status.error_message =
-                    Some(format!("Failed to write app private key to file: {}", e));
+                tracing::error!(error = %e, "validate_storage -> Failed to write app private key to file.");
+                storage_status.error_message = Some(format!(
+                    "validate_storage -> Failed to write app private key to file: {}",
+                    e
+                ));
                 return storage_status;
             }
         };
@@ -435,7 +451,7 @@ pub fn get_state(
         storage.initialize_storage();
         if execution_count > 4 {
             storage_status.error_message = Some(format!(
-                "Storage state check has been attempted {} times. Manual intervention may be required.",
+                "validate_storage -> Storage state check has been attempted {} times. Manual intervention may be required.",
                 execution_count
             ));
             return storage_status;
@@ -450,7 +466,7 @@ pub fn get_state(
     {
         storage_status.storage_state = StorageState::Inconsistent;
         storage_status.error_message = Some(
-            "Storage is in an inconsistent state: some files exist while others do not."
+            "validate_storage -> Storage is in an inconsistent state: some files exist while others do not."
                 .to_string(),
         );
         return storage_status;
@@ -467,7 +483,7 @@ pub fn get_state(
                         Some(path) => path,
                         None => {
                             storage_status.error_message = Some(
-                                "Failed to parse certificate path from app_config".to_string(),
+                                "validate_storage -> Failed to parse certificate path from app_config".to_string(),
                             );
                             return storage_status;
                         }
@@ -475,9 +491,11 @@ pub fn get_state(
                 ) {
                     Ok(chain) => chain,
                     Err(e) => {
-                        tracing::error!(error = %e, "Failed to open certificate blockchain.");
-                        storage_status.error_message =
-                            Some(format!("Failed to open certificate blockchain: {}", e));
+                        tracing::error!(error = %e, "validate_storage -> Failed to open certificate blockchain.");
+                        storage_status.error_message = Some(format!(
+                            "validate_storage -> Failed to open certificate blockchain: {}",
+                            e
+                        ));
                         return storage_status;
                     }
                 },
@@ -486,7 +504,7 @@ pub fn get_state(
                         Some(path) => path,
                         None => {
                             storage_status.error_message = Some(
-                                "Failed to parse private key path from app_config".to_string(),
+                                "validate_storage -> Failed to parse private key path from app_config".to_string(),
                             );
                             return storage_status;
                         }
@@ -494,9 +512,11 @@ pub fn get_state(
                 ) {
                     Ok(chain) => chain,
                     Err(e) => {
-                        tracing::error!(error = %e, "Failed to open private key blockchain.");
-                        storage_status.error_message =
-                            Some(format!("Failed to open private key blockchain: {}", e));
+                        tracing::error!(error = %e, "validate_storage -> Failed to open private key blockchain.");
+                        storage_status.error_message = Some(format!(
+                            "validate_storage -> Failed to open private key blockchain: {}",
+                            e
+                        ));
                         return storage_status;
                     }
                 },
@@ -504,17 +524,21 @@ pub fn get_state(
                     match app_config.blockchains.crl_path.to_str() {
                         Some(path) => path,
                         None => {
-                            storage_status.error_message =
-                                Some("Failed to parse CRL path from app_config".to_string());
+                            storage_status.error_message = Some(
+                                "validate_storage -> Failed to parse CRL path from app_config"
+                                    .to_string(),
+                            );
                             return storage_status;
                         }
                     },
                 ) {
                     Ok(chain) => chain,
                     Err(e) => {
-                        tracing::error!(error = %e, "Failed to open CRL blockchain.");
-                        storage_status.error_message =
-                            Some(format!("Failed to open CRL blockchain: {}", e));
+                        tracing::error!(error = %e, "validate_storage -> Failed to open CRL blockchain.");
+                        storage_status.error_message = Some(format!(
+                            "validate_storage -> Failed to open CRL blockchain: {}",
+                            e
+                        ));
                         return storage_status;
                     }
                 },
@@ -634,7 +658,7 @@ pub fn get_state(
             {
                 storage_status.storage_state = StorageState::Inconsistent;
                 storage_status.error_message = Some(
-                    "Storage is in an inconsistent state: some blocks failed signature validation."
+                    "validate_storage -> Storage is in an inconsistent state: some blocks failed signature validation."
                         .to_string(),
                 );
                 return storage_status;
@@ -650,10 +674,18 @@ pub fn get_api_storage(
     storage: Storage<crate::storage_ready::Ready>,
 ) -> anyhow::Result<Storage<crate::storage_api::API>> {
     let cert_store =
-        crate::encryption::build_client_auth_store_from_root_ca(&get_root_certificate(
+        match crate::encryption::build_client_auth_store_from_root_ca(&get_root_certificate(
             &storage.state.certificate_chain,
             crate::encryption::get_app_private_key(&storage.app_config)?,
-        )?)?;
+        )?) {
+            Ok(store) => store,
+            Err(e) => {
+                return Err(anyhow::anyhow!(
+                    "get_api_storage -> Failed to build client auth store: {}",
+                    e
+                ))
+            }
+        };
     Ok(Storage {
         state: crate::storage_api::API {
             certificate_chain: storage.state.certificate_chain,
@@ -688,16 +720,16 @@ pub fn get_initialized_storage(
             Some(path) => path,
             None => {
                 return Err(anyhow::anyhow!(
-                    "Failed to parse certificate path from app_config"
+                    "get_initialized_storage -> Failed to parse certificate path from app_config"
                 ))
             }
         },
     ) {
         Ok(chain) => chain,
         Err(e) => {
-            tracing::error!(error = %e, "Failed to open certificate blockchain.");
+            tracing::error!(error = %e, "get_initialized_storage -> Failed to open certificate blockchain.");
             return Err(anyhow::anyhow!(
-                "Failed to open certificate blockchain: {}",
+                "get_initialized_storage -> Failed to open certificate blockchain: {}",
                 e
             ));
         }
@@ -707,16 +739,16 @@ pub fn get_initialized_storage(
             Some(path) => path,
             None => {
                 return Err(anyhow::anyhow!(
-                    "Failed to parse private key path from app_config"
+                    "get_initialized_storage -> Failed to parse private key path from app_config"
                 ))
             }
         },
     ) {
         Ok(chain) => chain,
         Err(e) => {
-            tracing::error!(error = %e, "Failed to open private key blockchain.");
+            tracing::error!(error = %e, "get_initialized_storage -> Failed to open private key blockchain.");
             return Err(anyhow::anyhow!(
-                "Failed to open private key blockchain: {}",
+                "get_initialized_storage -> Failed to open private key blockchain: {}",
                 e
             ));
         }
@@ -724,13 +756,20 @@ pub fn get_initialized_storage(
     let crl_chain = match libblockchain::blockchain::open_chain(
         match app_config.blockchains.crl_path.to_str() {
             Some(path) => path,
-            None => return Err(anyhow::anyhow!("Failed to parse CRL path from app_config")),
+            None => {
+                return Err(anyhow::anyhow!(
+                    "get_initialized_storage -> Failed to parse CRL path from app_config"
+                ))
+            }
         },
     ) {
         Ok(chain) => chain,
         Err(e) => {
-            tracing::error!(error = %e, "Failed to open CRL blockchain.");
-            return Err(anyhow::anyhow!("Failed to open CRL blockchain: {}", e));
+            tracing::error!(error = %e, "get_initialized_storage -> Failed to open CRL blockchain.");
+            return Err(anyhow::anyhow!(
+                "get_initialized_storage -> Failed to open CRL blockchain: {}",
+                e
+            ));
         }
     };
     Ok(Storage {
@@ -751,7 +790,7 @@ pub fn get_created_storage(
             Some(path) => path,
             None => {
                 return Err(anyhow::anyhow!(
-                    "Failed to parse certificate path from app_config"
+                    "get_created_storage -> Failed to parse certificate path from app_config"
                 ))
             }
         },
@@ -777,9 +816,9 @@ pub fn get_created_storage(
     ) {
         Ok(chain) => chain,
         Err(e) => {
-            tracing::error!(error = %e, "Failed to open private key blockchain.");
+            tracing::error!(error = %e, "get_created_storage -> Failed to open private key blockchain.");
             return Err(anyhow::anyhow!(
-                "Failed to open private key blockchain: {}",
+                "get_created_storage -> Failed to open private key blockchain: {}",
                 e
             ));
         }
@@ -787,13 +826,20 @@ pub fn get_created_storage(
     let crl_chain = match libblockchain::blockchain::open_chain(
         match app_config.blockchains.crl_path.to_str() {
             Some(path) => path,
-            None => return Err(anyhow::anyhow!("Failed to parse CRL path from app_config")),
+            None => {
+                return Err(anyhow::anyhow!(
+                    "get_created_storage -> Failed to parse CRL path from app_config"
+                ))
+            }
         },
     ) {
         Ok(chain) => chain,
         Err(e) => {
-            tracing::error!(error = %e, "Failed to open CRL blockchain.");
-            return Err(anyhow::anyhow!("Failed to open CRL blockchain: {}", e));
+            tracing::error!(error = %e, "get_created_storage -> Failed to open CRL blockchain.");
+            return Err(anyhow::anyhow!(
+                "get_created_storage -> Failed to open CRL blockchain: {}",
+                e
+            ));
         }
     };
     Ok(Storage {
@@ -823,16 +869,16 @@ pub fn get_ready_storage(
             Some(path) => path,
             None => {
                 return Err(anyhow::anyhow!(
-                    "Failed to parse certificate path from app_config"
+                    "get_ready_storage -> Failed to parse certificate path from app_config"
                 ))
             }
         },
     ) {
         Ok(chain) => chain,
         Err(e) => {
-            tracing::error!(error = %e, "Failed to open certificate blockchain.");
+            tracing::error!(error = %e, "get_ready_storage -> Failed to open certificate blockchain.");
             return Err(anyhow::anyhow!(
-                "Failed to open certificate blockchain: {}",
+                "get_ready_storage -> Failed to open certificate blockchain: {}",
                 e
             ));
         }
@@ -842,16 +888,16 @@ pub fn get_ready_storage(
             Some(path) => path,
             None => {
                 return Err(anyhow::anyhow!(
-                    "Failed to parse private key path from app_config"
+                    "get_ready_storage ->  Failed to parse private key path from app_config"
                 ))
             }
         },
     ) {
         Ok(chain) => chain,
         Err(e) => {
-            tracing::error!(error = %e, "Failed to open private key blockchain.");
+            tracing::error!(error = %e, "get_ready_storage -> Failed to open private key blockchain.");
             return Err(anyhow::anyhow!(
-                "Failed to open private key blockchain: {}",
+                "get_ready_storage -> Failed to open private key blockchain: {}",
                 e
             ));
         }
@@ -859,13 +905,20 @@ pub fn get_ready_storage(
     let crl_chain = match libblockchain::blockchain::open_chain(
         match app_config.blockchains.crl_path.to_str() {
             Some(path) => path,
-            None => return Err(anyhow::anyhow!("Failed to parse CRL path from app_config")),
+            None => {
+                return Err(anyhow::anyhow!(
+                    "get_ready_storage -> Failed to parse CRL path from app_config"
+                ))
+            }
         },
     ) {
         Ok(chain) => chain,
         Err(e) => {
-            tracing::error!(error = %e, "Failed to open CRL blockchain.");
-            return Err(anyhow::anyhow!("Failed to open CRL blockchain: {}", e));
+            tracing::error!(error = %e, "get_ready_storage -> Failed to open CRL blockchain.");
+            return Err(anyhow::anyhow!(
+                "get_ready_storage -> Failed to open CRL blockchain: {}",
+                e
+            ));
         }
     };
     Ok(Storage {

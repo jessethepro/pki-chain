@@ -27,6 +27,7 @@ tracing-appender = "0.2"
 chrono = "0.4"
 log = "0.4.29"
 base64 = "0.22"
+uuid = "1.23.1"
 
 [dev-dependencies]
 tempfile = "3.0"

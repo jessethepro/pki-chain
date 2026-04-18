@@ -11,7 +11,7 @@ impl crate::storage::Storage<Empty> {
         ) {
             Ok(chain) => chain,
             Err(e) => {
-                tracing::error!(error = %e, "Storage<Empty>: Failed to open certificate chain.");
+                tracing::error!(error = %e, "create_storage -> Failed to open certificate chain.");
                 std::process::exit(1);
             }
         };
@@ -20,11 +20,11 @@ impl crate::storage::Storage<Empty> {
                 .blockchains
                 .private_key_path
                 .to_str()
-                .expect("Failed to parse private key path from app_config"),
+                .expect("create_storage -> Failed to parse private key path from app_config"),
         ) {
             Ok(chain) => chain,
             Err(e) => {
-                tracing::error!(error = %e, "Storage<Empty>: Failed to open private key chain.");
+                tracing::error!(error = %e, "create_storage -> Failed to open private key chain.");
                 std::process::exit(1);
             }
         };
@@ -33,11 +33,11 @@ impl crate::storage::Storage<Empty> {
                 .blockchains
                 .crl_path
                 .to_str()
-                .expect("Failed to parse CRL path from app_config"),
+                .expect("create_storage -> Failed to parse CRL path from app_config"),
         ) {
             Ok(chain) => chain,
             Err(e) => {
-                tracing::error!(error = %e, "Storage<Empty>: Failed to open CRL chain.");
+                tracing::error!(error = %e, "create_storage -> Failed to open CRL chain.");
                 std::process::exit(1);
             }
         };

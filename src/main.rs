@@ -1,6 +1,6 @@
 use pki_chain::comm_protocol::{start_api_server, start_repair_server, start_setup_server};
 use pki_chain::configs::AppConfig;
-use pki_chain::storage::{get_state, StorageState, StorageStatusResults, ValidationResult};
+use pki_chain::storage::{get_state, StorageState};
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 
@@ -23,7 +23,7 @@ fn main() {
     let app_config = match AppConfig::load() {
         Ok(config) => config,
         Err(e) => {
-            tracing::error!(error = %e, "Failed to load configuration");
+            tracing::error!(error = %e, "Main -> Failed to load configuration");
             return;
         }
     };
@@ -32,27 +32,27 @@ fn main() {
         match storage_status.storage_state {
             StorageState::Ready => {
                 tracing::info!(
-                    "Storage is ready. Storage Status Results: {:?}",
+                    "Main -> Storage is ready. Storage Status Results: {:?}",
                     storage_status
                 );
                 storage_status = start_api_server(&app_config, storage_status);
             }
             StorageState::Inconsistent => {
                 tracing::warn!(
-                    "Storage is inconsistent. Storage Status Results: {:?}",
+                    "Main -> Storage is inconsistent. Storage Status Results: {:?}",
                     storage_status
                 );
                 storage_status = start_repair_server(&app_config, storage_status);
             }
             _ => {
                 tracing::warn!(
-                    "Storage is in a setup state or is inconsistent. Storage Status Results: {:?}",
+                    "Main -> Storage is in a setup state or is inconsistent. Storage Status Results: {:?}",
                     storage_status
                 );
                 storage_status = start_setup_server(&app_config, storage_status);
             }
         }
     }
-    tracing::error!(error = %storage_status.error_message.as_ref().unwrap(), "There are errors in the storage system");
-    tracing::info!("Storage status: {:?}", storage_status);
+    tracing::error!(error = %storage_status.error_message.as_ref().unwrap(), "Main -> There are errors in the storage system");
+    tracing::info!("Main -> Storage status: {:?}", storage_status);
 }

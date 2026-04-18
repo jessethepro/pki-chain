@@ -20,14 +20,23 @@ pub const AES_GCM_TAG_SIZE: usize = 16; // 128 bits
 pub const DATA_LEN_SIZE: usize = 4; // u32 for block length
 
 pub fn sign_data(data: &[u8], private_key: PKey<openssl::pkey::Private>) -> Result<Vec<u8>> {
-    let mut signer = Signer::new(MessageDigest::sha256(), &private_key)
-        .map_err(|e| anyhow!("Failed to create signer: {}", e))?;
-    signer
-        .update(data)
-        .map_err(|e| anyhow!("Failed to update signer with data: {}", e))?;
-    signer
-        .sign_to_vec()
-        .map_err(|e| anyhow!("Failed to generate signature: {}", e))
+    let mut signer = match Signer::new(MessageDigest::sha256(), &private_key) {
+        Ok(s) => s,
+        Err(e) => return Err(anyhow!("sign_data -> Failed to create signer: {}", e)),
+    };
+    match signer.update(data) {
+        Ok(_) => (),
+        Err(e) => {
+            return Err(anyhow!(
+                "sign_data -> Failed to update signer with data: {}",
+                e
+            ))
+        }
+    }
+    match signer.sign_to_vec() {
+        Ok(sig) => Ok(sig),
+        Err(e) => Err(anyhow!("sign_data -> Failed to generate signature: {}", e)),
+    }
 }
 
 pub fn verify_signature(
@@ -35,50 +44,90 @@ pub fn verify_signature(
     signature: &[u8],
     public_key: PKey<openssl::pkey::Public>,
 ) -> Result<bool> {
-    let mut verifier = Verifier::new(MessageDigest::sha256(), &public_key)
-        .map_err(|e| anyhow!("Failed to create verifier: {}", e))?;
-    verifier
-        .update(data)
-        .map_err(|e| anyhow!("Failed to update verifier with data: {}", e))?;
-    verifier
-        .verify(signature)
-        .map_err(|e| anyhow!("Failed to verify signature: {}", e))
+    let mut verifier = match Verifier::new(MessageDigest::sha256(), &public_key) {
+        Ok(v) => v,
+        Err(e) => {
+            return Err(anyhow!(
+                "verify_signature -> Failed to create verifier: {}",
+                e
+            ))
+        }
+    };
+    match verifier.update(data) {
+        Ok(_) => (),
+        Err(e) => {
+            return Err(anyhow!(
+                "verify_signature -> Failed to update verifier with data: {}",
+                e
+            ))
+        }
+    }
+    match verifier.verify(signature) {
+        Ok(valid) => Ok(valid),
+        Err(e) => Err(anyhow!(
+            "verify_signature -> Failed to verify signature: {}",
+            e
+        )),
+    }
 }
 
 pub fn encrypt_data(data: &[u8], public_key: PKey<openssl::pkey::Public>) -> Result<Vec<u8>> {
     // Generate random AES-256 key (32 bytes)
     let mut aes_key = [0u8; AES_GCM_256_KEY_SIZE];
-    openssl::rand::rand_bytes(&mut aes_key)
-        .map_err(|e| anyhow!("Failed to generate random AES key: {}", e))?;
+    match openssl::rand::rand_bytes(&mut aes_key) {
+        Ok(_) => (),
+        Err(e) => {
+            return Err(anyhow!(
+                "encrypt_data -> Failed to generate random AES key: {}",
+                e
+            ))
+        }
+    }
 
     // Generate random 12-byte nonce
     let mut nonce = [0u8; AES_GCM_NONCE_SIZE];
-    openssl::rand::rand_bytes(&mut nonce)
-        .map_err(|e| anyhow!("Failed to generate random nonce: {}", e))?;
+    match openssl::rand::rand_bytes(&mut nonce) {
+        Ok(_) => (),
+        Err(e) => {
+            return Err(anyhow!(
+                "encrypt_data -> Failed to generate random nonce: {}",
+                e
+            ))
+        }
+    }
 
     let cipher = Cipher::aes_256_gcm();
     let mut tag = [0u8; AES_GCM_TAG_SIZE];
 
-    let encrypted_data = openssl::symm::encrypt_aead(
+    let encrypted_data = match openssl::symm::encrypt_aead(
         cipher,
         &aes_key,
         Some(&nonce),
         &[], // AAD
         data,
         &mut tag,
-    )
-    .map_err(|e| anyhow!("AES-GCM encryption failed: {}", e))?;
+    ) {
+        Ok(ed) => ed,
+        Err(e) => return Err(anyhow!("encrypt_data -> AES-GCM encryption failed: {}", e)),
+    };
 
     // Encrypt AES key with RSA-OAEP
     let encrypted_aes_key = (|| -> Result<Vec<u8>> {
-        let rsa = public_key
-            .rsa()
-            .map_err(|e| anyhow!("Failed to get RSA public key: {}", e))?;
+        let rsa = match public_key.rsa() {
+            Ok(r) => r,
+            Err(e) => {
+                return Err(anyhow!(
+                    "encrypt_data -> Failed to get RSA public key: {}",
+                    e
+                ))
+            }
+        };
 
         let mut ciphertext = vec![0u8; rsa.size() as usize];
-        let len = rsa
-            .public_encrypt(&aes_key, &mut ciphertext, Padding::PKCS1_OAEP)
-            .map_err(|e| anyhow!("RSA encryption failed: {}", e))?;
+        let len = match rsa.public_encrypt(&aes_key, &mut ciphertext, Padding::PKCS1_OAEP) {
+            Ok(len) => len,
+            Err(e) => return Err(anyhow!("encrypt_data -> RSA encryption failed: {}", e)),
+        };
 
         ciphertext.truncate(len);
         Ok(ciphertext)
