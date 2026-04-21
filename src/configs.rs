@@ -9,6 +9,7 @@ pub struct AppConfig {
     pub key_exports: KeyExports,
     pub server: ServerConfig,
     pub root_ca_defaults: RootCADefaults,
+    pub admin_ca_defaults: AdminCADefaults,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -39,6 +40,17 @@ pub struct RootCADefaults {
     pub root_ca_state: String,
     pub root_ca_country: String,
     pub root_ca_validity_days: u32,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct AdminCADefaults {
+    pub admin_ca_common_name: String,
+    pub admin_ca_organization: String,
+    pub admin_ca_organizational_unit: String,
+    pub admin_ca_locality: String,
+    pub admin_ca_state: String,
+    pub admin_ca_country: String,
+    pub admin_ca_validity_days: u32,
 }
 
 impl AppConfig {

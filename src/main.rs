@@ -46,7 +46,7 @@ fn main() {
             }
             _ => {
                 tracing::warn!(
-                    "Main -> Storage is in a setup state or is inconsistent. Storage Status Results: {:?}",
+                    "Main -> Storage is in a setup state. Storage Status Results: {:?}",
                     storage_status
                 );
                 storage_status = start_setup_server(&app_config, storage_status);

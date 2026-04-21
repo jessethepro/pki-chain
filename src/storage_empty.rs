@@ -3,11 +3,15 @@ pub struct Empty {}
 impl crate::storage::Storage<Empty> {
     pub fn create_storage(self) -> crate::storage::Storage<crate::storage_created::Created> {
         let certificate_chain = match libblockchain::blockchain::open_chain(
-            self.app_config
-                .blockchains
-                .certificate_path
-                .to_str()
-                .expect("Failed to parse certificate path from app_config"),
+            match self.app_config.blockchains.certificate_path.to_str() {
+                Some(path) => path,
+                None => {
+                    tracing::error!(
+                        "create_storage -> Failed to parse certificate path from app_config"
+                    );
+                    std::process::exit(1);
+                }
+            },
         ) {
             Ok(chain) => chain,
             Err(e) => {
@@ -16,11 +20,15 @@ impl crate::storage::Storage<Empty> {
             }
         };
         let private_key_chain = match libblockchain::blockchain::open_chain(
-            self.app_config
-                .blockchains
-                .private_key_path
-                .to_str()
-                .expect("create_storage -> Failed to parse private key path from app_config"),
+            match self.app_config.blockchains.private_key_path.to_str() {
+                Some(path) => path,
+                None => {
+                    tracing::error!(
+                        "create_storage -> Failed to parse private key path from app_config"
+                    );
+                    std::process::exit(1);
+                }
+            },
         ) {
             Ok(chain) => chain,
             Err(e) => {
@@ -29,11 +37,13 @@ impl crate::storage::Storage<Empty> {
             }
         };
         let crl_chain = match libblockchain::blockchain::open_chain(
-            self.app_config
-                .blockchains
-                .crl_path
-                .to_str()
-                .expect("create_storage -> Failed to parse CRL path from app_config"),
+            match self.app_config.blockchains.crl_path.to_str() {
+                Some(path) => path,
+                None => {
+                    tracing::error!("create_storage -> Failed to parse CRL path from app_config");
+                    std::process::exit(1);
+                }
+            },
         ) {
             Ok(chain) => chain,
             Err(e) => {
