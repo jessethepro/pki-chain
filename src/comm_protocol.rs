@@ -502,7 +502,7 @@ fn handle_api_request(
             // Handle LoginAdmin request
         }
         "GetState" => {
-            let storage_state = crate::storage::get_state(&storage.app_config, 1);
+            let storage_state = crate::storage::get_state(&storage.app_config);
             send_response(
                 &response_socket,
                 &serde_json::json!({
@@ -541,23 +541,25 @@ fn handle_setup_request(
 ) -> anyhow::Result<crate::storage::StorageStatusResults> {
     let mut version_buffer = [0u8; 4];
     let mut length_buffer = [0u8; 4];
+    let request_id = uuid::Uuid::new_v4().to_string();
     match stream.read_exact(&mut version_buffer).inspect_err(
         |e| tracing::error!(error = %e, "handle_setup_request -> Failed to read version"),
     ) {
         Ok(_) => {}
         Err(_) => {
             return Err(anyhow::anyhow!(
-                "handle_setup_request -> Failed to read version"
+                "handle_setup_request -> Failed to read version. Request ID: {}",
+                request_id
             ))
         }
     }
     match stream.read_exact(&mut length_buffer).inspect_err(
-        |e| tracing::error!(error = %e, "handle_setup_request -> Failed to read payload length"),
+        |e| tracing::error!(error = %e, "handle_setup_request -> Failed to read payload length. Request ID: {}", request_id),
     ) {
         Ok(_) => {}
         Err(_) => {
             return Err(anyhow::anyhow!(
-                "handle_setup_request -> Failed to read payload length"
+                "handle_setup_request -> Failed to read payload length. Request ID: {}", request_id
             ))
         }
     }
@@ -565,30 +567,32 @@ fn handle_setup_request(
     if payload_length > 10 * 1024 * 1024 {
         tracing::error!(
             payload_length,
-            "handle_setup_request -> Payload length exceeds maximum allowed size"
+            "handle_setup_request -> Payload length exceeds maximum allowed size. Request ID: {}",
+            request_id
         );
         return Err(anyhow::anyhow!(
-            "handle_setup_request -> Payload length exceeds maximum allowed size"
+            "handle_setup_request -> Payload length exceeds maximum allowed size. Request ID: {}",
+            request_id
         ));
     }
     let mut payload_buffer = vec![0u8; payload_length];
     match stream.read_exact(&mut payload_buffer).inspect_err(
-        |e| tracing::error!(error = %e, "handle_setup_request -> Failed to read payload data"),
+        |e| tracing::error!(error = %e, "handle_setup_request -> Failed to read payload data. Request ID: {}", request_id),
     ) {
         Ok(_) => {}
         Err(_) => {
             return Err(anyhow::anyhow!(
-                "handle_setup_request -> Failed to read payload data"
+                "handle_setup_request -> Failed to read payload data. Request ID: {}", request_id
             ))
         }
     }
     let request_json: serde_json::Value = match serde_json::from_slice(&payload_buffer).inspect_err(
-        |e| tracing::error!(error = %e, "handle_setup_request -> Failed to parse request JSON"),
+        |e| tracing::error!(error = %e, "handle_setup_request -> Failed to parse request JSON. Request ID: {}", request_id),
     ) {
         Ok(json) => json,
         Err(_) => {
             return Err(anyhow::anyhow!(
-                "handle_setup_request -> Failed to parse request JSON"
+                "handle_setup_request -> Failed to parse request JSON. Request ID: {}", request_id
             ))
         }
     };
@@ -598,23 +602,23 @@ fn handle_setup_request(
     {
         Some(rt) => rt,
         None => {
-            tracing::error!("handle_setup_request -> Request missing required field: request_type");
+            tracing::error!("handle_setup_request -> Request missing required field: request_type. Request ID: {}", request_id);
             return Err(anyhow::anyhow!(
-                "handle_setup_request -> Request missing required field: request_type"
+                "handle_setup_request -> Request missing required field: request_type. Request ID: {}", request_id
             ));
         }
     };
     let response_sock = match request_json.pointer("request/response_socket").and_then(|v| v.as_str()) {
         Some(s) => match std::os::unix::net::UnixStream::connect(s).inspect_err(
-            |e| tracing::error!(socket = s, error = %e, "handle_setup_request -> Failed to connect to response socket"),
+            |e| tracing::error!(socket = s, error = %e, "handle_setup_request -> Failed to connect to response socket. Request ID: {}", request_id),
         ) {
             Ok(sock) => sock,
-            Err(_) => return Err(anyhow::anyhow!("handle_setup_request -> Failed to connect to response socket")),
+            Err(_) => return Err(anyhow::anyhow!("handle_setup_request -> Failed to connect to response socket. Request ID: {}", request_id)),
         },
         None => {
-            tracing::error!("handle_setup_request -> Request missing required field: response_socket");
+            tracing::error!("handle_setup_request -> Request missing required field: response_socket. Request ID: {}", request_id);
             return Err(anyhow::anyhow!(
-                "handle_setup_request -> Request missing required field: response_socket"
+                "handle_setup_request -> Request missing required field: response_socket. Request ID: {}", request_id
             ));
         }
     };
@@ -629,6 +633,7 @@ fn handle_setup_request(
                 &response_sock,
                 &serde_json::json!({
                     "response": {
+                        "request_id": request_id,
                         "status": "success",
                         "message": "handle_setup_request -> Storage state retrieved successfully",
                         "data": {
@@ -660,13 +665,14 @@ fn handle_setup_request(
                                 &serde_json::json!({
                                     "response": {
                                         "status": "error",
-                                        "message": "CreateAndInitialize request missing required field: create_new_storage",
+                                        "message": format!("CreateAndInitialize request missing required field: create_new_storage. Request ID: {}", request_id),
                                         "data": request_json,
                                     }
                                 }),
                             );
                             return Err(anyhow::anyhow!(
-                                "handle_setup_request -> CreateAndInitialize request missing required field: create_new_storage"
+                                "handle_setup_request -> CreateAndInitialize request missing required field: create_new_storage. Request ID: {}",
+                                request_id
                             ));
                         }
                     };
@@ -680,14 +686,15 @@ fn handle_setup_request(
                                     &serde_json::json!({
                                         "response": {
                                             "status": "error",
-                                            "message": format!("Failed to parse admin certificate data from request: {}", e),
+                                            "message": format!("Failed to parse admin certificate data from request: {}. Request ID: {}", e, request_id),
                                             "data": request_json,
                                         }
                                     }),
                                 );
                                 return Err(anyhow::anyhow!(
-                                    "handle_setup_request -> Failed to parse admin certificate data from request: {}",
-                                    e
+                                    "handle_setup_request -> Failed to parse admin certificate data from request: {}. Request ID: {}",
+                                    e,
+                                    request_id
                                 ));
                             }
                         };
@@ -712,7 +719,7 @@ fn handle_setup_request(
                         storage_status.storage_state = crate::storage::StorageState::Ready;
                         return Ok(storage_status);
                     } else {
-                        tracing::info!("handle_setup_request -> CreateAndInitialize request indicated not to create new storage, sending success response with current storage state");
+                        tracing::info!("handle_setup_request -> CreateAndInitialize request indicated not to create new storage, sending success response with current storage state. Request ID: {}", request_id);
                         send_response(
                             &response_sock,
                             &serde_json::json!({
@@ -729,20 +736,21 @@ fn handle_setup_request(
                     }
                 }
                 _ => {
-                    tracing::warn!("handle_setup_request -> Received CreateAndInitialize request but storage state is not Empty, current storage state: {:?}, ignoring request", storage_status.storage_state);
+                    tracing::warn!("handle_setup_request -> Received CreateAndInitialize request but storage state is not Empty, current storage state: {:?}, ignoring request. Request ID: {}", storage_status.storage_state, request_id);
                     send_response(
                         &response_sock,
                         &serde_json::json!({
                             "response": {
                                 "status": "error",
-                                "message": format!("Received CreateAndInitialize request but storage state is not Empty, current storage state: {:?}", storage_status.storage_state),
+                                "message": format!("Received CreateAndInitialize request but storage state is not Empty, current storage state: {:?}. Request ID: {}", storage_status.storage_state, request_id),
                                 "data": request_json,
                             }
                         }),
                     );
                     return Err(anyhow::anyhow!(
-                        "handle_setup_request -> Received CreateAndInitialize request but storage state is not Empty, current storage state: {:?}",
-                        storage_status.storage_state
+                        "handle_setup_request -> Received CreateAndInitialize request but storage state is not Empty, current storage state: {:?}. Request ID: {}",
+                        storage_status.storage_state,
+                        request_id
                     ));
                 }
             }
@@ -761,8 +769,9 @@ fn handle_setup_request(
                                 &serde_json::json!({
                                     "response": {
                                         "status": "error",
-                                        "message": format!("Failed to get created storage: {}", e),
+                                        "message": format!("Failed to get created storage: {}. Request ID: {}", e, request_id),
                                         "data": request_json,
+                                        "request_id": request_id,
                                     }
                                 }),
                             );
@@ -781,14 +790,16 @@ fn handle_setup_request(
                                 &serde_json::json!({
                                     "response": {
                                         "status": "error",
-                                        "message": format!("Failed to parse admin certificate data from request: {}", e),
+                                        "message": format!("Failed to parse admin certificate data from request: {}. Request ID: {}", e, request_id),
                                         "data": request_json,
+                                        "request_id": request_id,
                                     }
                                 }),
                             );
                             return Err(anyhow::anyhow!(
-                                "handle_setup_request -> Failed to parse admin certificate data from request: {}",
-                                e
+                                "handle_setup_request -> Failed to parse admin certificate data from request: {}. Request ID: {}",
+                                e,
+                                request_id
                             ));
                         }
                     };
@@ -805,6 +816,7 @@ fn handle_setup_request(
                                     "admin_certificate": base64::engine::general_purpose::STANDARD.encode(admin_cert.to_der().unwrap_or_default()),
                                     "admin_private_key": base64::engine::general_purpose::STANDARD.encode(admin_key.private_key_to_der().unwrap_or_default()),
                                 },
+                                "request_id": request_id,
                             }
                         }),
                     );
@@ -812,20 +824,22 @@ fn handle_setup_request(
                     return Ok(storage_status);
                 }
                 _ => {
-                    tracing::warn!("handle_setup_request -> Received Initialize request but storage state is not Created, current storage state: {:?}, ignoring request", storage_status.storage_state);
+                    tracing::warn!("handle_setup_request -> Received Initialize request but storage state is not Created, current storage state: {:?}. Request ID: {}, ignoring request", storage_status.storage_state, request_id);
                     send_response(
                         &response_sock,
                         &serde_json::json!({
                             "response": {
                                 "status": "error",
-                                "message": format!("Received Initialize request but storage state is not Created, current storage state: {:?}", storage_status.storage_state),
+                                "message": format!("Received Initialize request but storage state is not Created, current storage state: {:?}. Request ID: {}", storage_status.storage_state, request_id),
                                 "data": request_json,
+                                "request_id": request_id,
                             }
                         }),
                     );
                     return Err(anyhow::anyhow!(
-                        "handle_setup_request -> Received Initialize request but storage state is not Created, current storage state: {:?}",
-                        storage_status.storage_state
+                        "handle_setup_request -> Received Initialize request but storage state is not Created, current storage state: {:?}. Request ID: {}",
+                        storage_status.storage_state,
+                        request_id
                     ));
                 }
             }
@@ -834,33 +848,35 @@ fn handle_setup_request(
             // Handle AddFirstAdmin request
             match storage_status.storage_state {
                 crate::storage::StorageState::Initialized => {
-                    tracing::info!("handle_setup_request -> Storage state is Initialized, proceeding to add first admin user");
+                    tracing::info!("handle_setup_request -> Storage state is Initialized, proceeding to add first admin user. Request ID: {}", request_id);
                     let storage_initialized = match crate::storage::get_initialized_storage(
                         app_config,
                     ) {
                         Ok(storage) => storage,
                         Err(e) => {
-                            tracing::error!(error = %e, "handle_setup_request -> Failed to get initialized storage");
+                            tracing::error!(error = %e, "handle_setup_request -> Failed to get initialized storage. Request ID: {}", request_id);
                             send_response(
                                 &response_sock,
                                 &serde_json::json!({
                                     "response": {
                                         "status": "error",
-                                        "message": format!("Failed to get initialized storage: {}", e),
+                                        "message": format!("Failed to get initialized storage: {}, request_id: {}", e, request_id),
                                         "data": request_json,
+                                        "request_id": request_id,
                                     }
                                 }),
                             );
                             return Err(anyhow::anyhow!(
-                                "handle_setup_request -> Failed to get initialized storage: {}",
-                                e
+                                "handle_setup_request -> Failed to get initialized storage: {}, request_id: {}",
+                                e,
+                                request_id
                             ));
                         }
                     };
                     let new_admin_data = match parse_admin_cert_data(&request_json) {
                         Ok(data) => data,
                         Err(e) => {
-                            tracing::error!(error = %e, "handle_setup_request -> Failed to parse admin certificate data from request");
+                            tracing::error!(error = %e, "handle_setup_request -> Failed to parse admin certificate data from request. request_id: {}", request_id);
                             send_response(
                                 &response_sock,
                                 &serde_json::json!({
@@ -868,12 +884,14 @@ fn handle_setup_request(
                                         "status": "error",
                                         "message": format!("Failed to parse admin certificate data from request: {}", e),
                                         "data": request_json,
+                                        "request_id": request_id,
                                     }
                                 }),
                             );
                             return Err(anyhow::anyhow!(
-                                "handle_setup_request -> Failed to parse admin certificate data from request: {}",
-                                e
+                                "handle_setup_request -> Failed to parse admin certificate data from request: {}, request_id: {}",
+                                e,
+                                request_id
                             ));
                         }
                     };
@@ -889,6 +907,7 @@ fn handle_setup_request(
                                     "admin_certificate": base64::engine::general_purpose::STANDARD.encode(admin_cert.to_der().unwrap_or_default()),
                                     "admin_private_key": base64::engine::general_purpose::STANDARD.encode(admin_key.private_key_to_der().unwrap_or_default()),
                                 },
+                                "request_id": request_id,
                             }
                         }),
                     );
@@ -904,34 +923,39 @@ fn handle_setup_request(
                                 "status": "error",
                                 "message": format!("Received AddFirstAdmin request but storage state is not Initialized, current storage state: {:?}", storage_status.storage_state),
                                 "data": request_json,
+                                "request_id": request_id,
                             }
                         }),
                     );
                     return Err(anyhow::anyhow!(
-                        "handle_setup_request -> Received AddFirstAdmin request but storage state is not Initialized, current storage state: {:?}",
-                        storage_status.storage_state
+                        "handle_setup_request -> Received AddFirstAdmin request but storage state is not Initialized, current storage state: {:?}, request_id: {}",
+                        storage_status.storage_state,
+                        request_id
                     ));
                 }
             }
         }
         _ => {
             tracing::error!(
-                "handle_setup_request -> Received request with unknown request_type: {}",
-                request_type
+                "handle_setup_request -> Received request with unknown request_type: {}, request_id: {}",
+                request_type,
+                request_id
             );
             send_response(
                 &response_sock,
                 &serde_json::json!({
                     "response": {
                         "status": "error",
-                        "message": format!("Received request with unknown request_type: {}", request_type),
+                        "message": format!("Received request with unknown request_type: {}, request_id: {}", request_type, request_id),
                         "data": request_json,
+                        "request_id": request_id,
                     }
                 }),
             );
             return Err(anyhow::anyhow!(
-                "handle_setup_request -> Received request with unknown request_type: {}",
-                request_type
+                "handle_setup_request -> Received request with unknown request_type: {}, request_id: {}",
+                request_type,
+                request_id
             ));
         }
     }

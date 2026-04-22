@@ -264,10 +264,7 @@ pub struct StorageStatusResults {
     pub error_message: Option<String>,
 }
 
-pub fn get_state(
-    app_config: &crate::configs::AppConfig,
-    execution_count: u32,
-) -> StorageStatusResults {
+pub fn get_state(app_config: &crate::configs::AppConfig) -> StorageStatusResults {
     let mut storage_status = StorageStatusResults {
         app_cert_exists: None,
         app_key_exists: None,
@@ -281,188 +278,191 @@ pub fn get_state(
         storage_state: StorageState::Inconsistent,
         error_message: None,
     };
-    storage_status.app_cert_exists = Some(app_config.blockchains.certificate_path.exists());
-    storage_status.app_key_exists = Some(app_config.blockchains.private_key_path.exists());
-    storage_status.cert_path_exists = Some(app_config.blockchains.certificate_path.exists());
-    storage_status.key_path_exists = Some(app_config.blockchains.private_key_path.exists());
-    storage_status.crl_path_exists = Some(app_config.blockchains.crl_path.exists());
-    if storage_status.cert_path_exists == Some(true) {
-        storage_status.cert_chain_openable = Some(
+    match app_config.key_exports.app_cert_path.exists() {
+        true => {
+            tracing::info!(
+                "get_state -> App certificate file exists at path: {:?}",
+                app_config.key_exports.app_cert_path
+            );
+            match std::fs::read(&app_config.key_exports.app_cert_path) {
+                Ok(_) => {
+                    tracing::info!(
+                        "get_state -> App certificate file is readable at path: {:?}",
+                        app_config.key_exports.app_cert_path
+                    );
+                    storage_status.app_cert_exists = Some(true);
+                }
+                Err(e) => {
+                    tracing::error!(error = %e, "get_state -> App certificate file is not readable at path: {:?}", app_config.key_exports.app_cert_path);
+                    storage_status.app_cert_exists = Some(false);
+                }
+            }
+        }
+        false => {
+            tracing::info!(
+                "get_state -> App certificate file does not exist at path: {:?}",
+                app_config.key_exports.app_cert_path
+            );
+            storage_status.app_cert_exists = Some(false);
+        }
+    };
+    match app_config.key_exports.app_key_path.exists() {
+        true => {
+            tracing::info!(
+                "get_state -> App private key file exists at path: {:?}",
+                app_config.key_exports.app_key_path
+            );
+            match std::fs::read(&app_config.key_exports.app_key_path) {
+                Ok(_) => {
+                    tracing::info!(
+                        "get_state -> App private key file is readable at path: {:?}",
+                        app_config.key_exports.app_key_path
+                    );
+                    storage_status.app_key_exists = Some(true);
+                }
+                Err(e) => {
+                    tracing::error!(error = %e, "get_state -> App private key file is not readable at path: {:?}", app_config.key_exports.app_key_path);
+                    storage_status.app_key_exists = Some(false);
+                }
+            }
+        }
+        false => {
+            tracing::info!(
+                "get_state -> App private key file does not exist at path: {:?}",
+                app_config.key_exports.app_key_path
+            );
+            storage_status.app_key_exists = Some(false);
+        }
+    };
+    match app_config.blockchains.certificate_path.exists() {
+        true => {
+            tracing::info!(
+                "get_state -> Certificate blockchain path exists: {:?}",
+                app_config.blockchains.certificate_path
+            );
+            storage_status.cert_path_exists = Some(true);
             match libblockchain::blockchain::open_chain(
                 match app_config.blockchains.certificate_path.to_str() {
                     Some(path) => path,
                     None => {
+                        tracing::error!(
+                            error = "Failed to parse certificate path from app_config",
+                            "get_state -> Failed to parse certificate path from app_config"
+                        );
                         storage_status.error_message =
                             Some("Failed to parse certificate path from app_config".to_string());
                         return storage_status;
                     }
                 },
             ) {
-                Ok(_) => true,
-                Err(e) => {
-                    tracing::error!(error = %e, "validate_storage -> Failed to open certificate blockchain.");
-                    storage_status.error_message = Some(format!(
-                        "validate_storage -> Failed to open certificate blockchain: {}",
-                        e
-                    ));
-                    false
+                Ok(_) => {
+                    tracing::info!(
+                        "get_state -> Certificate blockchain is openable at path: {:?}",
+                        app_config.blockchains.certificate_path
+                    );
+                    storage_status.cert_chain_openable = Some(true);
                 }
-            },
-        );
-    }
-    if storage_status.key_path_exists == Some(true) {
-        storage_status.key_chain_openable = Some(
+                Err(e) => {
+                    tracing::error!(error = %e, "get_state -> Certificate blockchain is not openable at path: {:?}", app_config.blockchains.certificate_path);
+                    storage_status.cert_chain_openable = Some(false);
+                }
+            }
+        }
+        false => {
+            tracing::info!(
+                "get_state -> Certificate blockchain path does not exist: {:?}",
+                app_config.blockchains.certificate_path
+            );
+            storage_status.cert_path_exists = Some(false);
+        }
+    };
+    match app_config.blockchains.private_key_path.exists() {
+        true => {
+            tracing::info!(
+                "get_state -> Private key blockchain path exists: {:?}",
+                app_config.blockchains.private_key_path
+            );
             match libblockchain::blockchain::open_chain(
                 match app_config.blockchains.private_key_path.to_str() {
                     Some(path) => path,
                     None => {
+                        tracing::error!(
+                            error = "Failed to parse private key path from app_config",
+                            "get_state -> Failed to parse private key path from app_config"
+                        );
                         storage_status.error_message =
                             Some("Failed to parse private key path from app_config".to_string());
                         return storage_status;
                     }
                 },
             ) {
-                Ok(_) => true,
-                Err(e) => {
-                    tracing::error!(error = %e, "validate_storage -> Failed to open private key blockchain.");
-                    storage_status.error_message = Some(format!(
-                        "validate_storage -> Failed to open private key blockchain: {}",
-                        e
-                    ));
-                    false
+                Ok(_) => {
+                    tracing::info!(
+                        "get_state -> Private key blockchain is openable at path: {:?}",
+                        app_config.blockchains.private_key_path
+                    );
+                    storage_status.key_chain_openable = Some(true);
                 }
-            },
-        );
-    }
-    if storage_status.crl_path_exists == Some(true) {
-        storage_status.crl_chain_openable = Some(
+                Err(e) => {
+                    tracing::error!(error = %e, "get_state -> Private key blockchain is not openable at path: {:?}", app_config.blockchains.private_key_path);
+                    storage_status.key_chain_openable = Some(false);
+                }
+            }
+        }
+        false => {
+            tracing::info!(
+                "get_state -> Private key blockchain path does not exist: {:?}",
+                app_config.blockchains.private_key_path
+            );
+            storage_status.key_path_exists = Some(false);
+        }
+    };
+    match app_config.blockchains.crl_path.exists() {
+        true => {
+            tracing::info!(
+                "get_state -> CRL blockchain path exists: {:?}",
+                app_config.blockchains.crl_path
+            );
             match libblockchain::blockchain::open_chain(
                 match app_config.blockchains.crl_path.to_str() {
                     Some(path) => path,
                     None => {
+                        tracing::error!(
+                            error = "Failed to parse CRL path from app_config",
+                            "get_state -> Failed to parse CRL path from app_config"
+                        );
                         storage_status.error_message =
                             Some("Failed to parse CRL path from app_config".to_string());
                         return storage_status;
                     }
                 },
             ) {
-                Ok(_) => true,
-                Err(e) => {
-                    tracing::error!(error = %e, "validate_storage -> Failed to open CRL blockchain.");
-                    storage_status.error_message = Some(format!(
-                        "validate_storage -> Failed to open CRL blockchain: {}",
-                        e
-                    ));
-                    false
+                Ok(_) => {
+                    tracing::info!(
+                        "get_state -> CRL blockchain is openable at path: {:?}",
+                        app_config.blockchains.crl_path
+                    );
+                    storage_status.crl_chain_openable = Some(true);
                 }
-            },
-        );
-    }
-    if !storage_status.app_cert_exists.unwrap_or(false)
-        && !storage_status.app_key_exists.unwrap_or(false)
-        && !storage_status.cert_path_exists.unwrap_or(false)
-        && !storage_status.key_path_exists.unwrap_or(false)
-        && !storage_status.crl_path_exists.unwrap_or(false)
-    {
-        let (app_cert, app_key) = match crate::encryption::create_app_cert_and_key_pair() {
-            Ok((cert, key)) => (cert, key),
-            Err(e) => {
-                tracing::error!(error = %e, "validate_storage -> Failed to generate app certificate and key.");
-                storage_status.error_message = Some(format!(
-                    "validate_storage -> Failed to generate app certificate and key: {}",
-                    e
-                ));
-                return storage_status;
-            }
-        };
-        if let Some(cert_parent_dir) = app_config.key_exports.app_cert_path.parent() {
-            if let Err(e) = std::fs::create_dir_all(cert_parent_dir) {
-                tracing::error!(error = %e, "validate_storage -> Failed to create parent directory for app certificate.");
-                storage_status.error_message = Some(format!(
-                    "validate_storage -> Failed to create parent directory for app certificate: {}",
-                    e
-                ));
-                return storage_status;
+                Err(e) => {
+                    tracing::error!(error = %e, "get_state -> CRL blockchain is not openable at path: {:?}", app_config.blockchains.crl_path);
+                    storage_status.crl_chain_openable = Some(false);
+                }
             }
         }
-        if let Some(key_parent_dir) = app_config.key_exports.app_key_path.parent() {
-            if let Err(e) = std::fs::create_dir_all(key_parent_dir) {
-                tracing::error!(error = %e, "validate_storage -> Failed to create parent directory for app private key.");
-                storage_status.error_message = Some(format!(
-                    "validate_storage -> Failed to create parent directory for app private key: {}",
-                    e
-                ));
-                return storage_status;
-            }
+        false => {
+            tracing::info!(
+                "get_state -> CRL blockchain path does not exist: {:?}",
+                app_config.blockchains.crl_path
+            );
+            storage_status.crl_path_exists = Some(false);
         }
-        match std::fs::write(
-            &app_config.key_exports.app_cert_path,
-            match app_cert.to_pem() {
-                Ok(pem) => pem,
-                Err(e) => {
-                    tracing::error!(error = %e, "validate_storage -> Failed to convert app certificate to PEM.");
-                    storage_status.error_message = Some(format!(
-                        "validate_storage -> Failed to convert app certificate to PEM: {}",
-                        e
-                    ));
-                    return storage_status;
-                }
-            },
-        ) {
-            Ok(_) => (),
-            Err(e) => {
-                tracing::error!(error = %e, "validate_storage -> Failed to write app certificate to file.");
-                storage_status.error_message = Some(format!(
-                    "validate_storage -> Failed to write app certificate to file: {}",
-                    e
-                ));
-                return storage_status;
-            }
-        };
-        match std::fs::write(
-            &app_config.key_exports.app_key_path,
-            match app_key.private_key_to_pem_pkcs8() {
-                Ok(pem) => pem,
-                Err(e) => {
-                    tracing::error!(error = %e, "validate_storage -> Failed to convert app private key to PEM.");
-                    storage_status.error_message = Some(format!(
-                        "validate_storage -> Failed to convert app private key to PEM: {}",
-                        e
-                    ));
-                    return storage_status;
-                }
-            },
-        ) {
-            Ok(_) => (),
-            Err(e) => {
-                tracing::error!(error = %e, "validate_storage -> Failed to write app private key to file.");
-                storage_status.error_message = Some(format!(
-                    "validate_storage -> Failed to write app private key to file: {}",
-                    e
-                ));
-                return storage_status;
-            }
-        };
-        let storage = Storage::<crate::storage_empty::Empty> {
-            state: crate::storage_empty::Empty {},
-            app_config: app_config.clone(),
-        };
-        let storage = storage.create_storage();
-        storage.initialize_storage();
-        if execution_count > 4 {
-            storage_status.error_message = Some(format!(
-                "validate_storage -> Storage state check has been attempted {} times. Manual intervention may be required.",
-                execution_count
-            ));
-            return storage_status;
-        }
-        get_state(app_config, execution_count + 1);
-    }
+    };
     if !storage_status.app_cert_exists.unwrap_or(false)
         || !storage_status.app_key_exists.unwrap_or(false)
-        || !storage_status.cert_path_exists.unwrap_or(false)
-        || !storage_status.key_path_exists.unwrap_or(false)
-        || !storage_status.crl_path_exists.unwrap_or(false)
+        || !storage_status.cert_chain_openable.unwrap_or(false)
+        || !storage_status.key_chain_openable.unwrap_or(false)
+        || !storage_status.crl_chain_openable.unwrap_or(false)
     {
         storage_status.storage_state = StorageState::Inconsistent;
         storage_status.error_message = Some(
@@ -471,9 +471,21 @@ pub fn get_state(
         );
         return storage_status;
     }
-    if storage_status.cert_chain_openable == Some(true)
-        && storage_status.key_chain_openable == Some(true)
-        && storage_status.crl_chain_openable == Some(true)
+    if !storage_status.app_cert_exists.unwrap_or(false)
+        && !storage_status.app_key_exists.unwrap_or(false)
+        && !storage_status.cert_path_exists.unwrap_or(false)
+        && !storage_status.key_path_exists.unwrap_or(false)
+        && !storage_status.crl_path_exists.unwrap_or(false)
+    {
+        storage_status.storage_state = StorageState::Empty;
+        return storage_status;
+    }
+
+    if storage_status.app_cert_exists.unwrap_or(false)
+        && storage_status.app_key_exists.unwrap_or(false)
+        && storage_status.cert_chain_openable.unwrap_or(false)
+        && storage_status.key_chain_openable.unwrap_or(false)
+        && storage_status.crl_chain_openable.unwrap_or(false)
     {
         storage_status.storage_state = StorageState::Created;
         let storage = Storage::<crate::storage_created::Created> {
@@ -561,41 +573,13 @@ pub fn get_state(
             .as_ref()
             .unwrap()
             .cert_height
-            == 0
+            == 2
             && storage_status
                 .validation_result
                 .as_ref()
                 .unwrap()
                 .key_height
-                == 0
-            && storage_status
-                .validation_result
-                .as_ref()
-                .unwrap()
-                .cert_blockchain_valid
-                == Some(true)
-            && storage_status
-                .validation_result
-                .as_ref()
-                .unwrap()
-                .key_blockchain_valid
-                == Some(true)
-        {
-            storage.initialize_storage();
-            get_state(app_config, execution_count + 1);
-        }
-        if storage_status
-            .validation_result
-            .as_ref()
-            .unwrap()
-            .cert_height
-            == 1
-            && storage_status
-                .validation_result
-                .as_ref()
-                .unwrap()
-                .key_height
-                == 1
+                == 2
             && storage_status
                 .validation_result
                 .as_ref()
@@ -617,13 +601,41 @@ pub fn get_state(
             .as_ref()
             .unwrap()
             .cert_height
-            > 1
+            > 2
             && storage_status
                 .validation_result
                 .as_ref()
                 .unwrap()
                 .key_height
-                > 1
+                > 2
+            && storage_status
+                .validation_result
+                .as_ref()
+                .unwrap()
+                .cert_blockchain_valid
+                == Some(true)
+            && storage_status
+                .validation_result
+                .as_ref()
+                .unwrap()
+                .key_blockchain_valid
+                == Some(true)
+        {
+            storage_status.storage_state = StorageState::Ready;
+            return storage_status;
+        }
+        if storage_status
+            .validation_result
+            .as_ref()
+            .unwrap()
+            .cert_height
+            > 2
+            && storage_status
+                .validation_result
+                .as_ref()
+                .unwrap()
+                .key_height
+                > 2
             && storage_status
                 .validation_result
                 .as_ref()
@@ -662,11 +674,13 @@ pub fn get_state(
                         .to_string(),
                 );
                 return storage_status;
+            } else {
+                storage_status.storage_state = StorageState::Ready;
+                return storage_status;
             }
-            storage_status.storage_state = StorageState::Ready;
-            return storage_status;
         }
     }
+    // If we reach this point, it means the storage is in the Created state and doesn't contain any key information.
     storage_status
 }
 

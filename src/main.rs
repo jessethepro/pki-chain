@@ -27,7 +27,7 @@ fn main() {
             return;
         }
     };
-    let mut storage_status = get_state(&app_config, 1);
+    let mut storage_status = get_state(&app_config);
     while storage_status.error_message.is_none() {
         match storage_status.storage_state {
             StorageState::Ready => {
