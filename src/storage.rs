@@ -893,6 +893,8 @@ pub fn get_admin_storage(
             certificate_chain: storage.state.certificate_chain,
             private_key_chain: storage.state.private_key_chain,
             crl_chain: storage.state.crl_chain,
+            auth_store: storage.state.auth_store,
+            auth_chain: storage.state.auth_chain,
         },
         app_config: storage.app_config.clone(),
     })
@@ -958,11 +960,121 @@ pub fn get_initialized_storage(
             ));
         }
     };
+    let root_cert = match crate::storage::get_root_certificate(
+        &certificate_chain,
+        &crate::encryption::get_app_private_key(app_config)?,
+    ) {
+        Ok(cert) => cert,
+        Err(e) => {
+            tracing::error!(error = %e, "get_initialized_storage -> Failed to get root certificate from certificate blockchain.");
+            return Err(anyhow::anyhow!(
+                "get_initialized_storage -> Failed to get root certificate from certificate blockchain: {}",
+                e
+            ));
+        }
+    };
+    let root_key = match crate::storage::get_root_private_key(
+        &private_key_chain,
+        &crate::encryption::get_app_private_key(app_config)?,
+    ) {
+        Ok(key) => key,
+        Err(e) => {
+            tracing::error!(error = %e, "get_initialized_storage -> Failed to get root private key from private key blockchain.");
+            return Err(anyhow::anyhow!(
+                "get_initialized_storage -> Failed to get root private key from private key blockchain: {}",
+                e
+            ));
+        }
+    };
+    let root_valid = match crate::encryption::validate_self_signed_root_pair(&root_cert, &root_key)
+    {
+        Ok(valid) => valid,
+        Err(e) => {
+            tracing::error!(error = %e, "get_initialized_storage -> Failed to validate root certificate and root private key pair.");
+            return Err(anyhow::anyhow!(
+                "get_initialized_storage -> Failed to validate root certificate and root private key pair: {}",
+                e
+            ));
+        }
+    };
+    if !root_valid {
+        tracing::error!(
+            "get_initialized_storage -> Root certificate and root private key pair are not valid."
+        );
+        return Err(anyhow::anyhow!(
+            "get_initialized_storage -> Root certificate and root private key pair are not valid."
+        ));
+    }
+    let auth_store = match crate::encryption::build_client_auth_store_from_root_ca(&root_cert) {
+        Ok(store) => store,
+        Err(e) => {
+            tracing::error!(error = %e, "get_initialized_storage -> Failed to build client auth store from root certificate.");
+            return Err(anyhow::anyhow!(
+                "get_initialized_storage -> Failed to build client auth store from root certificate: {}",
+                e
+            ));
+        }
+    };
+    let default_interm_cert = match crate::storage::get_default_admin_intermediate_certificate(
+        &certificate_chain,
+        &crate::encryption::get_app_private_key(app_config)?,
+    ) {
+        Ok(cert) => cert,
+        Err(e) => {
+            tracing::error!(error = %e, "get_initialized_storage -> Failed to get default admin intermediate certificate from certificate blockchain.");
+            return Err(anyhow::anyhow!(
+                    "get_initialized_storage -> Failed to get default admin intermediate certificate from certificate blockchain: {}",
+                    e
+                ));
+        }
+    };
+    let admin_valid = match crate::encryption::validate_intermediate_cert_chain(
+        &default_interm_cert,
+        &auth_store,
+    ) {
+        Ok(valid) => valid,
+        Err(e) => {
+            tracing::error!(error = %e, "get_initialized_storage -> Failed to validate default admin intermediate certificate against root certificate.");
+            return Err(anyhow::anyhow!(
+                    "get_initialized_storage -> Failed to validate default admin intermediate certificate against root certificate: {}",
+                    e
+                ));
+        }
+    };
+    if !admin_valid {
+        tracing::error!(
+            "get_initialized_storage -> Default admin intermediate certificate is not valid against root certificate."
+        );
+        return Err(anyhow::anyhow!(
+            "get_initialized_storage -> Default admin intermediate certificate is not valid against root certificate."
+        ));
+    }
+    let auth_chain = match openssl::stack::Stack::new() {
+        Ok(mut stack) => {
+            stack.push(default_interm_cert).map_err(|e| {
+                tracing::error!(error = %e, "get_initialized_storage -> Failed to push default admin intermediate certificate onto stack for certificate chain validation.");
+                anyhow::anyhow!(
+                    "get_initialized_storage -> Failed to push default admin intermediate certificate onto stack for certificate chain validation: {}",
+                    e
+                )
+            })?;
+            stack
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "get_initialized_storage -> Failed to create stack for certificate chain validation.");
+            return Err(anyhow::anyhow!(
+                "get_initialized_storage -> Failed to create stack for certificate chain validation: {}",
+                e
+            ));
+        }
+    };
     Ok(Storage {
         state: crate::storage_initialized::Initialized {
             certificate_chain,
             private_key_chain,
             crl_chain,
+            auth_store,
+            auth_chain,
         },
         app_config: app_config.clone(),
     })

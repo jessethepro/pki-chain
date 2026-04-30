@@ -6,6 +6,37 @@ pub struct API {
 }
 
 impl crate::storage::Storage<API> {
+    pub fn close(self) -> anyhow::Result<crate::storage::Storage<crate::storage_ready::Ready>> {
+        let private_key_chain = match libblockchain::blockchain::open_chain(
+            match self.app_config.blockchains.private_key_path.to_str() {
+                Some(path) => path,
+                None => {
+                    return Err(anyhow::anyhow!(
+                    "get_initialized_storage -> Failed to parse private key path from app_config"
+                ))
+                }
+            },
+        ) {
+            Ok(chain) => chain,
+            Err(e) => {
+                tracing::error!(error = %e, "get_initialized_storage -> Failed to open private key blockchain.");
+                return Err(anyhow::anyhow!(
+                    "get_initialized_storage -> Failed to open private key blockchain: {}",
+                    e
+                ));
+            }
+        };
+        Ok(crate::storage::Storage {
+            state: crate::storage_ready::Ready {
+                certificate_chain: self.state.certificate_chain,
+                private_key_chain,
+                crl_chain: self.state.crl_chain,
+                auth_store: self.state.auth_store,
+                auth_chain: self.state.auth_chain,
+            },
+            app_config: self.app_config,
+        })
+    }
     pub fn get_certificate_by_serial(
         &mut self,
         cert_serial: openssl::bn::BigNum,

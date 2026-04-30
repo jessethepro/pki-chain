@@ -146,11 +146,11 @@ pub fn start_api_server(
             std::process::exit(1);
         }
     };
-    let storage = get_api_storage(storage).expect("Failed to get API storage");
+    let mut storage = get_api_storage(storage).expect("Failed to get API storage");
     for stream in listener.incoming() {
         match stream {
             Ok(stream) => {
-                handle_api_request(&stream, &storage);
+                handle_api_request(&stream, &mut storage);
             }
             Err(e) => {
                 eprintln!("Failed to accept connection: {}", e);
@@ -162,7 +162,7 @@ pub fn start_api_server(
 
 fn handle_api_request(
     stream: &std::os::unix::net::UnixStream,
-    storage: &crate::storage::Storage<crate::storage_api::API>,
+    storage: &mut crate::storage::Storage<crate::storage_api::API>,
 ) {
     let request_id = uuid::Uuid::new_v4().to_string();
     let request_json = match recv_request(stream) {
@@ -323,10 +323,10 @@ fn handle_api_request(
         );
         return;
     }
-    // Check the requester is authorized by verifying the requester certificate against the cert chain.
+    // Check the requester is authorized by verifying the requester certificate against the auth chain.
     match crate::encryption::verify_client_auth_cert_chain(
-        &storage.state.cert_store,
-        &storage.state.cert_user_intermediate_stack,
+        &storage.state.auth_store,
+        &storage.state.auth_chain,
         &requester_cert,
     ) {
         true => {}
@@ -384,8 +384,8 @@ fn handle_api_request(
                 match storage.get_certificate_by_serial(requested_cert_serial_number.unwrap()) {
                     Ok((cert, _)) => {
                         let is_verified = match crate::encryption::verify_client_auth_cert_chain(
-                            &storage.state.cert_store,
-                            &storage.state.cert_user_intermediate_stack,
+                            &storage.state.auth_store,
+                            &storage.state.auth_chain,
                             &cert,
                         ) {
                             true => true,
@@ -468,8 +468,8 @@ fn handle_api_request(
                     }
                 };
                 let is_verified = match crate::encryption::verify_client_auth_cert_chain(
-                    &storage.state.cert_store,
-                    &storage.state.cert_user_intermediate_stack,
+                    &storage.state.auth_store,
+                    &storage.state.auth_chain,
                     &reqeusted_cert,
                 ) {
                     true => true,
