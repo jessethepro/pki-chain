@@ -66,13 +66,19 @@ pub fn recv_request(
     }
 }
 
-/*
-* The JSON format for the response is:
+/* The response will be a JSON object with the following format:
 {
-    "status": "success" | "error",
-    "message": "Detailed message about the result of the request",
-    "data": {
-        // Optional field containing additional data relevant to the request
+    "response": {
+        "request_id": "The unique ID of the request being responded to",
+        "status": "success" | "error",
+        "message": "Detailed message about the result of the request",
+        "storage_state": "The current storage state after handling the request",
+        "data": {
+            // Optional field containing additional data relevant to the request
+            // For AddFirstAdmin request, this will include the admin certificate and private key in base64 format
+            "admin_certificate": "Base64-encoded DER format of the admin certificate",
+            "admin_private_key": "Base64-encoded DER format of the admin private key",
+        }
     }
 }
 */
@@ -589,7 +595,14 @@ fn handle_setup_request(
     let request_json: serde_json::Value = match serde_json::from_slice(&payload_buffer).inspect_err(
         |e| tracing::error!(error = %e, "handle_setup_request -> Failed to parse request JSON. Request ID: {}", request_id),
     ) {
-        Ok(json) => json,
+        Ok(json) => {
+            tracing::info!(
+                "handle_setup_request -> Received request JSON: {}. Request ID: {}",
+                json,
+                request_id
+            );
+            json
+        }
         Err(_) => {
             return Err(anyhow::anyhow!(
                 "handle_setup_request -> Failed to parse request JSON. Request ID: {}", request_id
@@ -597,7 +610,7 @@ fn handle_setup_request(
         }
     };
     let request_type = match request_json
-        .pointer("request/request_type")
+        .pointer("/request/request_type")
         .and_then(|v| v.as_str())
     {
         Some(rt) => rt,
@@ -608,7 +621,7 @@ fn handle_setup_request(
             ));
         }
     };
-    let response_sock = match request_json.pointer("request/response_socket").and_then(|v| v.as_str()) {
+    let response_sock = match request_json.pointer("/request/response_socket").and_then(|v| v.as_str()) {
         Some(s) => match std::os::unix::net::UnixStream::connect(s).inspect_err(
             |e| tracing::error!(socket = s, error = %e, "handle_setup_request -> Failed to connect to response socket. Request ID: {}", request_id),
         ) {
@@ -637,7 +650,7 @@ fn handle_setup_request(
                         "status": "success",
                         "message": "handle_setup_request -> Storage state retrieved successfully",
                         "data": {
-                            "storage_state": serde_json::to_value(&storage_status).unwrap_or(serde_json::Value::Null),
+                            "storage_status": serde_json::to_value(&storage_status).unwrap_or(serde_json::Value::Null),
                         },
                     }
                 }),
@@ -654,7 +667,7 @@ fn handle_setup_request(
                 crate::storage::StorageState::Empty => {
                     tracing::info!("handle_setup_request -> Storage state is Empty, proceeding to create and initialize storage");
                     let new_storage: bool = match request_json
-                        .pointer("request/create_new_storage")
+                        .pointer("/request/create_new_storage")
                         .and_then(|v| v.as_bool())
                     {
                         Some(b) => b,
@@ -677,7 +690,7 @@ fn handle_setup_request(
                         }
                     };
                     if new_storage {
-                        let new_admin_data = match parse_admin_cert_data(&request_json) {
+                        let mut new_admin_data = match parse_admin_cert_data(&request_json) {
                             Ok(data) => data,
                             Err(e) => {
                                 tracing::error!(error = %e, "handle_setup_request -> Failed to parse admin certificate data from request");
@@ -698,6 +711,10 @@ fn handle_setup_request(
                                 ));
                             }
                         };
+                        if new_admin_data.issuer_common_name == "None" {
+                            new_admin_data.issuer_common_name =
+                                app_config.admin_ca_defaults.admin_ca_common_name.clone();
+                        }
                         let storage_empty = crate::storage::get_empty_storage(app_config);
                         let (admin_cert, admin_key) = storage_empty
                             .create_storage()
@@ -964,17 +981,20 @@ fn handle_setup_request(
 /*
  * The format for the setup server request is a JSON object with the following fields:
 {   "Request":{
-        "request_type": "CreateAndInitialize" | "Initialize" | "AddFirstAdmin",
+        "request_type": "CreateAndInitialize" | "Initialize" | "AddFirstAdmin" | "GetState", // CreateAndInitialize is used when storage state is Empty, Initialize is used when storage state is Created, AddFirstAdmin is used when storage state is Initialized, GetState can be used at any time to get the current storage state
         "response_socket": "Path to the Unix socket where the response should be sent",
-        "admin_certificate_data": {
-            "subject_common_name": "Common Name for the admin certificate",
-            "issuer_common_name": "Common Name for the issuer (Intermediate CA Name) certificate",
-            "organization": "Organization for the admin certificate",
-            "organizational_unit": "Organizational Unit for the admin certificate",
-            "locality": "Locality for the admin certificate",
-            "state": "State for the admin certificate",
-            "country": "Country for the admin certificate",
-            "validity_days": "Number of days the admin certificate should be valid for",
+        "create_new_storage": true | false, // Only applicable for CreateAndInitialize request type, indicates whether to create new storage or just initialize existing storage
+        "data": {
+            "admin_certificate_data": {
+                "subject_common_name": "Common Name for the admin certificate",
+                "issuer_common_name": "Common Name for the issuer (Intermediate CA Name) certificate",
+                "organization": "Organization for the admin certificate",
+                "organizational_unit": "Organizational Unit for the admin certificate",
+                "locality": "Locality for the admin certificate",
+                "state": "State for the admin certificate",
+                "country": "Country for the admin certificate",
+                "validity_days": "Number of days the admin certificate should be valid for",
+            }
         }
     }
 }
@@ -1002,7 +1022,7 @@ pub fn start_setup_server(
     storage_status: crate::storage::StorageStatusResults,
 ) -> crate::storage::StorageStatusResults {
     let _ = std::fs::remove_file(app_config.server.comm_sock.clone());
-    let listener = std::os::unix::net::UnixListener::bind(app_config.server.setup_sock.clone())
+    let listener = std::os::unix::net::UnixListener::bind(app_config.server.comm_sock.clone())
         .expect("Failed to bind to setup socket");
     tracing::info!(
         socket = app_config.server.setup_sock.to_str().unwrap_or("N/A"),
@@ -1074,7 +1094,7 @@ fn parse_admin_cert_data(
 ) -> Result<crate::pki_generator::CertificateData, anyhow::Error> {
     let admin_cert_data = crate::pki_generator::CertificateData {
         subject_common_name: match request_json
-            .pointer("request/admin_certificate_data/subject_common_name")
+            .pointer("/request/data/admin_certificate_data/subject_common_name")
             .and_then(|v| v.as_str())
         {
             Some(s) => s.to_string(),
@@ -1086,19 +1106,17 @@ fn parse_admin_cert_data(
             }
         },
         issuer_common_name: match request_json
-            .pointer("request/admin_certificate_data/issuer_common_name")
+            .pointer("/request/data/admin_certificate_data/issuer_common_name")
             .and_then(|v| v.as_str())
         {
             Some(s) => s.to_string(),
             None => {
-                tracing::error!("parse_admin_cert_data -> CreateAndInitialize request missing required field: admin_certificate_data.issuer_common_name");
-                return Err(anyhow::anyhow!(
-                    "parse_admin_cert_data -> CreateAndInitialize request missing required field: admin_certificate_data.issuer_common_name"
-                ));
+                tracing::info!("parse_admin_cert_data -> CreateAndInitialize request missing required field: admin_certificate_data.issuer_common_name");
+                "None".to_string()
             }
         },
         organization: match request_json
-            .pointer("request/admin_certificate_data/organization")
+            .pointer("/request/data/admin_certificate_data/organization")
             .and_then(|v| v.as_str())
         {
             Some(s) => s.to_string(),
@@ -1110,7 +1128,7 @@ fn parse_admin_cert_data(
             }
         },
         organizational_unit: match request_json
-            .pointer("request/admin_certificate_data/organizational_unit")
+            .pointer("/request/data/admin_certificate_data/organizational_unit")
             .and_then(|v| v.as_str())
         {
             Some(s) => s.to_string(),
@@ -1122,7 +1140,7 @@ fn parse_admin_cert_data(
             }
         },
         locality: match request_json
-            .pointer("request/admin_certificate_data/locality")
+            .pointer("/request/data/admin_certificate_data/locality")
             .and_then(|v| v.as_str())
         {
             Some(s) => s.to_string(),
@@ -1134,7 +1152,7 @@ fn parse_admin_cert_data(
             }
         },
         state: match request_json
-            .pointer("request/admin_certificate_data/state")
+            .pointer("/request/data/admin_certificate_data/state")
             .and_then(|v| v.as_str())
         {
             Some(s) => s.to_string(),
@@ -1146,7 +1164,7 @@ fn parse_admin_cert_data(
             }
         },
         country: match request_json
-            .pointer("request/admin_certificate_data/country")
+            .pointer("/request/data/admin_certificate_data/country")
             .and_then(|v| v.as_str())
         {
             Some(s) => s.to_string(),
@@ -1157,7 +1175,7 @@ fn parse_admin_cert_data(
             }
         },
         validity_days: match request_json
-            .pointer("request/admin_certificate_data/validity_days")
+            .pointer("/request/data/admin_certificate_data/validity_days")
             .and_then(|v| v.as_u64())
         {
             Some(d) => d as u32,

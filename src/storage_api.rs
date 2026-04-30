@@ -1,173 +1,81 @@
 pub struct API {
     pub certificate_chain: libblockchain::blockchain::BlockChain,
-    pub private_key_chain: libblockchain::blockchain::BlockChain,
     pub crl_chain: libblockchain::blockchain::BlockChain,
-    pub cert_store: openssl::x509::store::X509Store,
-    pub cert_user_intermediate_stack: openssl::stack::Stack<openssl::x509::X509>,
-    pub cert_admin_intermediate_stack: openssl::stack::Stack<openssl::x509::X509>,
+    pub auth_store: openssl::x509::store::X509Store,
+    pub auth_chain: openssl::stack::Stack<openssl::x509::X509>,
 }
 
 impl crate::storage::Storage<API> {
-    pub fn initialize(&mut self) -> anyhow::Result<()> {
-        // Load the certificate chain and build the cert store
-        let app_key = crate::encryption::get_app_private_key(&self.app_config)?;
-        let (cert_block, cert_signature) = match self.state.certificate_chain.get_block_by_height(0)
-        {
-            (Ok(block), Ok(signature)) => (block, signature),
-            (Err(e), _) | (_, Err(e)) => {
-                return Err(anyhow::anyhow!(
-                    "initialize -> Failed to get block by height {}: {}",
-                    0,
-                    e
-                ))
-            }
-        };
-        let (root_cert, cert_verified) = match crate::encryption::verify_and_decrypt_cert(
-            cert_block.block_data().as_slice(),
-            cert_signature.as_slice(),
-            app_key.clone(),
-        ) {
-            (Ok(data), Ok(verified)) => (data, verified),
-            (Err(e), _) | (_, Err(e)) => {
-                return Err(anyhow::anyhow!(
-                    "initialize -> Failed to verify and decrypt certificate: {}",
-                    e
-                ))
-            }
-        };
-        if !cert_verified {
-            return Err(anyhow::anyhow!(
-                "initialize -> Certificate at height {} failed signature verification",
-                0
-            ));
-        }
-        let (cert_block, cert_signature) = match self.state.certificate_chain.get_block_by_height(1)
-        {
-            (Ok(block), Ok(signature)) => (block, signature),
-            (Err(e), _) | (_, Err(e)) => {
-                return Err(anyhow::anyhow!(
-                    "initialize -> Failed to get block by height {}: {}",
-                    1,
-                    e
-                ))
-            }
-        };
-        let (admin_interm_cert, cert_verified) = match crate::encryption::verify_and_decrypt_cert(
-            cert_block.block_data().as_slice(),
-            cert_signature.as_slice(),
-            app_key.clone(),
-        ) {
-            (Ok(data), Ok(verified)) => (data, verified),
-            (Err(e), _) | (_, Err(e)) => {
-                return Err(anyhow::anyhow!(
-                    "initialize -> Failed to verify and decrypt certificate: {}",
-                    e
-                ))
-            }
-        };
-        if !cert_verified {
-            return Err(anyhow::anyhow!(
-                "initialize -> Certificate at height {} failed signature verification",
-                1
-            ));
-        }
-        self.state
-            .cert_admin_intermediate_stack
-            .push(admin_interm_cert.clone())
-            .map_err(|e| anyhow::anyhow!("Failed to push admin intermediate cert: {}", e))?;
-        for i in 2..self.state.certificate_chain.block_count()? {
-            let (cert_block, cert_signature) =
-                match self.state.certificate_chain.get_block_by_height(i) {
-                    (Ok(block), Ok(signature)) => (block, signature),
-                    (Err(e), _) | (_, Err(e)) => {
-                        return Err(anyhow::anyhow!(
-                            "initialize -> Failed to get block by height {}: {}",
-                            i,
-                            e
-                        ))
-                    }
-                };
-            let (cert, cert_verified) = match crate::encryption::verify_and_decrypt_cert(
-                cert_block.block_data().as_slice(),
-                cert_signature.as_slice(),
-                app_key.clone(),
-            ) {
-                (Ok(data), Ok(verified)) => (data, verified),
-                (Err(e), _) | (_, Err(e)) => {
-                    return Err(anyhow::anyhow!(
-                        "initialize -> Failed to verify and decrypt certificate: {}",
-                        e
-                    ))
-                }
-            };
-            if !cert_verified {
-                return Err(anyhow::anyhow!(
-                    "initialize -> Certificate at height {} failed signature verification",
-                    i
-                ));
-            }
-            match crate::encryption::validate_intermediate_ca_against_root_ca(&cert, &root_cert) {
-                Ok(true) => {
-                    self.state
-                        .cert_user_intermediate_stack
-                        .push(cert.clone())
-                        .map_err(|e| {
-                            anyhow::anyhow!(
-                                "initialize -> Failed to push admin intermediate cert: {}",
-                                e
-                            )
-                        })?;
-                }
-                Ok(false) => continue, // Not a valid intermediate CA, skip it
-                Err(e) => {
-                    return Err(anyhow::anyhow!(
-                        "initialize -> Failed to validate intermediate CA against root CA: {}",
-                        e
-                    ))
-                }
-            }
-        }
-        Ok(())
-    }
     pub fn get_certificate_by_serial(
-        &self,
+        &mut self,
         cert_serial: openssl::bn::BigNum,
-    ) -> anyhow::Result<(openssl::x509::X509, u64)> {
+    ) -> anyhow::Result<(openssl::x509::X509, bool)> {
         let app_key = crate::encryption::get_app_private_key(&self.app_config)?;
         let block_count = self.state.certificate_chain.block_count()?;
-        for i in 1..block_count {
-            let (cert_block, cert_signature) =
-                match self.state.certificate_chain.get_block_by_height(i) {
-                    (Ok(block), Ok(signature)) => (block, signature),
-                    (Err(e), _) | (_, Err(e)) => {
+        for i in 2..block_count - 1 {
+            let cert_block = match self.state.certificate_chain.get_block_by_height(i) {
+                (Ok(block), Ok(_)) => block,
+                (Err(e), _) | (_, Err(e)) => {
+                    return Err(anyhow::anyhow!(
+                        "get_certificate_by_serial -> Failed to get block by height {}: {}",
+                        i,
+                        e
+                    ))
+                }
+            };
+            let cert_data =
+                match crate::encryption::decrypt_data(cert_block.block_data().as_slice(), &app_key)
+                {
+                    Ok(data) => data,
+                    Err(e) => {
                         return Err(anyhow::anyhow!(
-                            "get_certificate_by_serial -> Failed to get block by height {}: {}",
+                    "get_certificate_by_serial -> Failed to decrypt certificate at height {}: {}",
+                    i,
+                    e
+                ))
+                    }
+                };
+            let cert = match openssl::x509::X509::from_der(&cert_data) {
+                Ok(cert) => cert,
+                Err(e) => {
+                    return Err(anyhow::anyhow!(
+                        "get_certificate_by_serial -> Failed to parse certificate at height {}: {}",
+                        i,
+                        e
+                    ))
+                }
+            };
+            if crate::storage::cert_is_intermediate(&cert, &self.app_config) {
+                let cert_der = match cert.to_der() {
+                    Ok(der) => der,
+                    Err(e) => {
+                        return Err(anyhow::anyhow!(
+                            "get_certificate_by_serial -> Failed to convert certificate to DER at height {}: {}",
                             i,
                             e
                         ))
                     }
                 };
-            let (cert, cert_verified) = match crate::encryption::verify_and_decrypt_cert(
-                cert_block.block_data().as_slice(),
-                cert_signature.as_slice(),
-                app_key.clone(),
-            ) {
-                (Ok(data), Ok(verified)) => (data, verified),
-                (Err(e), _) | (_, Err(e)) => {
-                    return Err(anyhow::anyhow!(
-                        "get_certificate_by_serial -> Failed to verify and decrypt certificate: {}",
-                        e
-                    ))
+                let cert_in_chain =
+                    self.state
+                        .auth_chain
+                        .iter()
+                        .any(|existing| match existing.to_der() {
+                            Ok(existing_der) => existing_der == cert_der,
+                            Err(_) => false,
+                        });
+                if !cert_in_chain {
+                    &mut self.state.auth_chain.push(cert.clone())?;
                 }
-            };
-            if !cert_verified {
-                return Err(anyhow::anyhow!(
-                    "get_certificate_by_serial -> Certificate at height {} failed signature verification",
-                    i
-                ));
-            }
-            if cert.serial_number().to_bn()? == cert_serial {
-                return Ok((cert, i));
+            } else {
+                if cert.serial_number().to_bn()? == cert_serial {
+                    let is_valid = crate::encryption::verify_client_auth_cert_chain(
+                        &self.state.auth_store,
+                        &self.state.auth_chain,
+                        &cert,
+                    );
+                    return Ok((cert, is_valid));
+                }
             }
         }
         Err(anyhow::anyhow!(
@@ -175,53 +83,85 @@ impl crate::storage::Storage<API> {
             cert_serial.to_dec_str()?
         ))
     }
-
     pub fn get_certificate_by_common_name(
-        &self,
+        &mut self,
         common_name: &str,
-    ) -> anyhow::Result<(openssl::x509::X509, u64)> {
+    ) -> anyhow::Result<(openssl::x509::X509, bool)> {
         let app_key = crate::encryption::get_app_private_key(&self.app_config)?;
         let block_count = self.state.certificate_chain.block_count()?;
-        for i in 1..block_count {
-            let (cert_block, cert_signature) =
-                match self.state.certificate_chain.get_block_by_height(i) {
-                    (Ok(block), Ok(signature)) => (block, signature),
-                    (Err(e), _) | (_, Err(e)) => return Err(anyhow::anyhow!(
-                        "get_certificate_by_common_name -> Failed to get block by height {}: {}",
-                        i,
-                        e
-                    )),
-                };
-            let (cert, cert_verified) = match crate::encryption::verify_and_decrypt_cert(
-                cert_block.block_data().as_slice(),
-                cert_signature.as_slice(),
-                app_key.clone(),
-            ) {
-                (Ok(data), Ok(verified)) => (data, verified),
+        for i in 2..block_count - 1 {
+            let cert_block = match self.state.certificate_chain.get_block_by_height(i) {
+                (Ok(block), Ok(_)) => block,
                 (Err(e), _) | (_, Err(e)) => {
                     return Err(anyhow::anyhow!(
-                        "get_certificate_by_common_name -> Failed to verify and decrypt certificate: {}",
+                        "get_certificate_by_serial -> Failed to get block by height {}: {}",
+                        i,
                         e
                     ))
                 }
             };
-            if !cert_verified {
-                return Err(anyhow::anyhow!(
-                    "get_certificate_by_common_name -> Certificate at height {} failed signature verification",
-                    i
-                ));
-            }
-            if cert
-                .subject_name()
-                .entries_by_nid(openssl::nid::Nid::COMMONNAME)
-                .any(|entry| {
-                    entry
-                        .data()
-                        .as_utf8()
-                        .map_or(false, |data| data.to_string() == common_name)
-                })
-            {
-                return Ok((cert, i));
+            let cert_data =
+                match crate::encryption::decrypt_data(cert_block.block_data().as_slice(), &app_key)
+                {
+                    Ok(data) => data,
+                    Err(e) => {
+                        return Err(anyhow::anyhow!(
+                    "get_certificate_by_serial -> Failed to decrypt certificate at height {}: {}",
+                    i,
+                    e
+                ))
+                    }
+                };
+            let cert = match openssl::x509::X509::from_der(&cert_data) {
+                Ok(cert) => cert,
+                Err(e) => {
+                    return Err(anyhow::anyhow!(
+                        "get_certificate_by_serial -> Failed to parse certificate at height {}: {}",
+                        i,
+                        e
+                    ))
+                }
+            };
+            if crate::storage::cert_is_intermediate(&cert, &self.app_config) {
+                let cert_der = match cert.to_der() {
+                    Ok(der) => der,
+                    Err(e) => {
+                        return Err(anyhow::anyhow!(
+                            "get_certificate_by_serial -> Failed to convert certificate to DER at height {}: {}",
+                            i,
+                            e
+                        ))
+                    }
+                };
+                let cert_in_chain =
+                    self.state
+                        .auth_chain
+                        .iter()
+                        .any(|existing| match existing.to_der() {
+                            Ok(existing_der) => existing_der == cert_der,
+                            Err(_) => false,
+                        });
+                if !cert_in_chain {
+                    &mut self.state.auth_chain.push(cert.clone())?;
+                }
+            } else {
+                if cert
+                    .subject_name()
+                    .entries_by_nid(openssl::nid::Nid::COMMONNAME)
+                    .any(|entry| {
+                        entry
+                            .data()
+                            .as_utf8()
+                            .map_or(false, |data| data.to_string() == common_name)
+                    })
+                {
+                    let is_valid = crate::encryption::verify_client_auth_cert_chain(
+                        &self.state.auth_store,
+                        &self.state.auth_chain,
+                        &cert,
+                    );
+                    return Ok((cert, is_valid));
+                }
             }
         }
         Err(anyhow::anyhow!(

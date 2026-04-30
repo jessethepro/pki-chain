@@ -8,6 +8,13 @@ impl crate::storage::Storage<Created> {
     pub fn initialize_storage(
         self,
     ) -> crate::storage::Storage<crate::storage_initialized::Initialized> {
+        let app_public_key = match crate::encryption::get_app_public_key(&self.app_config) {
+            Ok(key) => key,
+            Err(e) => {
+                tracing::error!(error = %e, "initialize_storage -> Failed to get app public key.");
+                std::process::exit(1);
+            }
+        };
         let (root_private_key, root_cert) = || -> (openssl::pkey::PKey<openssl::pkey::Private>, openssl::x509::X509) {
             let root_cert_data = crate::pki_generator::CertificateData {
                 subject_common_name: self.app_config.root_ca_defaults.root_ca_common_name.clone(),
@@ -37,13 +44,6 @@ impl crate::storage::Storage<Created> {
                 }
             }
         }();
-        let app_public_key = match crate::encryption::get_app_public_key(&self.app_config.clone()) {
-            Ok(key) => key,
-            Err(e) => {
-                tracing::error!(error = %e, "initialize_storage -> Failed to get app public key.");
-                std::process::exit(1);
-            }
-        };
         let encrypted_root_private_key = match crate::encryption::encrypt_data(
             match &root_private_key.private_key_to_der() {
                 Ok(der) => der,
@@ -52,7 +52,7 @@ impl crate::storage::Storage<Created> {
                     std::process::exit(1);
                 }
             },
-            app_public_key.clone(),
+            &app_public_key,
         ) {
             Ok(encrypted_key) => encrypted_key,
             Err(e) => {
@@ -68,7 +68,7 @@ impl crate::storage::Storage<Created> {
                     std::process::exit(1);
                 }
             },
-            app_public_key.clone(),
+            &app_public_key,
         ) {
             Ok(encrypted_cert) => encrypted_cert,
             Err(e) => {
@@ -78,7 +78,7 @@ impl crate::storage::Storage<Created> {
         };
         let root_cert_signature = match crate::encryption::sign_data(
             root_encrypted_cert.as_slice(),
-            root_private_key.clone(),
+            &root_private_key,
         ) {
             Ok(signature) => signature,
             Err(e) => {
@@ -153,7 +153,7 @@ impl crate::storage::Storage<Created> {
                     std::process::exit(1);
                 }
             },
-            app_public_key.clone(),
+            &app_public_key,
         ) {
             Ok(encrypted_key) => encrypted_key,
             Err(e) => {
@@ -169,7 +169,7 @@ impl crate::storage::Storage<Created> {
                     std::process::exit(1);
                 }
             },
-            app_public_key,
+            &app_public_key,
         ) {
             Ok(encrypted_cert) => encrypted_cert,
             Err(e) => {
@@ -179,7 +179,7 @@ impl crate::storage::Storage<Created> {
         };
         let admin_cert_signature = match crate::encryption::sign_data(
             admin_encrypted_cert.as_slice(),
-            admin_private_key.clone(),
+            &admin_private_key,
         ) {
             Ok(signature) => signature,
             Err(e) => {
@@ -217,11 +217,33 @@ impl crate::storage::Storage<Created> {
                 std::process::exit(1);
             }
         };
+        let auth_store = match crate::encryption::build_client_auth_store_from_root_ca(&root_cert) {
+            Ok(store) => store,
+            Err(e) => {
+                tracing::error!(error = %e, "initialize_storage -> Failed to create auth store.");
+                std::process::exit(1);
+            }
+        };
+        let auth_chain = match openssl::stack::Stack::new() {
+            Ok(mut stack) => {
+                stack.push(admin_cert).unwrap_or_else(|e| {
+                    tracing::error!(error = %e, "initialize_storage -> Failed to push admin cert to auth chain.");
+                    std::process::exit(1);
+                });
+                stack
+            }
+            Err(e) => {
+                tracing::error!(error = %e, "initialize_storage -> Failed to create auth chain stack.");
+                std::process::exit(1);
+            }
+        };
         crate::storage::Storage {
             state: crate::storage_initialized::Initialized {
                 certificate_chain: self.state.certificate_chain,
                 private_key_chain: self.state.private_key_chain,
                 crl_chain: self.state.crl_chain,
+                auth_store,
+                auth_chain,
             },
             app_config: self.app_config,
         }

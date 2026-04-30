@@ -5,6 +5,8 @@ pub struct Initialized {
     pub certificate_chain: libblockchain::blockchain::BlockChain,
     pub private_key_chain: libblockchain::blockchain::BlockChain,
     pub crl_chain: libblockchain::blockchain::BlockChain,
+    pub auth_store: openssl::x509::store::X509Store,
+    pub auth_chain: openssl::stack::Stack<openssl::x509::X509>,
 }
 
 impl crate::storage::Storage<Initialized> {
@@ -22,125 +24,37 @@ impl crate::storage::Storage<Initialized> {
                 std::process::exit(1);
             }
         };
-        let (root_cert_block, root_cert_signature) = match self
-            .state
-            .certificate_chain
-            .get_block_by_height(ROOT_HEIGHT)
-        {
-            (Ok(block), Ok(signature)) => (block, signature),
-            (Err(e), _) | (_, Err(e)) => {
-                tracing::error!(error = %e, "add_admin_user -> Failed to get root certificate block.");
-                std::process::exit(1);
-            }
-        };
-        let (root_cert, root_cert_verified) = match crate::encryption::verify_and_decrypt_cert(
-            root_cert_block.block_data().as_slice(),
-            &root_cert_signature,
-            app_priv_key.clone(),
-        ) {
-            (Ok(cert), Ok(verified)) => (cert, verified),
-            (Err(e), _) | (_, Err(e)) => {
-                tracing::error!(error = %e, "add_admin_user -> Failed to verify and decrypt root certificate.");
-                std::process::exit(1);
-            }
-        };
-        if !root_cert_verified {
-            tracing::error!("add_admin_user -> Root certificate verification failed.");
-            std::process::exit(1);
-        }
-        let (root_private_key_block, root_private_key_signature) = match self
-            .state
-            .private_key_chain
-            .get_block_by_height(ROOT_HEIGHT)
-        {
-            (Ok(block), Ok(signature)) => (block, signature),
-            (Err(e), _) | (_, Err(e)) => {
-                tracing::error!(error = %e, "add_admin_user -> Failed to get root private key block.");
-                std::process::exit(1);
-            }
-        };
-        let root_private_key = match crate::encryption::verify_and_decrypt_priv_key(
-            root_private_key_block.block_data().as_slice(),
-            &root_private_key_signature,
-            &root_cert,
-            app_priv_key.clone(),
-        ) {
-            (Ok(key), Ok(verified)) => {
-                if !verified {
-                    tracing::error!("add_admin_user -> Root private key verification failed.");
-                    std::process::exit(1);
-                }
-                key
-            }
-            (Err(e), _) | (_, Err(e)) => {
-                tracing::error!(error = %e, "add_admin_user -> Failed to verify and decrypt root private key.");
-                std::process::exit(1);
-            }
-        };
-        let app_pub_key = match crate::encryption::get_app_public_key(&self.app_config.clone()) {
+        let app_pub_key = match crate::encryption::get_app_public_key(&self.app_config) {
             Ok(key) => key,
             Err(e) => {
                 tracing::error!(error = %e, "add_admin_user -> Failed to get app public key.");
                 std::process::exit(1);
             }
         };
-        let (admin_interm_cert, admin_intermediate_signature) = match self
-            .state
-            .certificate_chain
-            .get_block_by_height(ADMIN_HEIGHT)
-        {
-            (Ok(block), Ok(signature)) => (block, signature),
-            (Err(e), _) | (_, Err(e)) => {
-                tracing::error!(error = %e, "add_admin_user -> Failed to get admin intermediate certificate block.");
-                std::process::exit(1);
-            }
-        };
-        let (admin_intermediate_cert, admin_intermediate_verified) =
-            match crate::encryption::verify_and_decrypt_cert(
-                admin_interm_cert.block_data().as_slice(),
-                &admin_intermediate_signature,
-                app_priv_key.clone(),
-            ) {
-                (Ok(cert), Ok(verified)) => (cert, verified),
-                (Err(e), _) | (_, Err(e)) => {
-                    tracing::error!(error = %e, "add_admin_user -> Failed to verify and decrypt admin intermediate certificate.");
-                    std::process::exit(1);
-                }
-            };
-        if !admin_intermediate_verified {
-            tracing::error!(
-                "add_admin_user -> Admin intermediate certificate verification failed."
-            );
-            std::process::exit(1);
-        }
-        let (admin_interm_private_key_block, admin_intermediate_private_key_signature) = match self
+        let admin_interm_private_key_block = match self
             .state
             .private_key_chain
             .get_block_by_height(ADMIN_HEIGHT)
         {
-            (Ok(block), Ok(signature)) => (block, signature),
+            (Ok(block), Ok(_)) => block,
             (Err(e), _) | (_, Err(e)) => {
                 tracing::error!(error = %e, "add_admin_user -> Failed to get admin intermediate private key block.");
                 std::process::exit(1);
             }
         };
-        let admin_intermediate_key = match crate::encryption::verify_and_decrypt_priv_key(
-            admin_interm_private_key_block.block_data().as_slice(),
-            &admin_intermediate_private_key_signature,
-            &admin_intermediate_cert,
-            app_priv_key.clone(),
+        let admin_intermediate_key = match crate::encryption::decrypt_data(
+            &admin_interm_private_key_block.block_data(),
+            &app_priv_key,
         ) {
-            (Ok(key), Ok(verified)) => {
-                if !verified {
-                    tracing::error!(
-                        "add_admin_user -> Admin intermediate private key verification failed."
-                    );
+            Ok(decrypted) => match openssl::pkey::PKey::private_key_from_der(&decrypted) {
+                Ok(key) => key,
+                Err(e) => {
+                    tracing::error!(error = %e, "add_admin_user -> Failed to parse admin intermediate private key DER.");
                     std::process::exit(1);
                 }
-                key
-            }
-            (Err(e), _) | (_, Err(e)) => {
-                tracing::error!(error = %e, "add_admin_user -> Failed to verify and decrypt admin intermediate private key.");
+            },
+            Err(e) => {
+                tracing::error!(error = %e, "add_admin_user -> Failed to decrypt admin intermediate private key.");
                 std::process::exit(1);
             }
         };
@@ -154,6 +68,17 @@ impl crate::storage::Storage<Initialized> {
                 std::process::exit(1);
             }
         };
+        if !crate::encryption::verify_client_auth_cert_chain(
+            &self.state.auth_store,
+            &self.state.auth_chain,
+            &admin_user_cert,
+        ) {
+            tracing::error!(
+                error = "N/A",
+                "add_admin_user -> Generated admin user certificate is not valid."
+            );
+            std::process::exit(1);
+        }
         let (encrypted_admin_user_cert, admin_user_cert_signature) =
             match crate::encryption::encrypt_and_sign_data(
                 &match admin_user_cert.to_der() {
@@ -163,8 +88,8 @@ impl crate::storage::Storage<Initialized> {
                         std::process::exit(1);
                     }
                 },
-                app_pub_key.clone(),
-                root_private_key.clone(),
+                &app_pub_key,
+                &admin_user_key,
             ) {
                 Ok(data) => data,
                 Err(e) => {
@@ -180,7 +105,7 @@ impl crate::storage::Storage<Initialized> {
                     std::process::exit(1);
                 }
             },
-            app_pub_key.clone(),
+            &app_pub_key,
         ) {
             Ok(data) => data,
             Err(e) => {

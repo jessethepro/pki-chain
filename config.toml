@@ -24,7 +24,7 @@ root_ca_validity_days = 3650
 
 [admin_ca_defaults]
 admin_ca_common_name = "MenaceLabs Admin Interm CA"
-admin_ca_orgaination = "MenaceLabs"
+admin_ca_organization = "MenaceLabs"
 admin_ca_organizational_unit = "CY"
 admin_ca_locality = "Sao Jose dos Campos"
 admin_ca_state = "SP"
