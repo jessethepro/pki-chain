@@ -96,16 +96,33 @@ impl crate::storage::Storage<API> {
                             Err(_) => false,
                         });
                 if !cert_in_chain {
-                    &mut self.state.auth_chain.push(cert.clone())?;
+                    match &mut self.state.auth_chain.push(cert.clone()) {
+                        Ok(_) => {}
+                        Err(e) => {
+                            return Err(anyhow::anyhow!(
+                                "get_certificate_by_serial -> Failed to push certificate to auth chain at height {}: {}",
+                                i,
+                                e
+                            ));
+                        }
+                    }
                 }
             } else {
                 if cert.serial_number().to_bn()? == cert_serial {
-                    let is_valid = crate::encryption::verify_client_auth_cert_chain(
+                    match crate::encryption::verify_client_auth_cert_chain(
                         &self.state.auth_store,
                         &self.state.auth_chain,
                         &cert,
-                    );
-                    return Ok((cert, is_valid));
+                    ) {
+                        Ok(is_valid) => return Ok((cert, is_valid)),
+                        Err(e) => {
+                            return Err(anyhow::anyhow!(
+                                "get_certificate_by_serial -> Failed to verify certificate with serial number {}: {}",
+                                cert_serial.to_dec_str()?,
+                                e
+                            ));
+                        }
+                    }
                 }
             }
         }
@@ -173,7 +190,16 @@ impl crate::storage::Storage<API> {
                             Err(_) => false,
                         });
                 if !cert_in_chain {
-                    &mut self.state.auth_chain.push(cert.clone())?;
+                    match &mut self.state.auth_chain.push(cert.clone()) {
+                        Ok(_) => {}
+                        Err(e) => {
+                            return Err(anyhow::anyhow!(
+                                "get_certificate_by_serial -> Failed to push certificate to auth chain at height {}: {}",
+                                i,
+                                e
+                            ));
+                        }
+                    }
                 }
             } else {
                 if cert
@@ -186,12 +212,20 @@ impl crate::storage::Storage<API> {
                             .map_or(false, |data| data.to_string() == common_name)
                     })
                 {
-                    let is_valid = crate::encryption::verify_client_auth_cert_chain(
+                    match crate::encryption::verify_client_auth_cert_chain(
                         &self.state.auth_store,
                         &self.state.auth_chain,
                         &cert,
-                    );
-                    return Ok((cert, is_valid));
+                    ) {
+                        Ok(is_valid) => return Ok((cert, is_valid)),
+                        Err(e) => {
+                            return Err(anyhow::anyhow!(
+                                "get_certificate_by_common_name -> Failed to verify certificate with common name '{}': {}",
+                                common_name,
+                                e
+                            ));
+                        }
+                    }
                 }
             }
         }

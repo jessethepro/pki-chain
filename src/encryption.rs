@@ -472,15 +472,43 @@ pub fn verify_client_auth_cert_chain(
     store: &openssl::x509::store::X509Store,
     chain: &openssl::stack::Stack<openssl::x509::X509>,
     user_cert: &openssl::x509::X509,
-) -> bool {
+) -> anyhow::Result<bool> {
     let mut store_ctx = match openssl::x509::X509StoreContext::new() {
         Ok(ctx) => ctx,
-        Err(_) => return false,
+        Err(e) => {
+            return Err(anyhow::anyhow!(
+                "Failed to create X509 store context: {}",
+                e
+            ))
+        }
     };
 
-    store_ctx
+    let verified = store_ctx
         .init(store, user_cert, chain, |ctx| ctx.verify_cert())
-        .unwrap_or(false)
+        .map_err(|e| anyhow::anyhow!("Failed to verify client auth certificate chain: {}", e))?;
+
+    if !verified || store_ctx.error() != openssl::x509::X509VerifyResult::OK {
+        let error = store_ctx.error();
+        let depth = store_ctx.error_depth();
+        let current_subject = store_ctx
+            .current_cert()
+            .and_then(|cert| {
+                cert.subject_name()
+                    .entries_by_nid(openssl::nid::Nid::COMMONNAME)
+                    .next()
+                    .and_then(|entry| entry.data().as_utf8().ok().map(|s| s.to_string()))
+            })
+            .unwrap_or_else(|| "<unknown>".to_string());
+
+        return Err(anyhow::anyhow!(
+            "Client auth certificate chain verification failed: error={:?}, depth={}, current_subject={}",
+            error,
+            depth,
+            current_subject
+        ));
+    }
+
+    Ok(true)
 }
 
 pub fn build_client_auth_store_from_root_ca(
@@ -572,7 +600,7 @@ pub fn validate_intermediate_cert_chain(
             ))
         }
     };
-    let valid = verify_client_auth_cert_chain(cert_store, &chain, intermediate_cert);
+    let valid = verify_client_auth_cert_chain(cert_store, &chain, intermediate_cert)?;
     if !valid {
         return Err(anyhow::anyhow!("validate_intermediate_cert_chain -> Intermediate certificate failed validation against root CA"));
     }

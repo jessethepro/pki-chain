@@ -35,38 +35,38 @@ pub struct CertificateData {
 }
 
 pub fn parse_certificate_data_from_json(
-    request_json: serde_json::Value,
+    request_json: &serde_json::Value,
+    request_id: &String,
 ) -> anyhow::Result<CertificateData> {
     let admin_cert_data = || -> anyhow::Result<CertificateData> {
         let subject_common_name = match request_json
-            .get("subject_common_name")
+            .pointer("/request/data/admin_certificate_data/subject_common_name")
             .and_then(|v| v.as_str())
         {
             Some(s) => s.to_string(),
             None => {
-                tracing::error!(
-                    "AddFirstAdmin -> request missing required field: subject_common_name"
-                );
+                tracing::error!("handle_setup_request -> Request missing required field: subject_common_name. Request ID: {}", request_id);
                 return Err(anyhow::anyhow!(
-                    "AddFirstAdmin -> request missing required field: subject_common_name"
-                ));
+                "handle_setup_request -> Request missing required field: subject_common_name. Request ID: {}", request_id
+            ));
             }
         };
         let issuer_common_name = match request_json
-            .get("issuer_common_name")
+            .pointer("/request/data/admin_certificate_data/issuer_common_name")
             .and_then(|v| v.as_str())
         {
             Some(s) => s.to_string(),
             None => {
-                tracing::error!(
+                tracing::info!(
                     "AddFirstAdmin -> request missing required field: issuer_common_name"
                 );
-                return Err(anyhow::anyhow!(
-                    "AddFirstAdmin -> request missing required field: issuer_common_name"
-                ));
+                "None".to_string() // Default to "None" for issuer CN if not provided. It will be set outside this function based on the CA certificate's common name during certificate generation.
             }
         };
-        let organization = match request_json.get("organization").and_then(|v| v.as_str()) {
+        let organization = match request_json
+            .pointer("/request/data/admin_certificate_data/organization")
+            .and_then(|v| v.as_str())
+        {
             Some(s) => s.to_string(),
             None => {
                 tracing::error!("AddFirstAdmin -> request missing required field: organization");
@@ -76,7 +76,7 @@ pub fn parse_certificate_data_from_json(
             }
         };
         let organizational_unit = match request_json
-            .get("organizational_unit")
+            .pointer("/request/data/admin_certificate_data/organizational_unit")
             .and_then(|v| v.as_str())
         {
             Some(s) => s.to_string(),
@@ -89,7 +89,10 @@ pub fn parse_certificate_data_from_json(
                 ));
             }
         };
-        let locality = match request_json.get("locality").and_then(|v| v.as_str()) {
+        let locality = match request_json
+            .pointer("/request/data/admin_certificate_data/locality")
+            .and_then(|v| v.as_str())
+        {
             Some(s) => s.to_string(),
             None => {
                 tracing::error!("AddFirstAdmin -> request missing required field: locality");
@@ -98,7 +101,10 @@ pub fn parse_certificate_data_from_json(
                 ));
             }
         };
-        let state = match request_json.get("state").and_then(|v| v.as_str()) {
+        let state = match request_json
+            .pointer("/request/data/admin_certificate_data/state")
+            .and_then(|v| v.as_str())
+        {
             Some(s) => s.to_string(),
             None => {
                 tracing::error!("AddFirstAdmin -> request missing required field: state");
@@ -107,7 +113,10 @@ pub fn parse_certificate_data_from_json(
                 ));
             }
         };
-        let country = match request_json.get("country").and_then(|v| v.as_str()) {
+        let country = match request_json
+            .pointer("/request/data/admin_certificate_data/country")
+            .and_then(|v| v.as_str())
+        {
             Some(s) => s.to_string(),
             None => {
                 tracing::error!("AddFirstAdmin -> request missing required field: country");
@@ -116,7 +125,10 @@ pub fn parse_certificate_data_from_json(
                 ));
             }
         };
-        let validity_days = match request_json.get("validity_days").and_then(|v| v.as_u64()) {
+        let validity_days = match request_json
+            .pointer("/request/data/admin_certificate_data/validity_days")
+            .and_then(|v| v.as_u64())
+        {
             Some(vd) => vd as u32,
             None => {
                 tracing::error!("AddFirstAdmin -> request missing required field: validity_days");

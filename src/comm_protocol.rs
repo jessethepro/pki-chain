@@ -1,11 +1,7 @@
 use base64::Engine;
 use std::io::{Read, Write};
 
-use crate::{
-    pki_generator::{self},
-    storage::{self, get_api_storage},
-    storage_empty, storage_ready,
-};
+use crate::storage::ValidationResult;
 
 const PROTOCOL_VERSION1: u32 = 1;
 
@@ -146,7 +142,7 @@ pub fn start_api_server(
             std::process::exit(1);
         }
     };
-    let mut storage = get_api_storage(storage).expect("Failed to get API storage");
+    let mut storage = crate::storage::get_api_storage(storage).expect("Failed to get API storage");
     for stream in listener.incoming() {
         match stream {
             Ok(stream) => {
@@ -329,15 +325,29 @@ fn handle_api_request(
         &storage.state.auth_chain,
         &requester_cert,
     ) {
-        true => {}
-        false => {
-            tracing::error!("handle_api_request -> Request ID {} -> Requester certificate failed verification against cert chain", request_id);
+        Ok(valid) => {
+            if !valid {
+                tracing::error!("handle_api_request -> Request ID {} -> Requester certificate failed verification against cert chain", request_id);
+                send_response(
+                    &response_socket,
+                    &serde_json::json!({
+                        "request_id": request_id,
+                        "status": "error",
+                        "message": "Requester certificate failed verification against cert chain",
+                        "data": request_json,
+                    }),
+                );
+                return;
+            }
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "handle_api_request -> Request ID {} -> Failed to verify requester certificate against cert chain", request_id);
             send_response(
                 &response_socket,
                 &serde_json::json!({
                     "request_id": request_id,
                     "status": "error",
-                    "message": "Requester certificate failed verification against cert chain",
+                    "message": "Failed to verify requester certificate against cert chain",
                     "data": request_json,
                 }),
             );
@@ -388,9 +398,9 @@ fn handle_api_request(
                             &storage.state.auth_chain,
                             &cert,
                         ) {
-                            true => true,
-                            false => {
-                                tracing::error!("handle_api_request -> Request ID {} -> Retrieved certificate failed verification against cert chain", request_id);
+                            Ok(valid) => valid,
+                            Err(e) => {
+                                tracing::error!(error = %e, "handle_api_request -> Request ID {} -> Retrieved certificate failed verification against cert chain", request_id);
                                 send_response(
                                     &response_socket,
                                     &serde_json::json!({
@@ -472,9 +482,9 @@ fn handle_api_request(
                     &storage.state.auth_chain,
                     &reqeusted_cert,
                 ) {
-                    true => true,
-                    false => {
-                        tracing::error!("handle_api_request -> Request ID {} -> Retrieved certificate failed verification against cert chain", request_id);
+                    Ok(valid) => valid,
+                    Err(e) => {
+                        tracing::error!(error = %e, "handle_api_request -> Request ID {} -> Retrieved certificate failed verification against cert chain", request_id);
                         send_response(
                             &response_socket,
                             &serde_json::json!({
@@ -690,30 +700,36 @@ fn handle_setup_request(
                         }
                     };
                     if new_storage {
-                        let mut new_admin_data = match parse_admin_cert_data(&request_json) {
-                            Ok(data) => data,
-                            Err(e) => {
-                                tracing::error!(error = %e, "handle_setup_request -> Failed to parse admin certificate data from request");
-                                send_response(
-                                    &response_sock,
-                                    &serde_json::json!({
-                                        "response": {
-                                            "status": "error",
-                                            "message": format!("Failed to parse admin certificate data from request: {}. Request ID: {}", e, request_id),
-                                            "data": request_json,
-                                        }
-                                    }),
-                                );
-                                return Err(anyhow::anyhow!(
+                        let mut new_admin_data =
+                            match crate::pki_generator::parse_certificate_data_from_json(
+                                &request_json,
+                                &request_id,
+                            ) {
+                                Ok(data) => data,
+                                Err(e) => {
+                                    tracing::error!(error = %e, "handle_setup_request -> Failed to parse admin certificate data from request");
+                                    send_response(
+                                        &response_sock,
+                                        &serde_json::json!({
+                                            "response": {
+                                                "status": "error",
+                                                "message": format!("Failed to parse admin certificate data from request: {}. Request ID: {}", e, request_id),
+                                                "data": request_json,
+                                            }
+                                        }),
+                                    );
+                                    return Err(anyhow::anyhow!(
                                     "handle_setup_request -> Failed to parse admin certificate data from request: {}. Request ID: {}",
                                     e,
                                     request_id
                                 ));
-                            }
-                        };
+                                }
+                            };
                         if new_admin_data.issuer_common_name == "None" {
+                            tracing::info!("handle_setup_request -> Admin certificate data missing issuer common name, using default from app config");
                             new_admin_data.issuer_common_name =
                                 app_config.admin_ca_defaults.admin_ca_common_name.clone();
+                            tracing::info!("handle_setup_request -> Admin certificate data after filling missing issuer common name: {:?}", new_admin_data);
                         }
                         let storage_empty = crate::storage::get_empty_storage(app_config);
                         let (admin_cert, admin_key) = storage_empty
@@ -798,7 +814,7 @@ fn handle_setup_request(
                             ));
                         }
                     };
-                    let new_admin_data = match parse_admin_cert_data(&request_json) {
+                    let new_admin_data = match parse_admin_cert_data(&request_json, app_config) {
                         Ok(data) => data,
                         Err(e) => {
                             tracing::error!(error = %e, "handle_setup_request -> Failed to parse admin certificate data from request");
@@ -890,7 +906,7 @@ fn handle_setup_request(
                             ));
                         }
                     };
-                    let new_admin_data = match parse_admin_cert_data(&request_json) {
+                    let new_admin_data = match parse_admin_cert_data(&request_json, app_config) {
                         Ok(data) => data,
                         Err(e) => {
                             tracing::error!(error = %e, "handle_setup_request -> Failed to parse admin certificate data from request. request_id: {}", request_id);
@@ -1091,6 +1107,7 @@ pub fn start_repair_server(
 
 fn parse_admin_cert_data(
     request_json: &serde_json::Value,
+    app_config: &crate::configs::AppConfig,
 ) -> Result<crate::pki_generator::CertificateData, anyhow::Error> {
     let admin_cert_data = crate::pki_generator::CertificateData {
         subject_common_name: match request_json
@@ -1111,8 +1128,8 @@ fn parse_admin_cert_data(
         {
             Some(s) => s.to_string(),
             None => {
-                tracing::info!("parse_admin_cert_data -> CreateAndInitialize request missing required field: admin_certificate_data.issuer_common_name");
-                "None".to_string()
+                tracing::info!("parse_admin_cert_data -> request missing admin_certificate_data.issuer_common_name, defaulting to configured admin intermediate CN");
+                app_config.admin_ca_defaults.admin_ca_common_name.clone()
             }
         },
         organization: match request_json

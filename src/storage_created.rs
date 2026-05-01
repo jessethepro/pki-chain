@@ -135,12 +135,12 @@ impl crate::storage::Storage<Created> {
                 country: self.app_config.admin_ca_defaults.admin_ca_country.clone(),
                 validity_days: self.app_config.admin_ca_defaults.admin_ca_validity_days,
                 cert_type: crate::pki_generator::CertificateDataType::IntermediateCA,
-                is_admin: true,
+                is_admin: false,
             };
             match crate::pki_generator::generate_key_pair(admin_cert_data, &root_private_key) {
                 Ok((admin_private_key, admin_cert)) => (admin_private_key, admin_cert),
                 Err(e) => {
-                    tracing::error!(error = %e, "initialize_storage -> Failed to generate root CA.");
+                    tracing::error!(error = %e, "initialize_storage -> Failed to generate default admin CA.");
                     std::process::exit(1);
                 }
             }
@@ -149,7 +149,7 @@ impl crate::storage::Storage<Created> {
             match &admin_private_key.private_key_to_der() {
                 Ok(der) => der,
                 Err(e) => {
-                    tracing::error!(error = %e, "initialize_storage -> Failed to convert admin private key to DER.");
+                    tracing::error!(error = %e, "initialize_storage -> Failed to convert default admin private key to DER.");
                     std::process::exit(1);
                 }
             },
@@ -157,7 +157,7 @@ impl crate::storage::Storage<Created> {
         ) {
             Ok(encrypted_key) => encrypted_key,
             Err(e) => {
-                tracing::error!(error = %e, "initialize_storage -> Failed to encrypt admin private key.");
+                tracing::error!(error = %e, "initialize_storage -> Failed to encrypt default admin private key.");
                 std::process::exit(1);
             }
         };
@@ -165,7 +165,7 @@ impl crate::storage::Storage<Created> {
             &match admin_cert.to_der() {
                 Ok(der) => der,
                 Err(e) => {
-                    tracing::error!(error = %e, "initialize_storage -> Failed to convert admin certificate to DER.");
+                    tracing::error!(error = %e, "initialize_storage -> Failed to convert default admin certificate to DER.");
                     std::process::exit(1);
                 }
             },
@@ -173,7 +173,7 @@ impl crate::storage::Storage<Created> {
         ) {
             Ok(encrypted_cert) => encrypted_cert,
             Err(e) => {
-                tracing::error!(error = %e, "initialize_storage -> Failed to encrypt admin certificate.");
+                tracing::error!(error = %e, "initialize_storage -> Failed to encrypt default admin certificate.");
                 std::process::exit(1);
             }
         };
@@ -183,7 +183,7 @@ impl crate::storage::Storage<Created> {
         ) {
             Ok(signature) => signature,
             Err(e) => {
-                tracing::error!(error = %e, "initialize_storage -> Failed to sign admin certificate.");
+                tracing::error!(error = %e, "initialize_storage -> Failed to sign default admin certificate.");
                 std::process::exit(1);
             }
         };
@@ -194,7 +194,7 @@ impl crate::storage::Storage<Created> {
         {
             Ok(_) => {}
             Err(e) => {
-                tracing::error!(error = %e, "initialize_storage -> Failed to put admin certificate block.");
+                tracing::error!(error = %e, "initialize_storage -> Failed to put default admin certificate block.");
                 std::process::exit(1);
             }
         };
@@ -213,27 +213,36 @@ impl crate::storage::Storage<Created> {
                         std::process::exit(1);
                     }
                 }
-                tracing::error!(error = %e, "initialize_storage -> Failed to put admin private key block.");
+                tracing::error!(error = %e, "initialize_storage -> Failed to put default admin private key block.");
                 std::process::exit(1);
             }
         };
         let auth_store = match crate::encryption::build_client_auth_store_from_root_ca(&root_cert) {
             Ok(store) => store,
             Err(e) => {
-                tracing::error!(error = %e, "initialize_storage -> Failed to create auth store.");
+                tracing::error!(error = %e, "initialize_storage -> Failed to create default admin auth store.");
+                std::process::exit(1);
+            }
+        };
+        match crate::encryption::validate_intermediate_cert_chain(&admin_cert, &auth_store) {
+            Ok(_) => {
+                tracing::info!("initialize_storage -> Default admin intermediate certificate chain validated successfully.{:?}", admin_cert);
+            }
+            Err(e) => {
+                tracing::error!(error = %e, "initialize_storage -> Failed to validate default admin intermediate certificate chain.");
                 std::process::exit(1);
             }
         };
         let auth_chain = match openssl::stack::Stack::new() {
             Ok(mut stack) => {
                 stack.push(admin_cert).unwrap_or_else(|e| {
-                    tracing::error!(error = %e, "initialize_storage -> Failed to push admin cert to auth chain.");
+                    tracing::error!(error = %e, "initialize_storage -> Failed to push default admin cert to auth chain.");
                     std::process::exit(1);
                 });
                 stack
             }
             Err(e) => {
-                tracing::error!(error = %e, "initialize_storage -> Failed to create auth chain stack.");
+                tracing::error!(error = %e, "initialize_storage -> Failed to create default admin auth chain stack.");
                 std::process::exit(1);
             }
         };

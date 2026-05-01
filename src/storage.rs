@@ -329,14 +329,17 @@ fn validate_storage(app_config: &crate::configs::AppConfig) -> ValidationResult 
         };
     let mut auth_chain = match openssl::stack::Stack::new() {
         Ok(mut stack) => {
-            stack.push(default_interm_cert).map_err(|e| {
-                tracing::error!(error = %e, "validate_storage -> Failed to push default admin intermediate certificate onto stack for certificate chain validation.");
-                validation_results.error_message = Some(format!(
-                    "validate_storage -> Failed to push default admin intermediate certificate onto stack for certificate chain validation: {}",
-                    e
-                ));
-                e
-            });
+            match stack.push(default_interm_cert) {
+                Ok(_) => {}
+                Err(e) => {
+                    tracing::error!(error = %e, "validate_storage -> Failed to push default admin intermediate certificate onto stack for certificate chain validation.");
+                    validation_results.error_message = Some(format!(
+                        "validate_storage -> Failed to push default admin intermediate certificate onto stack for certificate chain validation: {}",
+                        e
+                    ));
+                    return validation_results;
+                }
+            }
             stack
         }
         Err(e) => {
@@ -348,7 +351,6 @@ fn validate_storage(app_config: &crate::configs::AppConfig) -> ValidationResult 
             return validation_results;
         }
     };
-
     for i in 2..validation_results.cert_height - 1 {
         let cert_block = match cert_chain.get_block_by_height(i) {
             (Ok(block), Ok(_)) => block,
@@ -386,21 +388,35 @@ fn validate_storage(app_config: &crate::configs::AppConfig) -> ValidationResult 
             }
         };
         if cert_is_intermediate(&cert, &app_config) {
-            auth_chain.push(cert).map_err(|e| {
-                tracing::error!(error = %e, "validate_storage -> Failed to push certificate block at height {} onto stack for certificate chain validation.", i);
-                validation_results.error_message = Some(format!(
-                    "validate_storage -> Failed to push certificate block at height {} onto stack for certificate chain validation: {}",
-                    i, e
-                ));
-                e
-            });
+            match auth_chain.push(cert) {
+                Ok(_) => {}
+                Err(e) => {
+                    tracing::error!(error = %e, "validate_storage -> Failed to push intermediate certificate block at height {} onto auth chain stack for validation.", i);
+                    validation_results.error_message = Some(format!(
+                        "validate_storage -> Failed to push intermediate certificate block at height {} onto auth chain stack for validation: {}",
+                        i, e
+                    ));
+                    return validation_results;
+                }
+            };
         } else {
-            let cert_valid =
-                crate::encryption::verify_client_auth_cert_chain(&auth_store, &auth_chain, &cert);
-            validation_results
-                .certificates_validation_results
-                .get_or_insert_with(|| std::collections::HashMap::new())
-                .insert(i, cert_valid);
+            match crate::encryption::verify_client_auth_cert_chain(&auth_store, &auth_chain, &cert)
+            {
+                Ok(cert_valid) => {
+                    validation_results
+                        .certificates_validation_results
+                        .get_or_insert_with(|| std::collections::HashMap::new())
+                        .insert(i, cert_valid);
+                }
+                Err(e) => {
+                    tracing::error!(error = %e, "validate_storage -> Failed to verify certificate block at height {}.", i);
+                    validation_results.error_message = Some(format!(
+                        "validate_storage -> Failed to verify certificate block at height {}: {}",
+                        i, e
+                    ));
+                    return validation_results;
+                }
+            };
         }
     }
     validation_results

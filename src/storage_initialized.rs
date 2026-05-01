@@ -1,6 +1,3 @@
-const ROOT_HEIGHT: u64 = 0;
-const ADMIN_HEIGHT: u64 = 1;
-
 pub struct Initialized {
     pub certificate_chain: libblockchain::blockchain::BlockChain,
     pub private_key_chain: libblockchain::blockchain::BlockChain,
@@ -34,7 +31,7 @@ impl crate::storage::Storage<Initialized> {
         let admin_interm_private_key_block = match self
             .state
             .private_key_chain
-            .get_block_by_height(ADMIN_HEIGHT)
+            .get_block_by_height(crate::storage::ADMIN_BLOCK_HEIGHT)
         {
             (Ok(block), Ok(_)) => block,
             (Err(e), _) | (_, Err(e)) => {
@@ -68,17 +65,29 @@ impl crate::storage::Storage<Initialized> {
                 std::process::exit(1);
             }
         };
-        if !crate::encryption::verify_client_auth_cert_chain(
+        tracing::info!(
+            "add_admin_user -> Generated admin user certificate and key successfully: {:?}",
+            admin_user_cert
+        );
+        match crate::encryption::verify_client_auth_cert_chain(
             &self.state.auth_store,
             &self.state.auth_chain,
             &admin_user_cert,
         ) {
-            tracing::error!(
-                error = "N/A",
-                "add_admin_user -> Generated admin user certificate is not valid."
-            );
-            std::process::exit(1);
-        }
+            Ok(valid) => {
+                if !valid {
+                    tracing::error!(
+                        error = "N/A",
+                        "add_admin_user -> Generated admin user certificate is not valid."
+                    );
+                    std::process::exit(1);
+                }
+            }
+            Err(e) => {
+                tracing::error!(error = %e, "add_admin_user -> Failed to verify generated admin user certificate.");
+                std::process::exit(1);
+            }
+        };
         let (encrypted_admin_user_cert, admin_user_cert_signature) =
             match crate::encryption::encrypt_and_sign_data(
                 &match admin_user_cert.to_der() {
