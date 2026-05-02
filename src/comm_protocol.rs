@@ -1,8 +1,6 @@
 use base64::Engine;
 use std::io::{Read, Write};
 
-use crate::storage::ValidationResult;
-
 const PROTOCOL_VERSION1: u32 = 1;
 
 fn serialize_response(response_json: &serde_json::Value) -> (Vec<u8>, u32) {
@@ -1036,7 +1034,7 @@ fn handle_setup_request(
 pub fn start_setup_server(
     app_config: &crate::configs::AppConfig,
     storage_status: crate::storage::StorageStatusResults,
-) -> crate::storage::StorageStatusResults {
+) {
     let _ = std::fs::remove_file(app_config.server.comm_sock.clone());
     let listener = std::os::unix::net::UnixListener::bind(app_config.server.comm_sock.clone())
         .expect("Failed to bind to setup socket");
@@ -1052,7 +1050,7 @@ pub fn start_setup_server(
                 .unwrap_or(&"Unknown error".to_string()),
             "Failed to get storage state during setup"
         );
-        return storage_status;
+        return;
     }
     while storage_status.error_message.is_none()
         || storage_status.storage_state != crate::storage::StorageState::Ready
@@ -1084,7 +1082,7 @@ pub fn start_setup_server(
                     }
                     if storage_status.storage_state == crate::storage::StorageState::Ready {
                         tracing::info!("Storage is now ready, shutting down setup server");
-                        break;
+                        return;
                     }
                 }
                 Err(e) => {
@@ -1093,7 +1091,6 @@ pub fn start_setup_server(
             }
         }
     }
-    storage_status
 }
 
 pub fn start_repair_server(

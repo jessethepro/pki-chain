@@ -44,12 +44,19 @@ fn main() {
                 );
                 storage_status = start_repair_server(&app_config, storage_status);
             }
+            StorageState::Empty => {
+                tracing::warn!(
+                    "Main -> Storage is empty. Storage Status Results: {:?}",
+                    storage_status
+                );
+                start_setup_server(&app_config, storage_status);
+                storage_status = get_state(&app_config);
+            }
             _ => {
                 tracing::warn!(
                     "Main -> Storage is in a setup state. Storage Status Results: {:?}",
                     storage_status
                 );
-                storage_status = start_setup_server(&app_config, storage_status);
             }
         }
     }

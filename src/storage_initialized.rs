@@ -28,43 +28,38 @@ impl crate::storage::Storage<Initialized> {
                 std::process::exit(1);
             }
         };
-        let admin_interm_private_key_block = match self
-            .state
-            .private_key_chain
-            .get_block_by_height(crate::storage::ADMIN_BLOCK_HEIGHT)
-        {
-            (Ok(block), Ok(_)) => block,
-            (Err(e), _) | (_, Err(e)) => {
-                tracing::error!(error = %e, "add_admin_user -> Failed to get admin intermediate private key block.");
-                std::process::exit(1);
-            }
-        };
-        let admin_intermediate_key = match crate::encryption::decrypt_data(
-            &admin_interm_private_key_block.block_data(),
+        let admin_ca_cert = match crate::storage::get_admin_intermediate_certificate(
+            &self.state.certificate_chain,
             &app_priv_key,
         ) {
-            Ok(decrypted) => match openssl::pkey::PKey::private_key_from_der(&decrypted) {
-                Ok(key) => key,
+            Ok(cert) => cert,
+            Err(e) => {
+                tracing::error!(error = %e, "add_admin_user -> Failed to get admin intermediate certificate.");
+                std::process::exit(1);
+            }
+        };
+        let admin_intermediate_key = match crate::storage::get_admin_intermediate_private_key(
+            &self.state.private_key_chain,
+            &app_priv_key,
+        ) {
+            Ok(key) => key,
+            Err(e) => {
+                tracing::error!(error = %e, "add_admin_user -> Failed to get admin intermediate private key.");
+                std::process::exit(1);
+            }
+        };
+        let (admin_user_key, admin_user_cert) =
+            match crate::pki_generator::generate_user_cert_and_private_key(
+                admin_user_certificate_data,
+                &admin_intermediate_key,
+                &admin_ca_cert,
+            ) {
+                Ok((key, cert)) => (key, cert),
                 Err(e) => {
-                    tracing::error!(error = %e, "add_admin_user -> Failed to parse admin intermediate private key DER.");
+                    tracing::error!(error = %e, "add_admin_user -> Failed to generate admin user key pair.");
                     std::process::exit(1);
                 }
-            },
-            Err(e) => {
-                tracing::error!(error = %e, "add_admin_user -> Failed to decrypt admin intermediate private key.");
-                std::process::exit(1);
-            }
-        };
-        let (admin_user_key, admin_user_cert) = match crate::pki_generator::generate_key_pair(
-            admin_user_certificate_data,
-            &admin_intermediate_key,
-        ) {
-            Ok((key, cert)) => (key, cert),
-            Err(e) => {
-                tracing::error!(error = %e, "add_admin_user -> Failed to generate admin user key pair.");
-                std::process::exit(1);
-            }
-        };
+            };
         tracing::info!(
             "add_admin_user -> Generated admin user certificate and key successfully: {:?}",
             admin_user_cert

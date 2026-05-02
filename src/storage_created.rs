@@ -137,7 +137,7 @@ impl crate::storage::Storage<Created> {
                 cert_type: crate::pki_generator::CertificateDataType::IntermediateCA,
                 is_admin: false,
             };
-            match crate::pki_generator::generate_key_pair(admin_cert_data, &root_private_key) {
+            match crate::pki_generator::generate_intermediate_ca(admin_cert_data, &root_private_key, &root_cert) {
                 Ok((admin_private_key, admin_cert)) => (admin_private_key, admin_cert),
                 Err(e) => {
                     tracing::error!(error = %e, "initialize_storage -> Failed to generate default admin CA.");
@@ -225,9 +225,7 @@ impl crate::storage::Storage<Created> {
             }
         };
         match crate::encryption::validate_intermediate_cert_chain(&admin_cert, &auth_store) {
-            Ok(_) => {
-                tracing::info!("initialize_storage -> Default admin intermediate certificate chain validated successfully.{:?}", admin_cert);
-            }
+            Ok(_) => {}
             Err(e) => {
                 tracing::error!(error = %e, "initialize_storage -> Failed to validate default admin intermediate certificate chain.");
                 std::process::exit(1);

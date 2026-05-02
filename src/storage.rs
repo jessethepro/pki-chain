@@ -42,7 +42,7 @@ pub fn get_root_certificate(
     Ok(root_cert)
 }
 
-pub fn get_default_admin_intermediate_certificate(
+pub fn get_admin_intermediate_certificate(
     certificate_chain: &libblockchain::blockchain::BlockChain,
     app_private_key: &openssl::pkey::PKey<openssl::pkey::Private>,
 ) -> anyhow::Result<openssl::x509::X509> {
@@ -60,6 +60,26 @@ pub fn get_default_admin_intermediate_certificate(
     )?;
     let admin_cert = openssl::x509::X509::from_der(&decrypted_admin_cert_der)?;
     Ok(admin_cert)
+}
+
+pub fn get_admin_intermediate_private_key(
+    private_key_chain: &libblockchain::blockchain::BlockChain,
+    app_private_key: &openssl::pkey::PKey<openssl::pkey::Private>,
+) -> anyhow::Result<openssl::pkey::PKey<openssl::pkey::Private>> {
+    let key_block_count = private_key_chain.block_count()?;
+    if key_block_count <= ADMIN_BLOCK_HEIGHT {
+        anyhow::bail!("get_default_admin_intermediate_certificate_and_key -> Not enough blocks in the chain to retrieve default admin intermediate private key");
+    }
+    let encrypted_admin_key_block = match private_key_chain.get_block_by_height(ADMIN_BLOCK_HEIGHT) {
+        (Ok(block), Ok(_)) => block,
+        _ => anyhow::bail!("get_default_admin_intermediate_certificate_and_key -> Failed to retrieve default admin intermediate private key block"),
+    };
+    let decrypted_admin_key_der = crate::encryption::decrypt_data(
+        encrypted_admin_key_block.block_data().as_slice(),
+        &app_private_key,
+    )?;
+    let admin_private_key = openssl::pkey::PKey::private_key_from_der(&decrypted_admin_key_der)?;
+    Ok(admin_private_key)
 }
 
 #[derive(serde::Serialize, Debug, Clone)]
@@ -287,7 +307,7 @@ fn validate_storage(app_config: &crate::configs::AppConfig) -> ValidationResult 
             return validation_results;
         }
     };
-    let default_interm_cert = match get_default_admin_intermediate_certificate(
+    let default_interm_cert = match get_admin_intermediate_certificate(
         &cert_chain,
         &app_private_key,
     ) {
@@ -1031,7 +1051,7 @@ pub fn get_initialized_storage(
             ));
         }
     };
-    let default_interm_cert = match crate::storage::get_default_admin_intermediate_certificate(
+    let default_interm_cert = match crate::storage::get_admin_intermediate_certificate(
         &certificate_chain,
         &crate::encryption::get_app_private_key(app_config)?,
     ) {
@@ -1297,7 +1317,7 @@ pub fn get_ready_storage(
             ));
         }
     };
-    let admin_interm_cert = match crate::storage::get_default_admin_intermediate_certificate(
+    let admin_interm_cert = match crate::storage::get_admin_intermediate_certificate(
         &certificate_chain,
         &crate::encryption::get_app_private_key(app_config)?,
     ) {
