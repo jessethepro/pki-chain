@@ -1,5 +1,49 @@
-pub const ROOT_BLOCK_HEIGHT: u64 = 0;
-pub const ADMIN_BLOCK_HEIGHT: u64 = 1; // Represents the block height where the admin intermediate certificate and intermediate key are stored in the blockchains.
+pub const APP_BLOCK_HEIGHT: u64 = 0; // Represents the block height where the app certificate and app private key are stored in the blockchains.
+pub const ROOT_BLOCK_HEIGHT: u64 = 1; // Represents the block height where the root certificate and root private key are stored in the blockchains. The root certificate and private key are expected to be stored at this fixed height for consistent retrieval and validation, especially during storage validation and initialization processes.
+pub const ADMIN_BLOCK_HEIGHT: u64 = 2; // Represents the block height where the admin intermediate certificate and intermediate key are stored in the blockchains.
+
+pub fn get_app_certificate(
+    cert_blockchain: &libblockchain::blockchain::BlockChain,
+) -> anyhow::Result<openssl::x509::X509> {
+    let block_count = cert_blockchain.block_count()?;
+    if block_count == 0 {
+        anyhow::bail!("get_app_certificate -> No certificates found in the chain");
+    }
+    let cert_block = match cert_blockchain.get_block_by_height(APP_BLOCK_HEIGHT) {
+        (Ok(block), Ok(_)) => block,
+        _ => anyhow::bail!("get_app_certificate -> No certificates found in the chain"),
+    };
+    let cert = match openssl::x509::X509::from_pem(cert_block.block_data().as_slice()) {
+        Ok(cert) => cert,
+        Err(e) => anyhow::bail!(
+            "get_app_certificate -> Failed to parse certificate from PEM: {}",
+            e
+        ),
+    };
+    Ok(cert)
+}
+
+pub fn get_app_private_key(
+    key_blockchain: &libblockchain::blockchain::BlockChain,
+) -> anyhow::Result<openssl::pkey::PKey<openssl::pkey::Private>> {
+    let block_count = key_blockchain.block_count()?;
+    if block_count == 0 {
+        anyhow::bail!("get_app_private_key -> No private keys found in the chain");
+    }
+    let key_block = match key_blockchain.get_block_by_height(APP_BLOCK_HEIGHT) {
+        (Ok(block), Ok(_)) => block,
+        _ => anyhow::bail!("get_app_private_key -> No private keys found in the chain"),
+    };
+    let private_key =
+        match openssl::pkey::PKey::private_key_from_pem(key_block.block_data().as_slice()) {
+            Ok(key) => key,
+            Err(e) => anyhow::bail!(
+                "get_app_private_key -> Failed to parse private key from PEM: {}",
+                e
+            ),
+        };
+    Ok(private_key)
+}
 
 pub fn get_root_private_key(
     private_key_chain: &libblockchain::blockchain::BlockChain,
@@ -80,6 +124,131 @@ pub fn get_admin_intermediate_private_key(
     )?;
     let admin_private_key = openssl::pkey::PKey::private_key_from_der(&decrypted_admin_key_der)?;
     Ok(admin_private_key)
+}
+
+pub fn store_user_keypair_and_intermediate_cert(
+    user_cert: &openssl::x509::X509,
+    intermediate_cert: &openssl::x509::X509,
+    cert_chain: &libblockchain::blockchain::BlockChain,
+    app_public_key: &openssl::pkey::PKey<openssl::pkey::Public>,
+) -> anyhow::Result<()> {
+    let user_cert_pem = match user_cert.to_pem() {
+        Ok(pem) => pem,
+        Err(e) => {
+            tracing::error!(error = %e, "store_user_keypair_and_intermediate_cert -> Failed to convert user certificate to PEM.");
+            anyhow::bail!(
+                "store_user_keypair_and_intermediate_cert -> Failed to convert user certificate to PEM: {}",
+                e
+            );
+        }
+    };
+    let intermediate_cert_pem = match intermediate_cert.to_pem() {
+        Ok(pem) => pem,
+        Err(e) => {
+            tracing::error!(error = %e, "store_user_keypair_and_intermediate_cert -> Failed to convert intermediate certificate to PEM.");
+            anyhow::bail!("store_user_keypair_and_intermediate_cert -> Failed to convert intermediate certificate to PEM: {}", e);
+        }
+    };
+    let combined_pem = [user_cert_pem, intermediate_cert_pem].concat();
+    let encrypted_combined_cert = match crate::encryption::encrypt_data(
+        &combined_pem,
+        &app_public_key,
+    ) {
+        Ok(data) => data,
+        Err(e) => {
+            tracing::error!(error = %e, "store_user_keypair_and_intermediate_cert -> Failed to encrypt combined certificate.");
+            anyhow::bail!(
+                "store_user_keypair_and_intermediate_cert -> Failed to encrypt combined certificate: {}",
+                e
+            );
+        }
+    };
+    match cert_chain.put_block(&encrypted_combined_cert, &Vec::<u8>::new()) {
+        Ok(_) => Ok(()),
+        Err(e) => {
+            tracing::error!(error = %e, "store_user_keypair_and_intermediate_cert -> Failed to store user keypair and intermediate certificate in the chain.");
+            anyhow::bail!("store_user_keypair_and_intermediate_cert -> Failed to store user keypair and intermediate certificate in the chain: {}", e);
+        }
+    }
+}
+
+pub fn get_user_and_intermediate_cert(
+    height: u64,
+    certificate_chain: &libblockchain::blockchain::BlockChain,
+    app_private_key: &openssl::pkey::PKey<openssl::pkey::Private>,
+) -> anyhow::Result<(openssl::x509::X509, openssl::x509::X509)> {
+    let cert_block = match certificate_chain.get_block_by_height(height) {
+        (Ok(block), Ok(_)) => block,
+        (Err(e), _) | (_, Err(e)) => {
+            tracing::error!(error = %e, "get_user_and_intermediate_cert -> Failed to retrieve certificate block at height {}.", height);
+            anyhow::bail!(
+                "get_user_and_intermediate_cert -> Failed to retrieve certificate block at height {}: {}",
+                height,
+                e
+            );
+        }
+    };
+    let decrypted_combined_cert =
+        crate::encryption::decrypt_data(cert_block.block_data().as_slice(), &app_private_key)?;
+    let mut certs = match openssl::x509::X509::stack_from_pem(&decrypted_combined_cert) {
+        Ok(certs) => certs,
+        Err(e) => {
+            tracing::error!(error = %e, "get_user_and_intermediate_cert -> Failed to parse decrypted combined certificate PEM.");
+            anyhow::bail!(
+                "get_user_and_intermediate_cert -> Failed to parse decrypted combined certificate PEM: {}",
+                e
+            );
+        }
+    };
+    if certs.len() != 2 {
+        tracing::error!(
+            cert_count = certs.len(),
+            "get_user_and_intermediate_cert -> Expected 2 certificates in the combined PEM, found {}.",
+            certs.len()
+        );
+        anyhow::bail!(
+            "get_user_and_intermediate_cert -> Expected 2 certificates in the combined PEM, found {}.",
+            certs.len()
+        );
+    }
+    let leaf_cert = certs.remove(0);
+    let intermediate_cert = certs.remove(0);
+    Ok((leaf_cert, intermediate_cert))
+}
+
+pub fn store_private_key(
+    private_key: &openssl::pkey::PKey<openssl::pkey::Private>,
+    private_key_chain: &libblockchain::blockchain::BlockChain,
+    app_public_key: &openssl::pkey::PKey<openssl::pkey::Public>,
+) -> anyhow::Result<()> {
+    let private_key_der = match private_key.private_key_to_der() {
+        Ok(der) => der,
+        Err(e) => {
+            tracing::error!(error = %e, "store_private_key -> Failed to convert private key to DER.");
+            anyhow::bail!(
+                "store_private_key -> Failed to convert private key to DER: {}",
+                e
+            );
+        }
+    };
+    let encrypted_private_key =
+        match crate::encryption::encrypt_data(&private_key_der, &app_public_key) {
+            Ok(data) => data,
+            Err(e) => {
+                tracing::error!(error = %e, "store_private_key -> Failed to encrypt private key.");
+                anyhow::bail!("store_private_key -> Failed to encrypt private key: {}", e);
+            }
+        };
+    match private_key_chain.put_block(&encrypted_private_key, &Vec::<u8>::new()) {
+        Ok(_) => Ok(()),
+        Err(e) => {
+            tracing::error!(error = %e, "store_private_key -> Failed to store encrypted private key in the chain.");
+            anyhow::bail!(
+                "store_private_key -> Failed to store encrypted private key in the chain: {}",
+                e
+            );
+        }
+    }
 }
 
 #[derive(serde::Serialize, Debug, Clone)]
@@ -233,7 +402,7 @@ fn validate_storage(app_config: &crate::configs::AppConfig) -> ValidationResult 
         tracing::info!("validate_storage -> Certificate and private key blockchains are empty.");
         return validation_results;
     }
-    let app_private_key = match crate::encryption::get_app_private_key(&app_config) {
+    let app_private_key = match get_app_private_key(&priv_key_chain) {
         Ok(key) => key,
         Err(e) => {
             tracing::error!(error = %e, "validate_storage -> Failed to get app private key for validation.");
@@ -267,7 +436,7 @@ fn validate_storage(app_config: &crate::configs::AppConfig) -> ValidationResult 
             return validation_results;
         }
     };
-    validation_results.root_cert_valid = match crate::encryption::validate_self_signed_root_pair(
+    validation_results.root_cert_valid = match crate::encryption::validate_self_signed(
         &root_cert, &root_key,
     ) {
         Ok(valid) => {
@@ -296,7 +465,7 @@ fn validate_storage(app_config: &crate::configs::AppConfig) -> ValidationResult 
     // Zero out the root private key DER bytes from memory after validation
     zeroize::Zeroize::zeroize(&mut root_key.private_key_to_der().unwrap_or_default());
     drop(root_key); // Ensure the root private key is dropped from memory as soon as it's no longer needed for validation
-    let auth_store = match crate::encryption::build_client_auth_store_from_root_ca(&root_cert) {
+    let auth_store = match crate::encryption::get_auth_store(&root_cert) {
         Ok(store) => store,
         Err(e) => {
             tracing::error!(error = %e, "validate_storage -> Failed to build certificate store from root certificate for validation.");
@@ -322,8 +491,7 @@ fn validate_storage(app_config: &crate::configs::AppConfig) -> ValidationResult 
         }
     };
     validation_results.default_admin_intermediate_cert_valid =
-        match crate::encryption::validate_intermediate_cert_chain(&default_interm_cert, &auth_store)
-        {
+        match crate::encryption::validate_intermediate_cert(&default_interm_cert, &auth_store) {
             Ok(valid) => {
                 if !valid {
                     tracing::error!(
@@ -420,8 +588,7 @@ fn validate_storage(app_config: &crate::configs::AppConfig) -> ValidationResult 
                 }
             };
         } else {
-            match crate::encryption::verify_client_auth_cert_chain(&auth_store, &auth_chain, &cert)
-            {
+            match crate::encryption::verify_user_cert(&auth_store, &auth_chain, &cert) {
                 Ok(cert_valid) => {
                     validation_results
                         .certificates_validation_results
@@ -908,29 +1075,39 @@ pub fn get_state(app_config: &crate::configs::AppConfig) -> StorageStatusResults
 }
 
 pub fn get_api_storage(
-    storage: Storage<crate::storage_ready::Ready>,
+    storage: &Storage<crate::storage_ready::Ready>,
 ) -> anyhow::Result<Storage<crate::storage_api::API>> {
+    let app_private_key = match get_app_private_key(&storage.state.private_key_chain) {
+        Ok(key) => key,
+        Err(e) => {
+            tracing::error!(error = %e, "get_api_storage -> Failed to get app private key for decrypting certificate blockchain.");
+            return Err(anyhow::anyhow!(
+                "get_api_storage -> Failed to get app private key for decrypting certificate blockchain: {}",
+                e
+            ));
+        }
+    };
     Ok(Storage {
         state: crate::storage_api::API {
-            certificate_chain: storage.state.certificate_chain,
-            crl_chain: storage.state.crl_chain,
-            auth_store: storage.state.auth_store,
-            auth_chain: storage.state.auth_chain,
+            certificate_chain: storage.state.certificate_chain.clone(),
+            crl_chain: storage.state.crl_chain.clone(),
+            auth_store: storage.state.auth_store.clone(),
+            app_private_key,
         },
         app_config: storage.app_config.clone(),
     })
 }
 
 pub fn get_admin_storage(
-    storage: Storage<crate::storage_ready::Ready>,
+    storage: &Storage<crate::storage_ready::Ready>,
 ) -> anyhow::Result<Storage<crate::storage_admin::Admin>> {
     Ok(Storage {
         state: crate::storage_admin::Admin {
-            certificate_chain: storage.state.certificate_chain,
-            private_key_chain: storage.state.private_key_chain,
-            crl_chain: storage.state.crl_chain,
-            auth_store: storage.state.auth_store,
-            auth_chain: storage.state.auth_chain,
+            certificate_chain: storage.state.certificate_chain.clone(),
+            private_key_chain: storage.state.private_key_chain.clone(),
+            crl_chain: storage.state.crl_chain.clone(),
+            auth_store: storage.state.auth_store.clone(),
+            auth_chain: openssl::stack::Stack::new()?,
         },
         app_config: storage.app_config.clone(),
     })
@@ -996,10 +1173,18 @@ pub fn get_initialized_storage(
             ));
         }
     };
-    let root_cert = match crate::storage::get_root_certificate(
-        &certificate_chain,
-        &crate::encryption::get_app_private_key(app_config)?,
-    ) {
+    let app_private_key = match get_app_private_key(&private_key_chain) {
+        Ok(key) => key,
+        Err(e) => {
+            tracing::error!(error = %e, "get_initialized_storage -> Failed to get app private key for decrypting certificate blockchain during initialization.");
+            return Err(anyhow::anyhow!(
+                "get_initialized_storage -> Failed to get app private key for decrypting certificate blockchain during initialization: {}",
+                e
+            ));
+        }
+    };
+    let root_cert = match crate::storage::get_root_certificate(&certificate_chain, &app_private_key)
+    {
         Ok(cert) => cert,
         Err(e) => {
             tracing::error!(error = %e, "get_initialized_storage -> Failed to get root certificate from certificate blockchain.");
@@ -1009,10 +1194,8 @@ pub fn get_initialized_storage(
             ));
         }
     };
-    let root_key = match crate::storage::get_root_private_key(
-        &private_key_chain,
-        &crate::encryption::get_app_private_key(app_config)?,
-    ) {
+    let root_key = match crate::storage::get_root_private_key(&private_key_chain, &app_private_key)
+    {
         Ok(key) => key,
         Err(e) => {
             tracing::error!(error = %e, "get_initialized_storage -> Failed to get root private key from private key blockchain.");
@@ -1022,8 +1205,7 @@ pub fn get_initialized_storage(
             ));
         }
     };
-    let root_valid = match crate::encryption::validate_self_signed_root_pair(&root_cert, &root_key)
-    {
+    let root_valid = match crate::encryption::validate_self_signed(&root_cert, &root_key) {
         Ok(valid) => valid,
         Err(e) => {
             tracing::error!(error = %e, "get_initialized_storage -> Failed to validate root certificate and root private key pair.");
@@ -1041,7 +1223,7 @@ pub fn get_initialized_storage(
             "get_initialized_storage -> Root certificate and root private key pair are not valid."
         ));
     }
-    let auth_store = match crate::encryption::build_client_auth_store_from_root_ca(&root_cert) {
+    let auth_store = match crate::encryption::get_auth_store(&root_cert) {
         Ok(store) => store,
         Err(e) => {
             tracing::error!(error = %e, "get_initialized_storage -> Failed to build client auth store from root certificate.");
@@ -1053,7 +1235,7 @@ pub fn get_initialized_storage(
     };
     let default_interm_cert = match crate::storage::get_admin_intermediate_certificate(
         &certificate_chain,
-        &crate::encryption::get_app_private_key(app_config)?,
+        &app_private_key,
     ) {
         Ok(cert) => cert,
         Err(e) => {
@@ -1064,7 +1246,7 @@ pub fn get_initialized_storage(
                 ));
         }
     };
-    let admin_valid = match crate::encryption::validate_intermediate_cert_chain(
+    let admin_valid = match crate::encryption::validate_intermediate_cert(
         &default_interm_cert,
         &auth_store,
     ) {
@@ -1085,32 +1267,12 @@ pub fn get_initialized_storage(
             "get_initialized_storage -> Default admin intermediate certificate is not valid against root certificate."
         ));
     }
-    let auth_chain = match openssl::stack::Stack::new() {
-        Ok(mut stack) => {
-            stack.push(default_interm_cert).map_err(|e| {
-                tracing::error!(error = %e, "get_initialized_storage -> Failed to push default admin intermediate certificate onto stack for certificate chain validation.");
-                anyhow::anyhow!(
-                    "get_initialized_storage -> Failed to push default admin intermediate certificate onto stack for certificate chain validation: {}",
-                    e
-                )
-            })?;
-            stack
-        }
-        Err(e) => {
-            tracing::error!(error = %e, "get_initialized_storage -> Failed to create stack for certificate chain validation.");
-            return Err(anyhow::anyhow!(
-                "get_initialized_storage -> Failed to create stack for certificate chain validation: {}",
-                e
-            ));
-        }
-    };
     Ok(Storage {
         state: crate::storage_initialized::Initialized {
             certificate_chain,
             private_key_chain,
             crl_chain,
-            auth_store,
-            auth_chain,
+            auth_store: std::sync::Arc::new(auth_store),
         },
         app_config: app_config.clone(),
     })
@@ -1255,10 +1417,18 @@ pub fn get_ready_storage(
             ));
         }
     };
-    let root_cert = match crate::storage::get_root_certificate(
-        &certificate_chain,
-        &crate::encryption::get_app_private_key(app_config)?,
-    ) {
+    let app_private_key = match get_app_private_key(&private_key_chain) {
+        Ok(key) => key,
+        Err(e) => {
+            tracing::error!(error = %e, "get_ready_storage -> Failed to get app private key for decrypting certificate blockchain.");
+            return Err(anyhow::anyhow!(
+                "get_ready_storage -> Failed to get app private key for decrypting certificate blockchain: {}",
+                e
+            ));
+        }
+    };
+    let root_cert = match crate::storage::get_root_certificate(&certificate_chain, &app_private_key)
+    {
         Ok(cert) => cert,
         Err(e) => {
             tracing::error!(error = %e, "get_ready_storage -> Failed to get root certificate from certificate blockchain.");
@@ -1268,10 +1438,8 @@ pub fn get_ready_storage(
             ));
         }
     };
-    let root_key = match crate::storage::get_root_private_key(
-        &private_key_chain,
-        &crate::encryption::get_app_private_key(app_config)?,
-    ) {
+    let root_key = match crate::storage::get_root_private_key(&private_key_chain, &app_private_key)
+    {
         Ok(key) => key,
         Err(e) => {
             tracing::error!(error = %e, "get_ready_storage -> Failed to get root private key from private key blockchain.");
@@ -1281,7 +1449,7 @@ pub fn get_ready_storage(
             ));
         }
     };
-    match crate::encryption::validate_self_signed_root_pair(&root_cert, &root_key) {
+    match crate::encryption::validate_self_signed(&root_cert, &root_key) {
         Ok(valid) => {
             if valid {
                 tracing::info!(
@@ -1307,7 +1475,7 @@ pub fn get_ready_storage(
     // Zeroize the root private key from memory after validation and drop it
     zeroize::Zeroize::zeroize(&mut root_key.private_key_to_der().unwrap_or_default());
     drop(root_key);
-    let auth_store = match crate::encryption::build_client_auth_store_from_root_ca(&root_cert) {
+    let auth_store = match crate::encryption::get_auth_store(&root_cert) {
         Ok(store) => store,
         Err(e) => {
             tracing::error!(error = %e, "get_ready_storage -> Failed to build client auth store from root certificate.");
@@ -1319,7 +1487,7 @@ pub fn get_ready_storage(
     };
     let admin_interm_cert = match crate::storage::get_admin_intermediate_certificate(
         &certificate_chain,
-        &crate::encryption::get_app_private_key(app_config)?,
+        &app_private_key,
     ) {
         Ok(cert) => cert,
         Err(e) => {
@@ -1330,7 +1498,7 @@ pub fn get_ready_storage(
             ));
         }
     };
-    match crate::encryption::validate_intermediate_cert_chain(&admin_interm_cert, &auth_store) {
+    match crate::encryption::validate_intermediate_cert(&admin_interm_cert, &auth_store) {
         Ok(valid) => {
             if valid {
                 tracing::info!(
@@ -1353,19 +1521,39 @@ pub fn get_ready_storage(
             ));
         }
     };
-    let auth_chain = {
-        let mut stack = openssl::stack::Stack::new()?;
-        stack.push(admin_interm_cert)?;
-        stack
-    };
     Ok(Storage {
         state: crate::storage_ready::Ready {
             certificate_chain,
             private_key_chain,
             crl_chain,
-            auth_store,
-            auth_chain,
+            auth_store: std::sync::Arc::new(auth_store),
         },
         app_config: app_config.clone(),
     })
+}
+
+// Serialize App Cert or App Key for storage. Format:
+// [4 bytes plaintext pem_len LE]
+// [PEM-encoded cert or key bytes]
+pub fn serialize_app_cert_or_key(pem_data: &[u8]) -> Vec<u8> {
+    let mut serialized = Vec::new();
+    let pem_len = pem_data.len() as u32;
+    serialized.extend_from_slice(&pem_len.to_le_bytes());
+    serialized.extend_from_slice(pem_data);
+    serialized
+}
+
+pub fn deserialize_app_cert_or_key(data: &[u8]) -> anyhow::Result<Vec<u8>> {
+    if data.len() < 4 {
+        return Err(anyhow::anyhow!(
+            "deserialize_app_cert_or_key -> Data too short to contain PEM length"
+        ));
+    }
+    let pem_len = u32::from_le_bytes([data[0], data[1], data[2], data[3]]) as usize;
+    if data.len() < 4 + pem_len {
+        return Err(anyhow::anyhow!(
+            "deserialize_app_cert_or_key -> Data too short to contain full PEM data"
+        ));
+    }
+    Ok(data[4..4 + pem_len].to_vec())
 }

@@ -1,5 +1,12 @@
 use base64::Engine;
-use std::io::{Read, Write};
+use keyutils::keytypes::user;
+use openssl::x509::CertificateIssuer;
+use std::{
+    f32::consts::E,
+    io::{Read, Write},
+};
+
+use crate::storage::{self, ValidationResult};
 
 const PROTOCOL_VERSION1: u32 = 1;
 
@@ -87,20 +94,44 @@ fn send_response(
 }
 
 /*
-* The format for the API server request is a JSON object with the following fields:
+* The format for Public API server request is a JSON object with the following fields:
 {
+    "request_type": "Public",
     "request": {
         "response_socket": "Path to the Unix socket where the response should be sent",
-        "request_type": "GetCACertificate" | "CheckCRL" | "LoginAdmin" | "GetState" | "AdminRequest",
-        // For GetCACertificate request type, the following additional fields are required:
-        "subject_common_name": "The common name of the certificate to retrieve",
-        "requester_certificate": "Base64-encoded DER format of the requester certificate,
+        "request_action": "ValidateCertificate",
+        "requested_certificate": "PEM formatted of the certificate to validate",
+        "requester_certificate": "PEM formatted certificate of the requester, used for logging and auditing purposes",
+    },
+    "request_signature": "Base64-encoded signature of the request JSON (excluding the
+        request_signature field) signed by the requester's private key"
+}
+* The response format for a Public API request will be:
+{
+    "response": {
+        "request_id": "A unique identifier for the request/response pair, will be a UUID",
+        "status": "success" | "not_found",
+        "message": "Detailed message about the result of the request",
+        "requested_certificate": "PEM formatted certificate that was validated (if found)",
+        "intermediate_certificate": "PEM formatted intermediate certificate (if applicable)",
+        "root_certificate": "PEM formatted root certificate (if applicable)",
+    }
+}
+* The format for a Private API server request is a JSON object with the following fields:
+{
+    "request_type": "Private",
+    "request": {
+    [encrypted request data, the exact fields will depend on the specific private API request being made,
+    but it will generally include the following common fields:]
+        "response_socket": "Path to the Unix socket where the response should be sent",
+        "request_action": "GetState",
         "data": {
             // Optional field containing additional data relevant to the request
         },
     },
     "request_signature": "Base64-encoded signature of the request JSON (excluding the
-        request_signature field) signed by the requester certificate's private key"
+        request_signature field) signed by the requester's private key",
+    "requester_certificate_serial": "String representation of the serial number of the requester certificate, used to look up the requester certificate in storage for authentication"
 }
 * The API server will verify the signature of the request using the public key from the requester certificate
 * and verify the signature with the stored certificate in the database to ensure that the requester is authorized
@@ -124,8 +155,8 @@ fn send_response(
 
 pub fn start_api_server(
     app_config: &crate::configs::AppConfig,
-    storage_status: crate::storage::StorageStatusResults,
-) -> crate::storage::StorageStatusResults {
+    storage: &crate::storage::Storage<crate::storage_api::API>,
+) {
     let _ = std::fs::remove_file(&app_config.server.comm_sock); // Remove existing socket file if it exists
     let listener = std::os::unix::net::UnixListener::bind(&app_config.server.comm_sock)
         .expect("Failed to bind to socket");
@@ -133,40 +164,25 @@ pub fn start_api_server(
         "Communication server started at {}",
         app_config.server.comm_sock.to_str().unwrap_or("N/A")
     );
-    let storage = match crate::storage::get_ready_storage(app_config) {
-        Ok(s) => s,
-        Err(e) => {
-            tracing::error!(error = %e, "Failed to get ready storage");
-            std::process::exit(1);
-        }
-    };
-    let mut storage = crate::storage::get_api_storage(storage).expect("Failed to get API storage");
     for stream in listener.incoming() {
         match stream {
             Ok(stream) => {
-                handle_api_request(&stream, &mut storage);
+                handle_api_request(&stream, storage);
             }
             Err(e) => {
                 eprintln!("Failed to accept connection: {}", e);
             }
         }
     }
-    storage_status
 }
 
-fn handle_api_request(
-    stream: &std::os::unix::net::UnixStream,
-    storage: &mut crate::storage::Storage<crate::storage_api::API>,
+fn handle_public_api_request(
+    request_id: String,
+    request_json: serde_json::Value,
+    storage: &crate::storage::Storage<crate::storage_api::API>,
 ) {
-    let request_id = uuid::Uuid::new_v4().to_string();
-    let request_json = match recv_request(stream) {
-        Ok(json) => json,
-        Err(e) => {
-            tracing::error!(error = %e, "handle_api_request -> Request ID {} -> Failed to receive or parse request", request_id);
-            return;
-        }
-    };
-    let request = match request_json.get("request") {
+    // Handle public API request
+    let request = match request_json.pointer("/request") {
         Some(r) => r,
         None => {
             tracing::error!("handle_api_request -> Request ID {} -> Request JSON missing required field: request", request_id);
@@ -174,7 +190,7 @@ fn handle_api_request(
         }
     };
     let request_signature_base64 = match request_json
-        .get("request_signature")
+        .pointer("/request_signature")
         .and_then(|v| v.as_str())
     {
         Some(s) => s,
@@ -199,8 +215,44 @@ fn handle_api_request(
             return;
         }
     };
+    let requester_certificate_pem = match request_json
+        .pointer("/request/requester_certificate")
+        .and_then(|v| v.as_str())
+    {
+        Some(rc) => rc,
+        None => {
+            tracing::error!("handle_api_request -> Request ID {} -> Request missing required field: requester_certificate", request_id);
+            return;
+        }
+    };
+    let requester_certificate = match openssl::x509::X509::from_pem(
+        requester_certificate_pem.as_bytes(),
+    ) {
+        Ok(cert) => cert,
+        Err(e) => {
+            tracing::error!(error = %e, "handle_api_request -> Request ID {} -> Failed to parse requester certificate from PEM", request_id);
+            return;
+        }
+    };
+    let valid_signature = match requester_certificate.public_key() {
+        Ok(public_key) => match crate::encryption::verify_signature(
+            &request_bytes,
+            &request_signature,
+            &public_key,
+        ) {
+            Ok(valid) => valid,
+            Err(e) => {
+                tracing::error!(error = %e, "handle_api_request -> Request ID {} -> Failed to verify request signature", request_id);
+                return;
+            }
+        },
+        Err(e) => {
+            tracing::error!(error = %e, "handle_api_request -> Request ID {} -> Failed to extract public key from requester certificate", request_id);
+            return;
+        }
+    };
     let response_socket_str = match request_json
-        .pointer("request/response_socket")
+        .pointer("/request/response_socket")
         .and_then(|v| v.as_str())
     {
         Some(s) => s,
@@ -216,92 +268,7 @@ fn handle_api_request(
             return;
         }
     };
-    let requester_cert_base64 = request_json
-        .pointer("/request/requester_certificate")
-        .and_then(|v| v.as_str());
-    let requester_cert_der = match requester_cert_base64 {
-        Some(rc) => match base64::engine::general_purpose::STANDARD.decode(rc) {
-            Ok(der) => der,
-            Err(e) => {
-                tracing::error!(error = %e, "handle_api_request -> Request ID {} -> Failed to decode requester certificate from base64", request_id);
-                send_response(
-                    &response_socket,
-                    &serde_json::json!({
-                        "request_id": request_id,
-                        "status": "error",
-                        "message": "Failed to decode requester certificate from base64",
-                        "data": request_json,
-                    }),
-                );
-                return;
-            }
-        },
-        None => {
-            tracing::error!("handle_api_request -> Request ID {} -> Request missing required field: requester_certificate", request_id);
-            send_response(
-                &response_socket,
-                &serde_json::json!({
-                    "request_id": request_id,
-                    "status": "error",
-                    "message": "Request missing required field: requester_certificate",
-                    "data": request_json,
-                }),
-            );
-            return;
-        }
-    };
-    let requester_cert = match openssl::x509::X509::from_der(&requester_cert_der) {
-        Ok(cert) => cert,
-        Err(e) => {
-            tracing::error!(error = %e, "handle_api_request -> Request ID {} -> Failed to parse requester certificate from DER", request_id);
-            send_response(
-                &response_socket,
-                &serde_json::json!({
-                    "request_id": request_id,
-                    "status": "error",
-                    "message": "Failed to parse requester certificate from DER",
-                    "data": request_json,
-                }),
-            );
-            return;
-        }
-    };
-    let request_verified = match requester_cert.public_key() {
-        Ok(public_key) => match crate::encryption::verify_signature(
-            &request_bytes,
-            &request_signature,
-            public_key,
-        ) {
-            Ok(valid) => valid,
-            Err(e) => {
-                tracing::error!(error = %e, "handle_api_request -> Request ID {} -> Failed to verify request signature", request_id);
-                send_response(
-                    &response_socket,
-                    &serde_json::json!({
-                        "request_id": request_id,
-                        "status": "error",
-                        "message": "Failed to verify request signature",
-                        "data": request_json,
-                    }),
-                );
-                return;
-            }
-        },
-        Err(e) => {
-            tracing::error!(error = %e, "handle_api_request -> Request ID {} -> Failed to extract public key from requester certificate", request_id);
-            send_response(
-                &response_socket,
-                &serde_json::json!({
-                    "request_id": request_id,
-                    "status": "error",
-                    "message": "Failed to extract public key from requester certificate",
-                    "data": request_json,
-                }),
-            );
-            return;
-        }
-    };
-    if !request_verified {
+    if !valid_signature {
         tracing::error!(
             "handle_api_request -> Request ID {} -> Request signature verification failed",
             request_id
@@ -309,241 +276,333 @@ fn handle_api_request(
         send_response(
             &response_socket,
             &serde_json::json!({
-                "request_id": request_id,
-                "status": "error",
-                "message": "Request signature verification failed",
-                "data": request_json,
+                "response": {
+                    "request_id": request_id,
+                    "status": "not_found",
+                    "message": "Request signature verification failed",
+                }
             }),
         );
-        return;
     }
-    // Check the requester is authorized by verifying the requester certificate against the auth chain.
-    match crate::encryption::verify_client_auth_cert_chain(
-        &storage.state.auth_store,
-        &storage.state.auth_chain,
-        &requester_cert,
-    ) {
-        Ok(valid) => {
-            if !valid {
-                tracing::error!("handle_api_request -> Request ID {} -> Requester certificate failed verification against cert chain", request_id);
+    let request_action = match request
+        .pointer("/request/request_action")
+        .and_then(|v| v.as_str())
+    {
+        Some(ra) => ra,
+        None => {
+            tracing::error!("handle_api_request -> Request ID {} -> Request missing required field: request_action", request_id);
+            send_response(
+                &response_socket,
+                &serde_json::json!({
+                    "response": {
+                        "request_id": request_id,
+                        "status": "not_found",
+                        "message": "Request missing required field: request_action",
+                    }
+                }),
+            );
+            return;
+        }
+    };
+    match request_action {
+        "ValidateCertificate" => {
+            // Handle ValidateCertificate request
+            let requested_cert_pem = match request
+                .pointer("/request/requested_certificate")
+                .and_then(|v| v.as_str())
+            {
+                Some(rc) => rc,
+                None => {
+                    tracing::error!("handle_api_request -> Request ID {} -> ValidateCertificate request missing required field: requested_certificate", request_id);
+                    send_response(
+                        &response_socket,
+                        &serde_json::json!({
+                            "response": {
+                                "request_id": request_id,
+                                "status": "not_found",
+                                "message": "ValidateCertificate request missing required field: requested_certificate",
+                            }
+                        }),
+                    );
+                    return;
+                }
+            };
+            let requested_cert = match openssl::x509::X509::from_pem(requested_cert_pem.as_bytes())
+            {
+                Ok(cert) => cert,
+                Err(e) => {
+                    tracing::error!(error = %e, "handle_api_request -> Request ID {} -> Failed to parse requested certificate from PEM", request_id);
+                    send_response(
+                        &response_socket,
+                        &serde_json::json!({
+                            "response": {
+                                "request_id": request_id,
+                                "status": "not_found",
+                                "message": "Failed to parse requested certificate from PEM",
+                            }
+                        }),
+                    );
+                    return;
+                }
+            };
+            let requested_cert_serial = match requested_cert.serial_number().to_bn() {
+                Ok(serial) => serial,
+                Err(e) => {
+                    tracing::error!(error = %e, "handle_api_request -> Request ID {} -> Failed to convert requested certificate serial number", request_id);
+                    send_response(
+                        &response_socket,
+                        &serde_json::json!({
+                            "response": {
+                                "request_id": request_id,
+                                "status": "not_found",
+                                "message": "Failed to convert requested certificate serial number",
+                            }
+                        }),
+                    );
+                    return;
+                }
+            };
+            let (requested_cert, intermediate) = match storage
+                .get_certificate_by_serial(requested_cert_serial)
+            {
+                Ok(Some((cert, intermediate))) => (cert, intermediate),
+                Ok(None) => {
+                    tracing::warn!("handle_api_request -> Request ID {} -> Requested certificate not found in storage by serial number", request_id);
+                    send_response(
+                        &response_socket,
+                        &serde_json::json!({
+                            "response": {
+                                "request_id": request_id,
+                                "status": "not_found",
+                                "message": "Requested certificate not found in storage by serial number",
+                            }
+                        }),
+                    );
+                    return;
+                }
+                Err(e) => {
+                    tracing::error!(error = %e, "handle_api_request -> Request ID {} -> Failed to retrieve requested certificate from storage by serial number", request_id);
+                    send_response(
+                        &response_socket,
+                        &serde_json::json!({
+                            "response": {
+                                "request_id": request_id,
+                                "status": "not_found",
+                                "message": "Failed to retrieve requested certificate from storage by serial number",
+                            }
+                        }),
+                    );
+                    return;
+                }
+            };
+            let auth_chain = match openssl::stack::Stack::new() {
+                Ok(mut stack) => match stack.push(intermediate.clone()) {
+                    Ok(_) => stack,
+                    Err(e) => {
+                        tracing::error!(error = %e, "handle_api_request -> Request ID {} -> Failed to build auth chain stack", request_id);
+                        send_response(
+                            &response_socket,
+                            &serde_json::json!({
+                                "response": {
+                                    "request_id": request_id,
+                                    "status": "not_found",
+                                    "message": "Failed to build auth chain stack",
+                                }
+                            }),
+                        );
+                        return;
+                    }
+                },
+                Err(e) => {
+                    tracing::error!(error = %e, "handle_api_request -> Request ID {} -> Failed to create auth chain stack", request_id);
+                    send_response(
+                        &response_socket,
+                        &serde_json::json!({
+                            "response": {
+                                "request_id": request_id,
+                                "status": "not_found",
+                                "message": "Failed to create auth chain stack",
+                            }
+                        }),
+                    );
+                    return;
+                }
+            };
+            let is_valid = match crate::encryption::verify_user_cert(
+                &storage.state.auth_store,
+                &auth_chain,
+                &requested_cert,
+            ) {
+                Ok(valid) => valid,
+                Err(e) => {
+                    tracing::error!(error = %e, "handle_api_request -> Request ID {} -> Failed to verify requested certificate against cert chain", request_id);
+                    send_response(
+                        &response_socket,
+                        &serde_json::json!({
+                            "response": {
+                                "request_id": request_id,
+                                "status": "not_found",
+                                "message": "Failed to verify requested certificate against cert chain",
+                            }
+                        }),
+                    );
+                    return;
+                }
+            };
+            if !is_valid {
+                tracing::error!(
+                    "handle_api_request -> Request ID {} -> Requested certificate is not valid",
+                    request_id
+                );
                 send_response(
                     &response_socket,
                     &serde_json::json!({
-                        "request_id": request_id,
-                        "status": "error",
-                        "message": "Requester certificate failed verification against cert chain",
-                        "data": request_json,
+                        "response": {
+                            "request_id": request_id,
+                            "status": "not_found",
+                            "message": "Requested certificate is not valid",
+                        }
                     }),
                 );
                 return;
             }
-        }
-        Err(e) => {
-            tracing::error!(error = %e, "handle_api_request -> Request ID {} -> Failed to verify requester certificate against cert chain", request_id);
-            send_response(
-                &response_socket,
-                &serde_json::json!({
-                    "request_id": request_id,
-                    "status": "error",
-                    "message": "Failed to verify requester certificate against cert chain",
-                    "data": request_json,
-                }),
-            );
-            return;
-        }
-    };
-    // If we reach this point, the request is authenticated and authorized, so we can proceed to handle the request.
-    let request_type = match request
-        .pointer("request/request_type")
-        .and_then(|v| v.as_str())
-    {
-        Some(rt) => rt,
-        None => {
-            tracing::error!("handle_api_request -> Request ID {} -> Request missing required field: request_type", request_id);
-            send_response(
-                &response_socket,
-                &serde_json::json!({
-                    "request_id": request_id,
-                    "status": "error",
-                    "message": "Request missing required field: request_type",
-                    "data": request_json,
-                }),
-            );
-            return;
-        }
-    };
-    match request_type {
-        "GetCACertificate" => {
-            let requested_cert_serial_number = || -> Option<openssl::bn::BigNum> {
-                let serial_str = match request
-                    .pointer("request/requested_serial")
-                    .and_then(|v| v.as_str())
-                {
-                    Some(s) => s,
-                    None => return None,
-                };
-                let serial_bn = match openssl::bn::BigNum::from_dec_str(serial_str).ok() {
-                    Some(bn) => bn,
-                    None => return None,
-                };
-                Some(serial_bn)
-            }();
-            if requested_cert_serial_number.is_some() {
-                match storage.get_certificate_by_serial(requested_cert_serial_number.unwrap()) {
-                    Ok((cert, _)) => {
-                        let is_verified = match crate::encryption::verify_client_auth_cert_chain(
-                            &storage.state.auth_store,
-                            &storage.state.auth_chain,
-                            &cert,
-                        ) {
-                            Ok(valid) => valid,
-                            Err(e) => {
-                                tracing::error!(error = %e, "handle_api_request -> Request ID {} -> Retrieved certificate failed verification against cert chain", request_id);
-                                send_response(
-                                    &response_socket,
-                                    &serde_json::json!({
-                                        "request_id": request_id,
-                                        "status": "error",
-                                        "message": "Retrieved certificate failed verification against cert chain",
-                                        "data": request_json,
-                                    }),
-                                );
-                                return;
+            let request_cert_pem = match requested_cert.to_pem() {
+                Ok(pem) => String::from_utf8_lossy(&pem).to_string(),
+                Err(e) => {
+                    tracing::error!(error = %e, "handle_api_request -> Request ID {} -> Failed to convert requested certificate to PEM format", request_id);
+                    send_response(
+                        &response_socket,
+                        &serde_json::json!({
+                            "response": {
+                                "request_id": request_id,
+                                "status": "not_found",
+                                "message": "Failed to convert requested certificate to PEM format",
                             }
-                        };
-                        send_response(
-                            &response_socket,
-                            &serde_json::json!({
-                                "request_id": request_id,
-                                "status": "success",
-                                "message": "Requested certificate retrieved successfully",
-                                "data": {
-                                    "requested_certificate": base64::engine::general_purpose::STANDARD.encode(cert.to_der().unwrap_or_default()),
-                                    "is_verified": is_verified,
-                                },
-                            }),
-                        );
-                    }
-                    Err(e) => {
-                        tracing::error!(error = %e, "handle_api_request -> Request ID {} -> Failed to retrieve requested certificate by serial number", request_id);
-                        send_response(
-                            &response_socket,
-                            &serde_json::json!({
-                                "request_id": request_id,
-                                "status": "error",
-                                "message": "Failed to retrieve requested certificate by serial number",
-                                "data": request_json,
-                            }),
-                        );
-                    }
+                        }),
+                    );
+                    return;
                 }
-            } else {
-                let requested_cert_common_name = match request
-                    .pointer("request/requested_common_name")
-                    .and_then(|v| v.as_str())
-                {
-                    Some(cn) => cn,
-                    None => {
-                        tracing::error!("Error Location handle_api_request - > Request ID {} -> GetCACertificate request missing required field: requested_common_name", request_id);
-                        send_response(
-                            &response_socket,
-                            &serde_json::json!({
+            };
+            let intermediate_cert_pem = match intermediate.to_pem() {
+                Ok(pem) => String::from_utf8_lossy(&pem).to_string(),
+                Err(e) => {
+                    tracing::error!(error = %e, "handle_api_request -> Request ID {} -> Failed to convert intermediate certificate to PEM format", request_id);
+                    send_response(
+                        &response_socket,
+                        &serde_json::json!({
+                            "response": {
                                 "request_id": request_id,
-                                "status": "error",
-                                "message": "GetCACertificate request missing required field: requested_common_name",
-                                "data": request_json,
-                            }),
-                        );
-                        return;
-                    }
-                };
-                let reqeusted_cert = match storage
-                    .get_certificate_by_common_name(requested_cert_common_name)
-                {
-                    Ok((cert, _)) => cert,
-                    Err(e) => {
-                        tracing::error!(error = %e, "handle_api_request -> Request ID {} -> Failed to retrieve requested certificate by common name", request_id);
-                        send_response(
-                            &response_socket,
-                            &serde_json::json!({
+                                "status": "not_found",
+                                "message": "Failed to convert intermediate certificate to PEM format",
+                            }
+                        }),
+                    );
+                    return;
+                }
+            };
+            let root_cert = match crate::storage::get_root_certificate(
+                &storage.state.certificate_chain,
+                &storage.state.app_private_key,
+            ) {
+                Ok(cert) => cert,
+                Err(e) => {
+                    tracing::error!(error = %e, "handle_api_request -> Request ID {} -> Failed to retrieve root certificate", request_id);
+                    send_response(
+                        &response_socket,
+                        &serde_json::json!({
+                            "response": {
                                 "request_id": request_id,
-                                "status": "error",
-                                "message": "Failed to retrieve requested certificate by common name",
-                                "data": request_json,
-                            }),
-                        );
-                        return;
-                    }
-                };
-                let is_verified = match crate::encryption::verify_client_auth_cert_chain(
-                    &storage.state.auth_store,
-                    &storage.state.auth_chain,
-                    &reqeusted_cert,
-                ) {
-                    Ok(valid) => valid,
-                    Err(e) => {
-                        tracing::error!(error = %e, "handle_api_request -> Request ID {} -> Retrieved certificate failed verification against cert chain", request_id);
-                        send_response(
-                            &response_socket,
-                            &serde_json::json!({
+                                "status": "not_found",
+                                "message": "Failed to retrieve root certificate",
+                            }
+                        }),
+                    );
+                    return;
+                }
+            };
+            let root_cert_pem = match root_cert.to_pem() {
+                Ok(pem) => String::from_utf8_lossy(&pem).to_string(),
+                Err(e) => {
+                    tracing::error!(error = %e, "handle_api_request -> Request ID {} -> Failed to convert root certificate to PEM format", request_id);
+                    send_response(
+                        &response_socket,
+                        &serde_json::json!({
+                            "response": {
                                 "request_id": request_id,
-                                "status": "error",
-                                "message": "Retrieved certificate failed verification against cert chain",
-                                "data": request_json,
-                            }),
-                        );
-                        return;
-                    }
-                };
-                send_response(
-                    &response_socket,
-                    &serde_json::json!({
+                                "status": "not_found",
+                                "message": "Failed to convert root certificate to PEM format",
+                            }
+                        }),
+                    );
+                    return;
+                }
+            };
+            send_response(
+                &response_socket,
+                &serde_json::json!({
+                    "response": {
                         "request_id": request_id,
                         "status": "success",
-                        "message": "Requested certificate retrieved successfully",
-                        "data": {
-                            "requested_certificate": base64::engine::general_purpose::STANDARD.encode(reqeusted_cert.to_der().unwrap_or_default()),
-                            "is_verified": is_verified,
-                        },
-                    }),
-                );
-            }
-        }
-        "CheckCRL" => {
-            // Handle CheckCRL request
-        }
-        "LoginAdmin" => {
-            // Handle LoginAdmin request
-        }
-        "GetState" => {
-            let storage_state = crate::storage::get_state(&storage.app_config);
-            send_response(
-                &response_socket,
-                &serde_json::json!({
-                    "request_id": request_id,
-                    "status": "success",
-                    "message": "Storage state retrieved successfully",
-                    "data": {
-                        "storage_state": serde_json::to_value(&storage_state).unwrap_or(serde_json::Value::Null),
-                    },
+                        "message": "Certificate validated successfully",
+                        "requested_certificate": request_cert_pem,
+                        "intermediate_certificate": intermediate_cert_pem,
+                        "root_certificate": root_cert_pem,
+                    }
                 }),
             );
         }
         _ => {
             tracing::error!(
-                "handle_api_request - > Request ID {} -> Unknown request type: {}",
+                "handle_api_request -> Request ID {} -> Unknown request action: {}",
                 request_id,
-                request_type
+                request_action
             );
             send_response(
                 &response_socket,
                 &serde_json::json!({
-                    "request_id": request_id,
-                    "status": "error",
-                    "message": format!("Unknown request type: {}", request_type),
-                    "data": request_json,
+                    "response": {
+                        "request_id": request_id,
+                        "status": "not_found",
+                        "message": format!("Unknown request action: {}", request_action),
+                    }
                 }),
             );
+        }
+    }
+}
+
+fn handle_api_request(
+    stream: &std::os::unix::net::UnixStream,
+    storage: &crate::storage::Storage<crate::storage_api::API>,
+) {
+    let request_id = uuid::Uuid::new_v4().to_string();
+    let request_json = match recv_request(stream) {
+        Ok(json) => json,
+        Err(e) => {
+            tracing::error!(error = %e, "handle_api_request -> Request ID {} -> Failed to receive or parse request", request_id);
+            return;
+        }
+    };
+    let request_type = match request_json
+        .pointer("/request_type")
+        .and_then(|v| v.as_str())
+    {
+        Some(rt) => rt,
+        None => {
+            tracing::error!("handle_api_request -> Request ID {} -> Request JSON missing required field: request_type", request_id);
+            return;
+        }
+    };
+    match request_type {
+        "Public" => handle_public_api_request(request_id, request_json, storage),
+        //"Private" => handle_private_api_request(request_id, request_json, storage),
+        _ => {
+            tracing::error!(
+                "handle_api_request -> Request ID {} -> Unknown request type: {}",
+                request_id,
+                request_type
+            );
+            return;
         }
     }
 }
@@ -999,7 +1058,7 @@ fn handle_setup_request(
         "response_socket": "Path to the Unix socket where the response should be sent",
         "create_new_storage": true | false, // Only applicable for CreateAndInitialize request type, indicates whether to create new storage or just initialize existing storage
         "data": {
-            "admin_certificate_data": {
+            "certificate_data": {
                 "subject_common_name": "Common Name for the admin certificate",
                 "issuer_common_name": "Common Name for the issuer (Intermediate CA Name) certificate",
                 "organization": "Organization for the admin certificate",
@@ -1033,7 +1092,7 @@ fn handle_setup_request(
 */
 pub fn start_setup_server(
     app_config: &crate::configs::AppConfig,
-    storage_status: crate::storage::StorageStatusResults,
+    storage_status: &crate::storage::StorageStatusResults,
 ) {
     let _ = std::fs::remove_file(app_config.server.comm_sock.clone());
     let listener = std::os::unix::net::UnixListener::bind(app_config.server.comm_sock.clone())
@@ -1095,11 +1154,10 @@ pub fn start_setup_server(
 
 pub fn start_repair_server(
     app_config: &crate::configs::AppConfig,
-    storage_status: crate::storage::StorageStatusResults,
-) -> crate::storage::StorageStatusResults {
+    storage_status: &crate::storage::StorageStatusResults,
+) {
     // For now, we will just log that the repair server is not implemented and return the same storage status
     tracing::warn!("Repair server is not implemented yet, returning current storage status");
-    storage_status
 }
 
 fn parse_admin_cert_data(

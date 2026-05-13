@@ -9,7 +9,7 @@ pub const AES_GCM_TAG_SIZE: usize = 16; // 128 bits
 /// Size of data length field in serialized format (u32 = 4 bytes)
 pub const DATA_LEN_SIZE: usize = 4; // u32 for block length
 
-pub fn sign_data(
+fn sign_data(
     data: &[u8],
     private_key: &openssl::pkey::PKey<openssl::pkey::Private>,
 ) -> anyhow::Result<Vec<u8>> {
@@ -44,7 +44,7 @@ pub fn sign_data(
 pub fn verify_signature(
     data: &[u8],
     signature: &[u8],
-    public_key: openssl::pkey::PKey<openssl::pkey::Public>,
+    public_key: &openssl::pkey::PKey<openssl::pkey::Public>,
 ) -> anyhow::Result<bool> {
     let mut verifier =
         match openssl::sign::Verifier::new(openssl::hash::MessageDigest::sha256(), &public_key) {
@@ -247,17 +247,29 @@ pub fn decrypt_data(
 
     // RSA-OAEP unwrap
     let aes_key = {
-        let rsa = private_key
-            .rsa()
-            .map_err(|e| anyhow::anyhow!("decrypt_data -> Failed to get RSA private key: {}", e))?;
+        let rsa = match private_key.rsa() {
+            Ok(rsa) => rsa,
+            Err(e) => {
+                return Err(anyhow::anyhow!(
+                    "decrypt_data -> Failed to get RSA private key: {}",
+                    e
+                ))
+            }
+        };
         let mut decrypted_key = vec![0u8; rsa.size() as usize];
-        let len = rsa
-            .private_decrypt(
-                encrypted_aes_key,
-                &mut decrypted_key,
-                openssl::rsa::Padding::PKCS1_OAEP,
-            )
-            .map_err(|e| anyhow::anyhow!("decrypt_data -> RSA decryption failed: {}", e))?;
+        let len = match rsa.private_decrypt(
+            encrypted_aes_key,
+            &mut decrypted_key,
+            openssl::rsa::Padding::PKCS1_OAEP,
+        ) {
+            Ok(len) => len,
+            Err(e) => {
+                return Err(anyhow::anyhow!(
+                    "decrypt_data -> RSA decryption failed: {}",
+                    e
+                ))
+            }
+        };
         decrypted_key.truncate(len);
         decrypted_key
     };
@@ -270,205 +282,26 @@ pub fn decrypt_data(
         ));
     }
 
-    let decrypted_data = openssl::symm::decrypt_aead(
+    let decrypted_data = match openssl::symm::decrypt_aead(
         openssl::symm::Cipher::aes_256_gcm(),
         &aes_key,
         Some(nonce),
         &[], // AAD
         encrypted_data,
         tag,
-    )
-    .map_err(|e| anyhow::anyhow!("decrypt_data -> AES-GCM decryption failed: {}", e))?;
-
+    ) {
+        Ok(dd) => dd,
+        Err(e) => {
+            return Err(anyhow::anyhow!(
+                "decrypt_data -> AES-GCM decryption failed: {}",
+                e
+            ))
+        }
+    };
     Ok(decrypted_data)
 }
 
-pub fn encrypt_and_sign_data(
-    data: &[u8],
-    app_public_key: &openssl::pkey::PKey<openssl::pkey::Public>,
-    cert_private_key: &openssl::pkey::PKey<openssl::pkey::Private>,
-) -> anyhow::Result<(Vec<u8>, Vec<u8>)> {
-    let encrypted_data = encrypt_data(data, app_public_key)?;
-    let signature = sign_data(&encrypted_data, cert_private_key)?;
-    Ok((encrypted_data, signature))
-}
-
-pub fn create_app_cert_and_key_pair() -> anyhow::Result<(
-    openssl::x509::X509,
-    openssl::pkey::PKey<openssl::pkey::Private>,
-)> {
-    let rsa = openssl::rsa::Rsa::generate(4096).map_err(|e| {
-        anyhow::anyhow!(
-            "create_app_cert_and_key_pair -> Failed to generate RSA key pair: {}",
-            e
-        )
-    })?;
-    let private_key = openssl::pkey::PKey::from_rsa(rsa).map_err(|e| {
-        anyhow::anyhow!(
-            "create_app_cert_and_key_pair -> Failed to create PKey from RSA key pair: {}",
-            e
-        )
-    })?;
-
-    let mut builder = openssl::x509::X509Builder::new().map_err(|e| {
-        anyhow::anyhow!(
-            "create_app_cert_and_key_pair -> Failed to create X509 builder: {}",
-            e
-        )
-    })?;
-    builder.set_version(2).map_err(|e| {
-        anyhow::anyhow!(
-            "create_app_cert_and_key_pair -> Failed to set certificate version: {}",
-            e
-        )
-    })?;
-
-    let serial_bn = openssl::bn::BigNum::from_u32(1).map_err(|e| {
-        anyhow::anyhow!(
-            "create_app_cert_and_key_pair -> Failed to generate certificate serial number: {}",
-            e
-        )
-    })?;
-    let serial = serial_bn
-        .to_asn1_integer()
-        .map_err(|e| anyhow::anyhow!("create_app_cert_and_key_pair -> Failed to convert certificate serial number to ASN1: {}", e))?;
-    builder.set_serial_number(&serial).map_err(|e| {
-        anyhow::anyhow!(
-            "create_app_cert_and_key_pair -> Failed to set certificate serial number: {}",
-            e
-        )
-    })?;
-
-    let not_before = openssl::asn1::Asn1Time::days_from_now(0).map_err(|e| {
-        anyhow::anyhow!(
-            "create_app_cert_and_key_pair -> Failed to set certificate not_before timestamp: {}",
-            e
-        )
-    })?;
-    let not_after = openssl::asn1::Asn1Time::days_from_now(365 * 5).map_err(|e| {
-        anyhow::anyhow!(
-            "create_app_cert_and_key_pair -> Failed to set certificate not_after timestamp: {}",
-            e
-        )
-    })?;
-    builder.set_not_before(&not_before).map_err(|e| {
-        anyhow::anyhow!(
-            "create_app_cert_and_key_pair -> Failed to apply certificate not_before timestamp: {}",
-            e
-        )
-    })?;
-    builder.set_not_after(&not_after).map_err(|e| {
-        anyhow::anyhow!(
-            "create_app_cert_and_key_pair -> Failed to apply certificate not_after timestamp: {}",
-            e
-        )
-    })?;
-
-    let subject_name = openssl::x509::X509NameBuilder::new()
-        .and_then(|mut b| {
-            b.append_entry_by_text("CN", "App Certificate")
-                .map(|_| b.build())
-        })
-        .map_err(|e| {
-            anyhow::anyhow!(
-                "create_app_cert_and_key_pair -> Failed to build subject name: {}",
-                e
-            )
-        })?;
-
-    let issuer_name = openssl::x509::X509NameBuilder::new()
-        .and_then(|mut b| {
-            b.append_entry_by_text("CN", "App Certificate")
-                .map(|_| b.build())
-        })
-        .map_err(|e| {
-            anyhow::anyhow!(
-                "create_app_cert_and_key_pair -> Failed to build issuer name: {}",
-                e
-            )
-        })?;
-
-    builder.set_subject_name(&subject_name).map_err(|e| {
-        anyhow::anyhow!(
-            "create_app_cert_and_key_pair -> Failed to set subject name: {}",
-            e
-        )
-    })?;
-    builder.set_issuer_name(&issuer_name).map_err(|e| {
-        anyhow::anyhow!(
-            "create_app_cert_and_key_pair -> Failed to set issuer name: {}",
-            e
-        )
-    })?;
-    builder.set_pubkey(&private_key).map_err(|e| {
-        anyhow::anyhow!(
-            "create_app_cert_and_key_pair -> Failed to set public key in certificate: {}",
-            e
-        )
-    })?;
-    builder
-        .sign(&private_key, openssl::hash::MessageDigest::sha256())
-        .map_err(|e| {
-            anyhow::anyhow!(
-                "create_app_cert_and_key_pair -> Failed to sign certificate: {}",
-                e
-            )
-        })?;
-
-    Ok((builder.build(), private_key))
-}
-
-pub fn get_app_public_key(
-    app_config: &crate::configs::AppConfig,
-) -> anyhow::Result<openssl::pkey::PKey<openssl::pkey::Public>> {
-    let app_cert_pem = std::fs::read(&app_config.key_exports.app_cert_path).map_err(|e| {
-        anyhow::anyhow!(
-            "get_app_public_key -> Failed to read app certificate PEM file: {}",
-            e
-        )
-    })?;
-    let app_cert = openssl::x509::X509::from_pem(&app_cert_pem).map_err(|e| {
-        anyhow::anyhow!(
-            "get_app_public_key -> Failed to parse app certificate PEM file: {}",
-            e
-        )
-    })?;
-    let public_key_pem = app_cert.public_key()?.public_key_to_pem().map_err(|e| {
-        anyhow::anyhow!(
-            "get_app_public_key -> Failed to serialize app public key to PEM format: {}",
-            e
-        )
-    })?;
-    let public_key =
-        openssl::pkey::PKey::public_key_from_pem(public_key_pem.as_slice()).map_err(|e| {
-            anyhow::anyhow!(
-                "get_app_public_key -> Failed to load public key from PEM: {}",
-                e
-            )
-        })?;
-    Ok(public_key)
-}
-
-pub fn get_app_private_key(
-    app_config: &crate::configs::AppConfig,
-) -> anyhow::Result<openssl::pkey::PKey<openssl::pkey::Private>> {
-    let private_key_pem = std::fs::read(&app_config.key_exports.app_key_path).map_err(|e| {
-        anyhow::anyhow!(
-            "get_app_private_key -> Failed to read private key PEM file: {}",
-            e
-        )
-    })?;
-    let private_key = openssl::pkey::PKey::private_key_from_pem(private_key_pem.as_slice())
-        .map_err(|e| {
-            anyhow::anyhow!(
-                "get_app_private_key -> Failed to load private key from PEM: {}",
-                e
-            )
-        })?;
-    Ok(private_key)
-}
-
-pub fn verify_client_auth_cert_chain(
+pub fn verify_user_cert(
     store: &openssl::x509::store::X509Store,
     chain: &openssl::stack::Stack<openssl::x509::X509>,
     user_cert: &openssl::x509::X509,
@@ -483,9 +316,15 @@ pub fn verify_client_auth_cert_chain(
         }
     };
 
-    let verified = store_ctx
-        .init(store, user_cert, chain, |ctx| ctx.verify_cert())
-        .map_err(|e| anyhow::anyhow!("Failed to verify client auth certificate chain: {}", e))?;
+    let verified = match store_ctx.init(store, user_cert, chain, |ctx| ctx.verify_cert()) {
+        Ok(v) => v,
+        Err(e) => {
+            return Err(anyhow::anyhow!(
+                "Failed to verify client auth certificate chain: {}",
+                e
+            ))
+        }
+    };
 
     if !verified || store_ctx.error() != openssl::x509::X509VerifyResult::OK {
         let error = store_ctx.error();
@@ -507,11 +346,10 @@ pub fn verify_client_auth_cert_chain(
             current_subject
         ));
     }
-
     Ok(true)
 }
 
-pub fn build_client_auth_store_from_root_ca(
+pub fn get_auth_store(
     root_cert: &openssl::x509::X509,
 ) -> anyhow::Result<openssl::x509::store::X509Store> {
     let mut store_builder = openssl::x509::store::X509StoreBuilder::new()
@@ -531,7 +369,7 @@ pub fn build_client_auth_store_from_root_ca(
     Ok(store_builder.build())
 }
 
-pub fn validate_self_signed_root_pair(
+pub fn validate_self_signed(
     cert: &openssl::x509::X509,
     key: &openssl::pkey::PKey<openssl::pkey::Private>,
 ) -> anyhow::Result<bool> {
@@ -587,7 +425,7 @@ pub fn validate_self_signed_root_pair(
     Ok(true)
 }
 
-pub fn validate_intermediate_cert_chain(
+pub fn validate_intermediate_cert(
     intermediate_cert: &openssl::x509::X509,
     cert_store: &openssl::x509::store::X509Store,
 ) -> anyhow::Result<bool> {
@@ -600,7 +438,7 @@ pub fn validate_intermediate_cert_chain(
             ))
         }
     };
-    let valid = verify_client_auth_cert_chain(cert_store, &chain, intermediate_cert)?;
+    let valid = verify_user_cert(cert_store, &chain, intermediate_cert)?;
     if !valid {
         return Err(anyhow::anyhow!("validate_intermediate_cert_chain -> Intermediate certificate failed validation against root CA"));
     }

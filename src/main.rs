@@ -29,37 +29,50 @@ fn main() {
     };
     let mut storage_status = get_state(&app_config);
     while storage_status.error_message.is_none() {
-        match storage_status.storage_state {
+        match get_state(&app_config).storage_state {
             StorageState::Ready => {
                 tracing::info!(
                     "Main -> Storage is ready. Storage Status Results: {:?}",
-                    storage_status
+                    &storage_status
                 );
-                storage_status = start_api_server(&app_config, storage_status);
+                let storage = match pki_chain::storage::get_ready_storage(&app_config) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        tracing::error!(error = %e, "Failed to get ready storage");
+                        std::process::exit(1);
+                    }
+                };
+                let api_storage = match pki_chain::storage::get_api_storage(&storage) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        tracing::error!(error = %e, "Failed to get API storage");
+                        std::process::exit(1);
+                    }
+                };
+                start_api_server(&app_config, &api_storage);
             }
             StorageState::Inconsistent => {
                 tracing::warn!(
                     "Main -> Storage is inconsistent. Storage Status Results: {:?}",
-                    storage_status
+                    &storage_status
                 );
-                storage_status = start_repair_server(&app_config, storage_status);
+                start_repair_server(&app_config, &storage_status);
             }
             StorageState::Empty => {
                 tracing::warn!(
                     "Main -> Storage is empty. Storage Status Results: {:?}",
-                    storage_status
+                    &storage_status
                 );
-                start_setup_server(&app_config, storage_status);
-                storage_status = get_state(&app_config);
+                start_setup_server(&app_config, &storage_status);
             }
             _ => {
                 tracing::warn!(
                     "Main -> Storage is in a setup state. Storage Status Results: {:?}",
-                    storage_status
+                    &storage_status
                 );
             }
         }
     }
     tracing::error!(error = %storage_status.error_message.as_ref().unwrap(), "Main -> There are errors in the storage system");
-    tracing::info!("Main -> Storage status: {:?}", storage_status);
+    tracing::info!("Main -> Storage status: {:?}", &storage_status);
 }

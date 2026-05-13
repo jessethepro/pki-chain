@@ -8,8 +8,16 @@ impl crate::storage::Storage<Created> {
     pub fn initialize_storage(
         self,
     ) -> crate::storage::Storage<crate::storage_initialized::Initialized> {
-        let app_public_key = match crate::encryption::get_app_public_key(&self.app_config) {
-            Ok(key) => key,
+        let app_public_key = match crate::storage::get_app_certificate(
+            &self.state.certificate_chain,
+        ) {
+            Ok(cert) => match cert.public_key() {
+                Ok(key) => key,
+                Err(e) => {
+                    tracing::error!(error = %e, "initialize_storage -> Failed to extract public key from app certificate.");
+                    std::process::exit(1);
+                }
+            },
             Err(e) => {
                 tracing::error!(error = %e, "initialize_storage -> Failed to get app public key.");
                 std::process::exit(1);
@@ -76,20 +84,10 @@ impl crate::storage::Storage<Created> {
                 std::process::exit(1);
             }
         };
-        let root_cert_signature = match crate::encryption::sign_data(
-            root_encrypted_cert.as_slice(),
-            &root_private_key,
-        ) {
-            Ok(signature) => signature,
-            Err(e) => {
-                tracing::error!(error = %e, "initialize_storage -> Failed to sign root certificate.");
-                std::process::exit(1);
-            }
-        };
         match self
             .state
             .certificate_chain
-            .put_block(root_encrypted_cert, root_cert_signature.clone())
+            .put_block(&root_encrypted_cert, &Vec::<u8>::new())
         {
             Ok(_) => {}
             Err(e) => {
@@ -101,7 +99,7 @@ impl crate::storage::Storage<Created> {
         match self
             .state
             .private_key_chain
-            .put_block(encrypted_root_private_key, root_cert_signature)
+            .put_block(&encrypted_root_private_key, &Vec::<u8>::new())
         {
             Ok(_) => {}
             Err(e) => {
@@ -177,20 +175,10 @@ impl crate::storage::Storage<Created> {
                 std::process::exit(1);
             }
         };
-        let admin_cert_signature = match crate::encryption::sign_data(
-            admin_encrypted_cert.as_slice(),
-            &admin_private_key,
-        ) {
-            Ok(signature) => signature,
-            Err(e) => {
-                tracing::error!(error = %e, "initialize_storage -> Failed to sign default admin certificate.");
-                std::process::exit(1);
-            }
-        };
         match self
             .state
             .certificate_chain
-            .put_block(admin_encrypted_cert, admin_cert_signature.clone())
+            .put_block(&admin_encrypted_cert, &Vec::<u8>::new())
         {
             Ok(_) => {}
             Err(e) => {
@@ -202,7 +190,7 @@ impl crate::storage::Storage<Created> {
         match self
             .state
             .private_key_chain
-            .put_block(encrypted_admin_private_key, admin_cert_signature)
+            .put_block(&encrypted_admin_private_key, &Vec::<u8>::new())
         {
             Ok(_) => {}
             Err(e) => {
@@ -217,30 +205,17 @@ impl crate::storage::Storage<Created> {
                 std::process::exit(1);
             }
         };
-        let auth_store = match crate::encryption::build_client_auth_store_from_root_ca(&root_cert) {
+        let auth_store = match crate::encryption::get_auth_store(&root_cert) {
             Ok(store) => store,
             Err(e) => {
                 tracing::error!(error = %e, "initialize_storage -> Failed to create default admin auth store.");
                 std::process::exit(1);
             }
         };
-        match crate::encryption::validate_intermediate_cert_chain(&admin_cert, &auth_store) {
+        match crate::encryption::validate_intermediate_cert(&admin_cert, &auth_store) {
             Ok(_) => {}
             Err(e) => {
                 tracing::error!(error = %e, "initialize_storage -> Failed to validate default admin intermediate certificate chain.");
-                std::process::exit(1);
-            }
-        };
-        let auth_chain = match openssl::stack::Stack::new() {
-            Ok(mut stack) => {
-                stack.push(admin_cert).unwrap_or_else(|e| {
-                    tracing::error!(error = %e, "initialize_storage -> Failed to push default admin cert to auth chain.");
-                    std::process::exit(1);
-                });
-                stack
-            }
-            Err(e) => {
-                tracing::error!(error = %e, "initialize_storage -> Failed to create default admin auth chain stack.");
                 std::process::exit(1);
             }
         };
@@ -249,8 +224,7 @@ impl crate::storage::Storage<Created> {
                 certificate_chain: self.state.certificate_chain,
                 private_key_chain: self.state.private_key_chain,
                 crl_chain: self.state.crl_chain,
-                auth_store,
-                auth_chain,
+                auth_store: std::sync::Arc::new(auth_store),
             },
             app_config: self.app_config,
         }

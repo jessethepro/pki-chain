@@ -2,7 +2,7 @@ pub struct Admin {
     pub certificate_chain: libblockchain::blockchain::BlockChain,
     pub private_key_chain: libblockchain::blockchain::BlockChain,
     pub crl_chain: libblockchain::blockchain::BlockChain,
-    pub auth_store: openssl::x509::store::X509Store,
+    pub auth_store: std::sync::Arc<openssl::x509::store::X509Store>,
     pub auth_chain: openssl::stack::Stack<openssl::x509::X509>,
 }
 
@@ -14,7 +14,6 @@ impl crate::storage::Storage<Admin> {
                 private_key_chain: self.state.private_key_chain,
                 crl_chain: self.state.crl_chain,
                 auth_store: self.state.auth_store,
-                auth_chain: self.state.auth_chain,
             },
             app_config: self.app_config,
         })

@@ -32,7 +32,7 @@
 
 ## Project-specific conventions
 - Typestate matters: open storage with correct state (`Storage::<Initialized>::open()` / `Storage::<Ready>::open()`).
-- `libblockchain` is not thread-safe: open a new chain per thread/task (see [src/storage.rs](src/storage.rs)).
+- `libblockchain` is thread-safe: `BlockChain` wraps RocksDB in `Arc<DBWithThreadMode<MultiThreaded>>` and derives `Clone`. Clone an existing handle to share it across threads rather than opening a new chain per thread.
 - Admin certs are marked by OU suffix " Admin".
 - Storage writes are transactional with rollback in `storage.rs` helpers; keep that pattern.
 - `key/app.key` is the master encryption key; loss breaks access to encrypted blockchain data.
@@ -47,7 +47,7 @@
 - Logs: rolling daily files under logs/ (`pki_chain.log`), also mirrored to stdout. Level controlled by `RUST_LOG` env var (default: `info`).
 
 ## Integration points
-- `libblockchain` git dependency provides `BlockChain<ReadWrite|ReadOnly>` (RocksDB backend).
+- `libblockchain` git dependency provides `BlockChain` (RocksDB backend, `Arc`-backed, `Clone`able, thread-safe).
 - OpenSSL handles RSA-4096, X.509, signatures (see [src/pki_generator.rs](src/pki_generator.rs)).
 - Client implementations live in a separate project and communicate exclusively via the Unix socket wire protocol described above.
 - API docs/examples: [API_README.md](API_README.md).
